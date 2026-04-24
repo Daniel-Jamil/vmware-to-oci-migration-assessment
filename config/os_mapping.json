@@ -1,0 +1,33 @@
+{
+  "default": "Unmapped / Review",
+  "rules": [
+    {
+      "contains": "windows server 2022",
+      "mapped": "Windows Server 2022"
+    },
+    {
+      "contains": "windows server 2019",
+      "mapped": "Windows Server 2019"
+    },
+    {
+      "contains": "windows",
+      "mapped": "Windows"
+    },
+    {
+      "contains": "ubuntu",
+      "mapped": "Linux - Ubuntu"
+    },
+    {
+      "contains": "rocky",
+      "mapped": "Linux - Rocky"
+    },
+    {
+      "contains": "linux",
+      "mapped": "Linux"
+    },
+    {
+      "contains": "freebsd",
+      "mapped": "FreeBSD"
+    }
+  ]
+}

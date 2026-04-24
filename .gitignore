@@ -1,0 +1,23 @@
+# Python cache/temp
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.tmp
+
+# Virtual environments
+.venv/
+venv/
+
+# OS/editor temp files
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+
+# Project temp runtime state
+downloads/app_state/*.json
+downloads/app_state/*_snapshot.json
+
+# Downloaded OCI price lists
+downloads/oci_pricing_*.json

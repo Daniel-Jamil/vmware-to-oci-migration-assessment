@@ -1,0 +1,934 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vmw2oci - Step 4 OS Consolidation</title>
+  <style>
+    :root {
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --text: #121417;
+      --muted: #5f6672;
+      --line: #d9dde3;
+      --line-strong: #c8cdd6;
+      --accent: #0f62fe;
+      --accent-2: #0043ce;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif; margin: 0; background: var(--bg); color: var(--text); letter-spacing: .01em; }
+    .container { width: 100%; margin: 0; box-sizing: border-box; padding: 1.25rem 1.5rem; background: var(--panel); min-height: 100vh; }
+    .top-actions { margin-bottom: 1rem; display:flex; gap:.5rem; }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color .15s ease;
+    }
+    a:hover { border-bottom-color: var(--accent); }
+    a.btn { display:inline-flex; align-items:center; background:#fff; color:var(--text); text-decoration:none; padding:.5rem .75rem; border-radius:0; border:1px solid var(--line-strong); font-weight:600; }
+    a.btn:hover { color: var(--accent); border-color: var(--accent); }
+    .meta, .summary { background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 0; padding: .8rem 1rem; margin-bottom: 1rem; }
+    .summary-split { display: grid; grid-template-columns: 1.5fr 1fr; gap: 1rem; align-items: start; margin-top: .5rem; }
+    .summary-right { background: #fff; border: 1px solid var(--line); border-radius: 0; padding: .75rem; }
+    .summary-right h4 { margin: 0 0 .5rem 0; font-size: .95rem; }
+    .summary-right { position: relative; }
+    .discount-box { margin-top: .75rem; padding: .65rem .75rem; background:#fff; border:1px solid var(--line); border-radius:0; }
+    .discount-box label { display:flex; align-items:center; gap:.5rem; font-weight:600; }
+    .discount-box input[type="number"] { width: 120px; }
+    .discount-box small { display:block; margin-top:.35rem; color:var(--muted); }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(20, 24, 35, 0.45); display: none; align-items: center; justify-content: center; z-index: 20; }
+    .modal { width: min(760px, 94vw); max-height: 82vh; overflow: auto; background: #fff; border-radius: 0; border: 1px solid var(--line); box-shadow: 0 12px 36px rgba(0,0,0,.18); }
+    .modal-header { padding: .75rem .9rem; border-bottom: 1px solid var(--line); display:flex; justify-content: space-between; align-items: center; }
+    .modal-body { padding: .85rem .9rem; }
+    .modal-grid { display: grid; grid-template-columns: 1.2fr 1fr .8fr; gap: .5rem .75rem; align-items: center; }
+    .modal-actions { padding: .75rem .9rem; border-top: 1px solid var(--line); display:flex; justify-content: flex-end; gap:.5rem; }
+    .btn-secondary { background: #fff; color: var(--text); border: 1px solid var(--line-strong); }
+    .btn-secondary:hover { background: #fff; color: var(--accent); border-color: var(--accent); }
+    .cost-pie {
+      width: 180px;
+      height: 180px;
+      border-radius: 50%;
+      margin: .25rem auto .6rem auto;
+      background: conic-gradient(#4f7cff 0 20%, #37b26c 20% 40%, #f59f00 40% 60%, #7048e8 60% 80%, #d6336c 80% 100%);
+      border: 1px solid var(--line);
+    }
+    .pie-tooltip {
+      position: absolute;
+      display: none;
+      background: rgba(26, 26, 26, 0.92);
+      color: #fff;
+      padding: .3rem .45rem;
+      border-radius: 4px;
+      font-size: .78rem;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 5;
+    }
+    .summary-table { width: 100%; border-collapse: collapse; background: #fff; margin-top: .5rem; }
+    .summary-table th, .summary-table td { border: 1px solid var(--line); padding: .45rem .5rem; text-align: center; }
+    .summary-table th { background: #f2f4f8; }
+    .summary-table th.th-cpu { background: #4f7cff; color: #fff; }
+    .summary-table th.th-ram { background: #37b26c; color: #fff; }
+    .summary-table th.th-storage { background: #f59f00; color: #1a1a1a; }
+    .summary-table th.th-vpu { background: #7048e8; color: #fff; }
+    .summary-table th.th-license { background: #d6336c; color: #fff; }
+    .summary-table td:first-child, .summary-table th:first-child { text-align: left; white-space: nowrap; }
+    .vm-table th.sortable { position: relative; cursor: pointer; user-select: none; padding-right: 1.35rem; }
+    .vm-table th.sortable .sort-icon {
+      position: absolute;
+      top: .18rem;
+      right: .35rem;
+      font-size: .72rem;
+      line-height: 1;
+      opacity: .7;
+    }
+    .vm-table th.sortable.sorted-asc .sort-icon::before { content: '▲'; }
+    .vm-table th.sortable.sorted-desc .sort-icon::before { content: '▼'; }
+    .vm-table th.sortable .sort-icon::before { content: '⇅'; }
+    .flash { padding: 0.7rem 0.9rem; border-radius: 0; margin-bottom: 0.75rem; }
+    .flash.success { background: #e9f8ef; color: #136b2f; border: 1px solid #acdcb8; }
+    .flash.error { background: #ffefef; color: #912828; border: 1px solid #f1b7b7; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid var(--line); padding: .5rem .55rem; text-align: left; vertical-align: top; }
+    th { background: #f2f4f8; }
+    select { width: 100%; padding: .4rem .45rem; }
+    input[type="number"] { width: 100%; box-sizing: border-box; padding: .4rem .45rem; }
+    .ocpu-col { width: 70px; white-space: nowrap; }
+    .bulk-shape { margin-top: .35rem; }
+    .bulk-shape small { display: block; margin-bottom: .25rem; color: var(--muted); font-weight: normal; }
+    .cost-col { width: 110px; min-width: 110px; max-width: 130px; white-space: nowrap; }
+    .storage-cost { cursor: help; }
+    .cost-line { white-space: nowrap; }
+    .cost-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .3rem; }
+    .cost-cell { padding: .25rem .35rem; border: 1px solid var(--line); border-radius: 0; background: #f8faff; }
+    .cost-label { font-size: .78rem; color: var(--muted); display:block; }
+    .cost-value { font-weight: 600; }
+    .save-row { margin-top: .9rem; }
+    button { cursor: pointer; background: var(--accent); color: white; border: 1px solid var(--accent); border-radius: 0; padding: .55rem .8rem; font-weight: 600; }
+    button:hover { background: var(--accent-2); border-color: var(--accent-2); }
+    code { background: #eff2f5; padding: 0.1rem 0.35rem; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    {% set currency_symbol_map = {
+      'EUR': '€',
+      'USD': '$',
+      'GBP': '£',
+      'JPY': '¥',
+      'CHF': 'CHF ',
+      'AUD': 'A$',
+      'CAD': 'C$',
+      'SGD': 'S$',
+      'SEK': 'kr ',
+      'NOK': 'kr ',
+      'DKK': 'kr '
+    } %}
+    {% set pricing_symbol = currency_symbol_map.get((pricing_currency or 'USD'), (pricing_currency or 'USD') ~ ' ') %}
+
+    <h1>Step 4 - Selected VM List & OCI Shape Selection</h1>
+
+    <div class="top-actions">
+      <a class="btn" href="{{ url_for('index') }}">Back to Step 1/2</a>
+      <a class="btn" href="{{ url_for('step3') }}">Back to Step 3</a>
+      <button type="submit" form="step4-form">Save Step 4 Settings (All VMs)</button>
+      <button type="submit" form="step4-form" name="action" value="export_excel">Export to Excel</button>
+      <button type="button" id="open-shape-strategy">Set default shape strategy</button>
+    </div>
+
+    <div id="shape-strategy-modal" class="modal-backdrop" aria-hidden="true">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shape-strategy-title">
+        <div class="modal-header">
+          <strong id="shape-strategy-title">Set default shape strategy</strong>
+          <button type="button" id="close-shape-strategy" class="btn-secondary">Cancel</button>
+        </div>
+        <div class="modal-body">
+          <p style="margin-top:0;">Choose default OCI target shape and burst per unique OS. Apply will set matching values on each selected VM row.</p>
+          <div id="shape-strategy-grid" class="modal-grid"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="cancel-shape-strategy" class="btn-secondary">Cancel</button>
+          <button type="button" id="apply-shape-strategy">Apply</button>
+        </div>
+      </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="meta">
+      <p><strong>Source Pricelist:</strong> <code>{{ source_pricelist_file or 'No pricelist file found' }}</code></p>
+      <p><strong>vInfo source:</strong> <code>{{ source_vinfo_csv }}</code></p>
+    </div>
+
+    <div class="summary">
+      <strong>Totals</strong>
+      <div class="summary-split">
+        <div>
+          <table class="summary-table">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>VMs</th>
+                <th class="th-cpu">CPU</th>
+              <th class="th-ram">RAM (GB)</th>
+                <th class="th-storage">Storage (GB)</th>
+                <th class="th-vpu">VPUs</th>
+                <th class="th-license">License (Lic Included VMs)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Quantity</td>
+                <td id="sum-qty-vms">{{ "{:,}".format(overall.vm_count) }}</td>
+                <td id="sum-qty-cpu">{{ "{:,}".format(overall.total_cpus) }}</td>
+                <td id="sum-qty-ram">{{ "{:,}".format(overall.total_memory_gb) }}</td>
+                <td id="sum-qty-storage-gb">{{ "{:,}".format(overall.total_provisioned_gb) }}</td>
+                <td id="sum-qty-vpu">{{ "{:,}".format(overall.total_vpus) }}</td>
+                <td id="sum-qty-license">{{ "{:,}".format(overall.total_license_included_vms) }}</td>
+              </tr>
+              <tr>
+              <td>Monthly cost</td>
+                <td id="sum-total-cost"><strong>{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_monthly_cost) }}</strong></td>
+                <td id="sum-cpu-cost">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_cpu_monthly_cost) }}</td>
+                <td id="sum-ram-cost">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_ram_monthly_cost) }}</td>
+                <td id="sum-storage-capacity-cost">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_storage_capacity_monthly_cost) }}</td>
+                <td id="sum-storage-vpu-cost">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_storage_performance_monthly_cost) }}</td>
+                <td id="sum-license-cost">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_os_license_monthly_cost) }}</td>
+              </tr>
+              <tr>
+                <td>Yearly cost</td>
+                <td id="sum-total-cost-yearly"><strong>{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_monthly_cost * 12) }}</strong></td>
+                <td id="sum-cpu-cost-yearly">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_cpu_monthly_cost * 12) }}</td>
+                <td id="sum-ram-cost-yearly">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_ram_monthly_cost * 12) }}</td>
+                <td id="sum-storage-capacity-cost-yearly">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_storage_capacity_monthly_cost * 12) }}</td>
+                <td id="sum-storage-vpu-cost-yearly">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_storage_performance_monthly_cost * 12) }}</td>
+                <td id="sum-license-cost-yearly">{{ pricing_symbol }}{{ "{:,.0f}".format(overall.total_os_license_monthly_cost * 12) }}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="discount-box">
+            <label for="iaas_discount_pct">
+              IaaS Discount %
+              <input
+                type="number"
+                id="iaas_discount_pct"
+                name="iaas_discount_pct"
+                form="step4-form"
+                min="0"
+                max="100"
+                step="0.01"
+                value="{{ '%.2f'|format(iaas_discount_pct or 0) }}"
+              />
+            </label>
+            <small>Applied to CPU/RAM and Storage costs only. OS License cost is not discounted.</small>
+          </div>
+        </div>
+
+        <div class="summary-right">
+          <h4>Cost Split</h4>
+          <div id="cost-pie" class="cost-pie" tabindex="0"></div>
+          <div id="pie-tooltip" class="pie-tooltip"></div>
+        </div>
+      </div>
+
+    </div>
+
+    <form id="step4-form" method="post">
+      <table class="vm-table">
+        <thead>
+          <tr>
+            <th rowspan="2" class="sortable" data-sort-index="0">VM Name <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="sortable" data-sort-index="1">OS <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="sortable" data-sort-index="2">
+              <div>OS License</div>
+              <div class="bulk-shape">
+                <small>Set all Windows Server:</small>
+                <select id="bulk_os_license">
+                  <option value="">-- choose license --</option>
+                  <option value="BYOL">BYOL</option>
+                  <option value="Lic Include">Lic Include</option>
+                </select>
+              </div>
+              <span class="sort-icon" aria-hidden="true"></span>
+            </th>
+            <th rowspan="2" class="sortable" data-sort-index="3">vCPUs <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="ocpu-col sortable" data-sort-index="4">OCPUs <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="sortable" data-sort-index="5">
+              <div>Burst</div>
+              <div class="bulk-shape">
+                <small>Set all:</small>
+                <select id="bulk_burst">
+                  <option value="">-- choose burst --</option>
+                  <option value="100%">100%</option>
+                  <option value="50%">50%</option>
+                  <option value="12.5%">12.5%</option>
+                </select>
+              </div>
+              <span class="sort-icon" aria-hidden="true"></span>
+            </th>
+            <th rowspan="2" class="sortable" data-sort-index="6">RAM GB <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="sortable" data-sort-index="7">Storage GB <span class="sort-icon" aria-hidden="true"></span></th>
+            <th rowspan="2" class="sortable" data-sort-index="8">
+              <div>VPU</div>
+              <div class="bulk-shape">
+                <small>Set default:</small>
+                <select id="bulk_vpu">
+                  <option value="">-- choose VPU --</option>
+                  {% for v in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120] %}
+                    <option value="{{ v }}">{{ v }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <span class="sort-icon" aria-hidden="true"></span>
+            </th>
+            <th rowspan="2" class="sortable" data-sort-index="9">
+              <div>OCI Target</div>
+              <div class="bulk-shape">
+                <small>Set all:</small>
+                <select id="bulk_oci_shape">
+                  <option value="">-- choose shape for all --</option>
+                  {% for shape_name in shape_options %}
+                    <option value="{{ shape_name }}">{{ shape_name }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <span class="sort-icon" aria-hidden="true"></span>
+            </th>
+            <th colspan="4" class="cost-col">Cost</th>
+          </tr>
+          <tr>
+            <th class="cost-col sortable" data-sort-index="10">CPU/RAM <span class="sort-icon" aria-hidden="true"></span></th>
+            <th class="cost-col sortable" data-sort-index="11">Storage <span class="sort-icon" aria-hidden="true"></span></th>
+            <th class="cost-col sortable" data-sort-index="12">OS License <span class="sort-icon" aria-hidden="true"></span></th>
+            <th class="cost-col sortable" data-sort-index="13">Total <span class="sort-icon" aria-hidden="true"></span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in vm_rows %}
+            <tr class="vm-row" data-memory-gb="{{ row.memory_gb }}" data-provisioned-gb="{{ row.provisioned_gb }}" data-os-name="{{ row.os_name }}">
+              <td>
+                {{ row.vm_name }}
+                <input type="hidden" name="vm_name" value="{{ row.vm_name }}" />
+              </td>
+              <td>{{ row.os_name }}</td>
+              <td>
+                {% if row.is_windows_server %}
+                  <select name="vm_os_license" required>
+                    <option value="BYOL" {% if row.os_license == 'BYOL' %}selected{% endif %}>BYOL</option>
+                    <option value="Lic Include" {% if row.os_license == 'Lic Include' %}selected{% endif %}>Lic Include</option>
+                  </select>
+                {% else %}
+                  <input type="hidden" name="vm_os_license" value="" />
+                {% endif %}
+              </td>
+              <td>{{ row.cpus }}</td>
+              <td class="ocpu-col">
+                <input type="number" name="vm_ocpu" value="{{ row.ocpu }}" min="1" step="1" required />
+              </td>
+              <td>
+                <select name="vm_burst" required>
+                  <option value="100%" {% if row.burst == '100%' or row.burst == '1:1' %}selected{% endif %}>100%</option>
+                  <option value="50%" {% if row.burst == '50%' %}selected{% endif %}>50%</option>
+                  <option value="12.5%" {% if row.burst == '12.5%' %}selected{% endif %}>12.5%</option>
+                </select>
+              </td>
+              <td>{{ row.memory_gb }}</td>
+              <td>{{ row.provisioned_gb }}</td>
+              <td>
+                <select name="vm_vpu" required>
+                  {% for vpu in vpu_options %}
+                    <option value="{{ vpu }}" {% if row.vpu == vpu %}selected{% endif %}>{{ vpu }}</option>
+                  {% endfor %}
+                </select>
+              </td>
+              <td>
+                <select name="oci_shape" required>
+                  {% for shape_name in shape_options %}
+                    <option value="{{ shape_name }}" {% if row.oci_shape == shape_name %}selected{% endif %}>{{ shape_name }}</option>
+                  {% endfor %}
+                </select>
+              </td>
+              <td class="cost-col cpu-ram-cost" title="CPU cost: {{ pricing_symbol }}{{ "%.2f"|format(row.cpu_monthly_cost) }}&#10;Memory cost: {{ pricing_symbol }}{{ "%.2f"|format(row.ram_monthly_cost) }}">{{ pricing_symbol }}{{ "%.2f"|format(row.cpu_ram_monthly_cost) }}</td>
+              <td class="cost-col storage-cost" title="Storage cost: {{ pricing_symbol }}{{ "%.2f"|format(row.storage_capacity_monthly_cost) }}&#10;VPU cost: {{ pricing_symbol }}{{ "%.2f"|format(row.storage_performance_monthly_cost) }}">{{ pricing_symbol }}{{ "%.2f"|format(row.storage_monthly_cost) }}</td>
+              <td class="cost-col os-license-cost">{{ pricing_symbol }}{{ "%.2f"|format(row.os_license_monthly_cost) }}</td>
+              <td class="cost-col total-cost">{{ pricing_symbol }}{{ "%.2f"|format(row.cpu_ram_monthly_cost + row.storage_monthly_cost + row.os_license_monthly_cost) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="14">No selected VMs found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <script id="pricing-config" type="application/json">
+        {{ {
+            'pricing_currency': pricing_currency or 'USD',
+            'shape_price_rates': shape_price_rates or {},
+            'shape_options': shape_options or [],
+            'block_storage_unit_price': block_storage_unit_price or 0,
+            'block_perf_unit_price': block_perf_unit_price or 0,
+            'windows_os_unit_price': windows_os_unit_price or 0,
+            'iaas_discount_pct': iaas_discount_pct or 0
+          } | tojson }}
+      </script>
+
+    </form>
+  </div>
+
+  <script>
+    (function () {
+      const pricingConfigEl = document.getElementById('pricing-config');
+      const pricingConfig = pricingConfigEl ? JSON.parse(pricingConfigEl.textContent || '{}') : {};
+      const pricingCurrency = pricingConfig.pricing_currency || 'USD';
+      const shapeRates = pricingConfig.shape_price_rates || {};
+      const strategyShapeOptions = Array.isArray(pricingConfig.shape_options) ? pricingConfig.shape_options : [];
+      const blockStorageUnitPrice = Number(pricingConfig.block_storage_unit_price) || 0;
+      const blockPerfUnitPrice = Number(pricingConfig.block_perf_unit_price) || 0;
+      const windowsOsUnitPrice = Number(pricingConfig.windows_os_unit_price) || 0;
+      const configuredDiscountPct = Number(pricingConfig.iaas_discount_pct) || 0;
+
+      function currencySymbol(code) {
+        const map = {
+          EUR: '€',
+          USD: '$',
+          GBP: '£',
+          JPY: '¥',
+          CHF: 'CHF ',
+          AUD: 'A$',
+          CAD: 'C$',
+          SGD: 'S$',
+          SEK: 'kr ',
+          NOK: 'kr ',
+          DKK: 'kr '
+        };
+        return map[code] || `${code} `;
+      }
+
+      function toNumber(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : 0;
+      }
+
+      function formatMoney(v) {
+        return `${currencySymbol(pricingCurrency)}${toNumber(v).toFixed(2)}`;
+      }
+
+      function formatNumberWhole(v) {
+        return Math.round(toNumber(v)).toLocaleString('en-US');
+      }
+
+      function formatMoneyWhole(v) {
+        return `${currencySymbol(pricingCurrency)}${formatNumberWhole(v)}`;
+      }
+
+      function getDiscountFactor() {
+        const raw = discountInput ? toNumber(discountInput.value) : configuredDiscountPct;
+        const pct = Math.max(0, Math.min(100, raw));
+        return 1 - (pct / 100);
+      }
+
+      function recalcRow(row) {
+        const shapeSel = row.querySelector('select[name="oci_shape"]');
+        const osLicenseSel = row.querySelector('select[name="vm_os_license"]');
+        const ocpuInput = row.querySelector('input[name="vm_ocpu"]');
+        const burstSel = row.querySelector('select[name="vm_burst"]');
+        const vpuSel = row.querySelector('select[name="vm_vpu"]');
+        const memGb = toNumber(row.dataset.memoryGb);
+        const provGb = toNumber(row.dataset.provisionedGb);
+
+        if (!shapeSel || !ocpuInput || !vpuSel) return null;
+
+        const shapeName = shapeSel.value;
+        const rates = shapeRates[shapeName] || {};
+        const ocpuRate = toNumber(rates.ocpu_unit_price);
+        const memRate = toNumber(rates.memory_unit_price);
+        const ocpuVal = Math.max(1, Math.floor(toNumber(ocpuInput.value)));
+        const burstVal = burstSel ? String(burstSel.value || '100%') : '100%';
+        const burstFactor = burstVal === '50%' ? 0.5 : (burstVal === '12.5%' ? 0.125 : 1);
+        const vpuVal = toNumber(vpuSel.value);
+
+        const cpuCost = (ocpuVal * ocpuRate) * 730 * burstFactor;
+        const ramCost = (memGb * memRate) * 730;
+        const discountFactor = getDiscountFactor();
+        const cpuCostDiscounted = cpuCost * discountFactor;
+        const ramCostDiscounted = ramCost * discountFactor;
+        const cpuRamCost = cpuCostDiscounted + ramCostDiscounted;
+        const osLicenseCost = (osLicenseSel && osLicenseSel.value === 'Lic Include') ? (windowsOsUnitPrice * ocpuVal * 730 * burstFactor) : 0;
+        const storageCapacityCost = provGb * blockStorageUnitPrice;
+        const storageVpuCost = provGb * vpuVal * blockPerfUnitPrice;
+        const storageCapacityCostDiscounted = storageCapacityCost * discountFactor;
+        const storageVpuCostDiscounted = storageVpuCost * discountFactor;
+        const storageCost = storageCapacityCostDiscounted + storageVpuCostDiscounted;
+        const totalCost = cpuRamCost + storageCost + osLicenseCost;
+
+        const cpuRamTarget = row.querySelector('.cpu-ram-cost');
+        const osLicenseTarget = row.querySelector('.os-license-cost');
+        const storageTarget = row.querySelector('.storage-cost');
+        const totalTarget = row.querySelector('.total-cost');
+        if (cpuRamTarget) cpuRamTarget.textContent = formatMoney(cpuRamCost);
+        if (cpuRamTarget) {
+          cpuRamTarget.title = `CPU cost: ${formatMoney(cpuCostDiscounted)}\nMemory cost: ${formatMoney(ramCostDiscounted)}`;
+        }
+        if (osLicenseTarget) osLicenseTarget.textContent = formatMoney(osLicenseCost);
+        if (storageTarget) storageTarget.textContent = formatMoney(storageCost);
+        if (storageTarget) {
+          storageTarget.title = `Storage cost: ${formatMoney(storageCapacityCostDiscounted)}\nVPU cost: ${formatMoney(storageVpuCostDiscounted)}`;
+        }
+        if (totalTarget) totalTarget.textContent = formatMoney(totalCost);
+
+        return {
+          cpuCost: cpuCostDiscounted,
+          ramCost: ramCostDiscounted,
+          storageCapacityCost: storageCapacityCostDiscounted,
+          storageVpuCost: storageVpuCostDiscounted,
+          storageCost,
+          osLicenseCost,
+          totalCost,
+          licenseIncluded: Boolean(osLicenseSel && osLicenseSel.value === 'Lic Include')
+        };
+      }
+
+      function recalcSummary() {
+        let cpuTotal = 0;
+        let ramTotal = 0;
+        let storageCapacityTotal = 0;
+        let storageVpuTotal = 0;
+        let storageTotal = 0;
+        let licenseCostTotal = 0;
+        let grandTotal = 0;
+        let licenseIncludedCount = 0;
+        let totalMemoryGb = 0;
+        let totalProvisionedGb = 0;
+        let totalVpus = 0;
+
+        rows.forEach((row) => {
+          const rowVals = recalcRow(row);
+          if (!rowVals) return;
+          cpuTotal += rowVals.cpuCost;
+          ramTotal += rowVals.ramCost;
+          storageCapacityTotal += rowVals.storageCapacityCost;
+          storageVpuTotal += rowVals.storageVpuCost;
+          storageTotal += rowVals.storageCost;
+          licenseCostTotal += rowVals.osLicenseCost;
+          grandTotal += rowVals.totalCost;
+          if (rowVals.licenseIncluded) licenseIncludedCount += 1;
+          totalMemoryGb += toNumber(row.dataset.memoryGb);
+          totalProvisionedGb += toNumber(row.dataset.provisionedGb);
+          const vpuSel = row.querySelector('select[name="vm_vpu"]');
+          if (vpuSel) totalVpus += toNumber(vpuSel.value);
+        });
+
+        const qtyLicense = document.getElementById('sum-qty-license');
+        const qtyRam = document.getElementById('sum-qty-ram');
+        const qtyStorageGb = document.getElementById('sum-qty-storage-gb');
+        const qtyVpu = document.getElementById('sum-qty-vpu');
+        const sumTotal = document.getElementById('sum-total-cost');
+        const sumCpu = document.getElementById('sum-cpu-cost');
+        const sumRam = document.getElementById('sum-ram-cost');
+        const sumStorageCapacity = document.getElementById('sum-storage-capacity-cost');
+        const sumStorageVpu = document.getElementById('sum-storage-vpu-cost');
+        const sumLicense = document.getElementById('sum-license-cost');
+        const sumTotalYearly = document.getElementById('sum-total-cost-yearly');
+        const sumCpuYearly = document.getElementById('sum-cpu-cost-yearly');
+        const sumRamYearly = document.getElementById('sum-ram-cost-yearly');
+        const sumStorageCapacityYearly = document.getElementById('sum-storage-capacity-cost-yearly');
+        const sumStorageVpuYearly = document.getElementById('sum-storage-vpu-cost-yearly');
+        const sumLicenseYearly = document.getElementById('sum-license-cost-yearly');
+        const pie = document.getElementById('cost-pie');
+
+        if (qtyLicense) qtyLicense.textContent = formatNumberWhole(licenseIncludedCount);
+        if (qtyRam) qtyRam.textContent = formatNumberWhole(totalMemoryGb);
+        if (qtyStorageGb) qtyStorageGb.textContent = formatNumberWhole(totalProvisionedGb);
+        if (qtyVpu) qtyVpu.textContent = formatNumberWhole(totalVpus);
+        if (sumTotal) sumTotal.innerHTML = `<strong>${formatMoneyWhole(grandTotal)}</strong>`;
+        if (sumCpu) sumCpu.textContent = formatMoneyWhole(cpuTotal);
+        if (sumRam) sumRam.textContent = formatMoneyWhole(ramTotal);
+        if (sumStorageCapacity) sumStorageCapacity.textContent = formatMoneyWhole(storageCapacityTotal);
+        if (sumStorageVpu) sumStorageVpu.textContent = formatMoneyWhole(storageVpuTotal);
+        if (sumLicense) sumLicense.textContent = formatMoneyWhole(licenseCostTotal);
+        if (sumTotalYearly) sumTotalYearly.innerHTML = `<strong>${formatMoneyWhole(grandTotal * 12)}</strong>`;
+        if (sumCpuYearly) sumCpuYearly.textContent = formatMoneyWhole(cpuTotal * 12);
+        if (sumRamYearly) sumRamYearly.textContent = formatMoneyWhole(ramTotal * 12);
+        if (sumStorageCapacityYearly) sumStorageCapacityYearly.textContent = formatMoneyWhole(storageCapacityTotal * 12);
+        if (sumStorageVpuYearly) sumStorageVpuYearly.textContent = formatMoneyWhole(storageVpuTotal * 12);
+        if (sumLicenseYearly) sumLicenseYearly.textContent = formatMoneyWhole(licenseCostTotal * 12);
+
+        const total = cpuTotal + ramTotal + storageCapacityTotal + storageVpuTotal + licenseCostTotal;
+        const cpuPct = total > 0 ? (cpuTotal / total) * 100 : 0;
+        const ramPct = total > 0 ? (ramTotal / total) * 100 : 0;
+        const storageCapacityPct = total > 0 ? (storageCapacityTotal / total) * 100 : 0;
+        const storageVpuPct = total > 0 ? (storageVpuTotal / total) * 100 : 0;
+        const licensePct = total > 0 ? (licenseCostTotal / total) * 100 : 0;
+
+        const c1 = cpuPct;
+        const c2 = c1 + ramPct;
+        const c3 = c2 + storageCapacityPct;
+        const c4 = c3 + storageVpuPct;
+        if (pie) {
+          pie.style.background = `conic-gradient(
+            #4f7cff 0% ${c1}%,
+            #37b26c ${c1}% ${c2}%,
+            #f59f00 ${c2}% ${c3}%,
+            #7048e8 ${c3}% ${c4}%,
+            #d6336c ${c4}% 100%
+          )`;
+          pie.dataset.cpuPct = String(cpuPct);
+          pie.dataset.ramPct = String(ramPct);
+          pie.dataset.storageCapacityPct = String(storageCapacityPct);
+          pie.dataset.storageVpuPct = String(storageVpuPct);
+          pie.dataset.licensePct = String(licensePct);
+          pie.dataset.cpuLabel = `CPU: ${formatMoney(cpuTotal)} (${cpuPct.toFixed(1)}%)`;
+          pie.dataset.ramLabel = `RAM: ${formatMoney(ramTotal)} (${ramPct.toFixed(1)}%)`;
+          pie.dataset.storageCapacityLabel = `Storage: ${formatMoney(storageCapacityTotal)} (${storageCapacityPct.toFixed(1)}%)`;
+          pie.dataset.storageVpuLabel = `VPU: ${formatMoney(storageVpuTotal)} (${storageVpuPct.toFixed(1)}%)`;
+          pie.dataset.licenseLabel = `License: ${formatMoney(licenseCostTotal)} (${licensePct.toFixed(1)}%)`;
+        }
+      }
+
+      const bulkSelect = document.getElementById('bulk_oci_shape');
+      const bulkOsLicenseSelect = document.getElementById('bulk_os_license');
+      const bulkBurstSelect = document.getElementById('bulk_burst');
+      const bulkVpuSelect = document.getElementById('bulk_vpu');
+      const pie = document.getElementById('cost-pie');
+      const pieTooltip = document.getElementById('pie-tooltip');
+      const discountInput = document.getElementById('iaas_discount_pct');
+      const openShapeStrategyBtn = document.getElementById('open-shape-strategy');
+      const shapeStrategyModal = document.getElementById('shape-strategy-modal');
+      const shapeStrategyGrid = document.getElementById('shape-strategy-grid');
+      const applyShapeStrategyBtn = document.getElementById('apply-shape-strategy');
+      const cancelShapeStrategyBtn = document.getElementById('cancel-shape-strategy');
+      const closeShapeStrategyBtn = document.getElementById('close-shape-strategy');
+      const rows = Array.from(document.querySelectorAll('tr.vm-row'));
+
+      function showPieTooltip(event) {
+        if (!pie || !pieTooltip) return;
+        const rect = pie.getBoundingClientRect();
+        const x = event.clientX - rect.left - (rect.width / 2);
+        const y = event.clientY - rect.top - (rect.height / 2);
+        const r = Math.sqrt(x * x + y * y);
+        const radius = rect.width / 2;
+        if (r > radius || r < radius * 0.2) {
+          pieTooltip.style.display = 'none';
+          return;
+        }
+
+        const angle = (Math.atan2(y, x) * 180 / Math.PI + 90 + 360) % 360;
+        const pct = (angle / 360) * 100;
+        const cpuPct = toNumber(pie.dataset.cpuPct);
+        const ramPct = toNumber(pie.dataset.ramPct);
+        const storageCapacityPct = toNumber(pie.dataset.storageCapacityPct);
+        const storageVpuPct = toNumber(pie.dataset.storageVpuPct);
+
+        const c1 = cpuPct;
+        const c2 = c1 + ramPct;
+        const c3 = c2 + storageCapacityPct;
+        const c4 = c3 + storageVpuPct;
+
+        let text = pie.dataset.licenseLabel || '';
+        if (pct <= c1) text = pie.dataset.cpuLabel || text;
+        else if (pct <= c2) text = pie.dataset.ramLabel || text;
+        else if (pct <= c3) text = pie.dataset.storageCapacityLabel || text;
+        else if (pct <= c4) text = pie.dataset.storageVpuLabel || text;
+
+        pieTooltip.textContent = text;
+        pieTooltip.style.left = `${event.clientX - rect.left + 12}px`;
+        pieTooltip.style.top = `${event.clientY - rect.top + 12}px`;
+        pieTooltip.style.display = text ? 'block' : 'none';
+      }
+
+      function hidePieTooltip() {
+        if (pieTooltip) pieTooltip.style.display = 'none';
+      }
+
+      rows.forEach((row) => {
+        const shapeSel = row.querySelector('select[name="oci_shape"]');
+        const osLicenseSel = row.querySelector('select[name="vm_os_license"]');
+        const ocpuInput = row.querySelector('input[name="vm_ocpu"]');
+        const burstSel = row.querySelector('select[name="vm_burst"]');
+        const vpuSel = row.querySelector('select[name="vm_vpu"]');
+
+        if (shapeSel) {
+          shapeSel.addEventListener('change', () => { recalcRow(row); recalcSummary(); });
+        }
+        if (osLicenseSel) {
+          osLicenseSel.addEventListener('change', () => { recalcRow(row); recalcSummary(); });
+        }
+        if (ocpuInput) {
+          ocpuInput.addEventListener('input', () => { recalcRow(row); recalcSummary(); });
+          ocpuInput.addEventListener('change', () => {
+            const fixed = Math.max(1, Math.floor(toNumber(ocpuInput.value)));
+            ocpuInput.value = String(fixed);
+            recalcRow(row);
+            recalcSummary();
+          });
+        }
+        if (burstSel) {
+          burstSel.addEventListener('change', () => { recalcRow(row); recalcSummary(); });
+        }
+        if (vpuSel) {
+          vpuSel.addEventListener('change', () => { recalcRow(row); recalcSummary(); });
+        }
+      });
+
+      recalcSummary();
+
+      if (pie) {
+        pie.addEventListener('mousemove', showPieTooltip);
+        pie.addEventListener('mouseleave', hidePieTooltip);
+        pie.addEventListener('blur', hidePieTooltip);
+      }
+
+      if (!bulkSelect) return;
+
+      bulkSelect.addEventListener('change', function () {
+        const value = this.value;
+        if (!value) return;
+
+        document.querySelectorAll('select[name="oci_shape"]').forEach((sel) => {
+          sel.value = value;
+          const row = sel.closest('tr.vm-row');
+          if (row) recalcRow(row);
+        });
+        recalcSummary();
+      });
+
+      if (bulkOsLicenseSelect) {
+        bulkOsLicenseSelect.addEventListener('change', function () {
+          const value = this.value;
+          if (!value) return;
+
+          document.querySelectorAll('select[name="vm_os_license"]').forEach((sel) => {
+            sel.value = value;
+            const row = sel.closest('tr.vm-row');
+            if (row) recalcRow(row);
+          });
+          recalcSummary();
+        });
+      }
+
+      if (bulkBurstSelect) {
+        bulkBurstSelect.addEventListener('change', function () {
+          const value = this.value;
+          if (!value) return;
+
+          document.querySelectorAll('select[name="vm_burst"]').forEach((sel) => {
+            sel.value = value;
+            const row = sel.closest('tr.vm-row');
+            if (row) recalcRow(row);
+          });
+          recalcSummary();
+        });
+      }
+
+      if (bulkVpuSelect) {
+        bulkVpuSelect.addEventListener('change', function () {
+          const value = this.value;
+          if (value === '') return;
+
+          document.querySelectorAll('select[name="vm_vpu"]').forEach((sel) => {
+            sel.value = value;
+            const row = sel.closest('tr.vm-row');
+            if (row) recalcRow(row);
+          });
+          recalcSummary();
+        });
+      }
+
+      if (discountInput) {
+        discountInput.addEventListener('change', function () {
+          const val = Math.max(0, Math.min(100, toNumber(discountInput.value)));
+          discountInput.value = val.toFixed(2);
+          recalcSummary();
+        });
+        discountInput.addEventListener('input', function () {
+          recalcSummary();
+        });
+      }
+
+      function closeShapeStrategyModal() {
+        if (shapeStrategyModal) {
+          shapeStrategyModal.style.display = 'none';
+          shapeStrategyModal.setAttribute('aria-hidden', 'true');
+        }
+      }
+
+      function openShapeStrategyModal() {
+        if (!shapeStrategyModal || !shapeStrategyGrid) return;
+
+        const osMap = new Map();
+        rows.forEach((row) => {
+          const osName = (row.dataset.osName || '').trim() || 'Unknown / Empty';
+          const shapeSel = row.querySelector('select[name="oci_shape"]');
+          const burstSel = row.querySelector('select[name="vm_burst"]');
+          if (!osMap.has(osName)) {
+            osMap.set(osName, {
+              shape: shapeSel ? shapeSel.value : '',
+              burst: burstSel ? burstSel.value : '100%'
+            });
+          }
+        });
+
+        const shapeOptions = strategyShapeOptions.length
+          ? strategyShapeOptions.map((v) => ({ value: String(v), label: String(v) }))
+          : Array.from(document.querySelectorAll('select[name="oci_shape"] option')).map((o) => ({ value: o.value, label: o.textContent || o.value }));
+        const burstOptions = [
+          { value: '100%', label: '100%' },
+          { value: '50%', label: '50%' },
+          { value: '12.5%', label: '12.5%' }
+        ];
+        shapeStrategyGrid.innerHTML = '';
+
+        Array.from(osMap.keys()).sort((a, b) => a.localeCompare(b)).forEach((osName) => {
+          const label = document.createElement('label');
+          label.textContent = osName;
+          const shapeSelect = document.createElement('select');
+          shapeSelect.dataset.osName = osName;
+          shapeSelect.dataset.role = 'shape';
+          const current = osMap.get(osName) || { shape: '', burst: '100%' };
+          const currentShape = current.shape || '';
+          const currentBurst = (current.burst === '1:1') ? '100%' : (current.burst || '100%');
+
+          shapeOptions.forEach((opt) => {
+            const clone = document.createElement('option');
+            clone.value = opt.value;
+            clone.textContent = opt.label;
+            if (clone.value === currentShape) clone.selected = true;
+            shapeSelect.appendChild(clone);
+          });
+
+          const burstSelect = document.createElement('select');
+          burstSelect.dataset.osName = osName;
+          burstSelect.dataset.role = 'burst';
+          burstOptions.forEach((opt) => {
+            const clone = document.createElement('option');
+            clone.value = opt.value;
+            clone.textContent = opt.label;
+            if (clone.value === currentBurst) clone.selected = true;
+            burstSelect.appendChild(clone);
+          });
+
+          shapeStrategyGrid.appendChild(label);
+          shapeStrategyGrid.appendChild(shapeSelect);
+          shapeStrategyGrid.appendChild(burstSelect);
+        });
+
+        shapeStrategyModal.style.display = 'flex';
+        shapeStrategyModal.setAttribute('aria-hidden', 'false');
+      }
+
+      function applyShapeStrategy() {
+        if (!shapeStrategyGrid) return;
+        const mapping = new Map();
+        const byOs = new Map();
+        shapeStrategyGrid.querySelectorAll('select[data-os-name][data-role]').forEach((sel) => {
+          const osName = sel.dataset.osName || '';
+          const role = sel.dataset.role || '';
+          if (!byOs.has(osName)) byOs.set(osName, {});
+          byOs.get(osName)[role] = sel.value;
+        });
+        byOs.forEach((vals, osName) => {
+          mapping.set(osName, {
+            shape: vals.shape || '',
+            burst: vals.burst || '100%'
+          });
+        });
+
+        rows.forEach((row) => {
+          const osName = (row.dataset.osName || '').trim() || 'Unknown / Empty';
+          const target = mapping.get(osName);
+          const shapeSel = row.querySelector('select[name="oci_shape"]');
+          const burstSel = row.querySelector('select[name="vm_burst"]');
+          if (shapeSel && target && target.shape) shapeSel.value = target.shape;
+          if (burstSel && target && target.burst) burstSel.value = target.burst;
+          recalcRow(row);
+        });
+        recalcSummary();
+        closeShapeStrategyModal();
+      }
+
+      if (openShapeStrategyBtn) openShapeStrategyBtn.addEventListener('click', openShapeStrategyModal);
+      if (applyShapeStrategyBtn) applyShapeStrategyBtn.addEventListener('click', applyShapeStrategy);
+      if (cancelShapeStrategyBtn) cancelShapeStrategyBtn.addEventListener('click', closeShapeStrategyModal);
+      if (closeShapeStrategyBtn) closeShapeStrategyBtn.addEventListener('click', closeShapeStrategyModal);
+      if (shapeStrategyModal) {
+        shapeStrategyModal.addEventListener('click', (e) => {
+          if (e.target === shapeStrategyModal) closeShapeStrategyModal();
+        });
+      }
+
+      const vmTable = document.querySelector('table.vm-table');
+      const sortableHeaders = vmTable ? Array.from(vmTable.querySelectorAll('th.sortable[data-sort-index]')) : [];
+      const numericSortCols = new Set([3, 4, 6, 7, 8, 10, 11, 12, 13]);
+      let activeSortIndex = null;
+      let activeSortDir = 'asc';
+
+      function parseSortableValue(raw, isNumeric) {
+        if (!isNumeric) return (raw || '').toLowerCase();
+        const cleaned = String(raw || '').replace(/[^0-9.-]/g, '');
+        const n = Number(cleaned);
+        return Number.isFinite(n) ? n : 0;
+      }
+
+      function updateSortHeaderState() {
+        sortableHeaders.forEach((th) => {
+          th.classList.remove('sorted-asc', 'sorted-desc');
+          const idx = Number(th.dataset.sortIndex || '-1');
+          if (idx === activeSortIndex) {
+            th.classList.add(activeSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+          }
+        });
+      }
+
+      function sortVmRowsByColumn(colIdx, direction) {
+        if (!vmTable) return;
+        const tbody = vmTable.querySelector('tbody');
+        if (!tbody) return;
+
+        const vmRows = Array.from(tbody.querySelectorAll('tr.vm-row'));
+        if (!vmRows.length) return;
+
+        const isNumeric = numericSortCols.has(colIdx);
+        vmRows.sort((rowA, rowB) => {
+          const cellsA = rowA.querySelectorAll('td');
+          const cellsB = rowB.querySelectorAll('td');
+          const rawA = cellsA[colIdx] ? cellsA[colIdx].textContent : '';
+          const rawB = cellsB[colIdx] ? cellsB[colIdx].textContent : '';
+          const a = parseSortableValue(rawA, isNumeric);
+          const b = parseSortableValue(rawB, isNumeric);
+
+          if (a < b) return direction === 'asc' ? -1 : 1;
+          if (a > b) return direction === 'asc' ? 1 : -1;
+          return 0;
+        });
+
+        vmRows.forEach((row) => tbody.appendChild(row));
+      }
+
+      sortableHeaders.forEach((th) => {
+        th.addEventListener('click', () => {
+          const colIdx = Number(th.dataset.sortIndex || '-1');
+          if (colIdx < 0) return;
+
+          if (activeSortIndex === colIdx) {
+            activeSortDir = activeSortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            activeSortIndex = colIdx;
+            activeSortDir = 'asc';
+          }
+
+          sortVmRowsByColumn(activeSortIndex, activeSortDir);
+          updateSortHeaderState();
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

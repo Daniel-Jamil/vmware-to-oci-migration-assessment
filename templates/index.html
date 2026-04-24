@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vmw2oci - Step 1 & 2</title>
+  <style>
+    :root {
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --text: #121417;
+      --muted: #5f6672;
+      --line: #d9dde3;
+      --line-strong: #c8cdd6;
+      --accent: #0f62fe;
+      --accent-2: #0043ce;
+      --error: #b42318;
+      --success: #137333;
+      --radius: 0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      letter-spacing: 0.01em;
+      color: var(--text);
+      background: var(--bg);
+    }
+    .container {
+      width: 100%;
+      margin: 0;
+      background: var(--panel);
+      min-height: 100vh;
+      padding: 2rem;
+    }
+    h1, h2, h3 {
+      margin-top: 0;
+      line-height: 1.2;
+      font-weight: 600;
+      letter-spacing: 0.005em;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 1.25rem; }
+    h2 { font-size: 1.2rem; margin: 2rem 0 .6rem; }
+    h3 { font-size: 1rem; margin-bottom: .5rem; }
+    p { margin: .5rem 0 1rem; color: var(--text); }
+    form {
+      display: grid;
+      grid-template-columns: 170px minmax(260px, 1fr) auto;
+      gap: .6rem;
+      align-items: center;
+      margin: .7rem 0 1rem;
+      padding: .7rem 0;
+      border-top: 1px solid var(--line);
+    }
+    label { font-weight: 600; font-size: .92rem; }
+    select, button {
+      padding: .62rem .72rem;
+      font-size: .92rem;
+      border-radius: var(--radius);
+      border: 1px solid var(--line-strong);
+    }
+    select { background: #fff; color: var(--text); }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    button:hover { background: var(--accent-2); border-color: var(--accent-2); }
+    .flash { padding: .65rem .75rem; border-radius: var(--radius); margin-bottom: .65rem; border: 1px solid; }
+    .flash.success { background: #edf7ef; color: var(--success); border-color: #b8ddbf; }
+    .flash.error { background: #fef1f1; color: var(--error); border-color: #efc4c1; }
+    .result {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: var(--radius);
+      padding: .9rem 1rem;
+      margin-top: .9rem;
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color .15s ease;
+    }
+    a:hover { border-bottom-color: var(--accent); }
+    a.btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: .4rem;
+      padding: .6rem .8rem;
+      border: 1px solid var(--line-strong);
+      color: var(--text);
+      background: #fff;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    a.btn:hover { border-color: var(--accent); color: var(--accent); }
+    code { background: #eff2f5; padding: .1rem .35rem; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>vmw2oci Wizard</h1>
+    <h2>Step 1 - OCI Price List Downloader</h2>
+    <p>
+      Select a currency and download the Oracle Cloud public price list from
+      <code>/cetools/api/v1/products/</code>.
+    </p>
+
+    {% if downloaded_price_lists %}
+      <form method="post">
+        <input type="hidden" name="action" value="select_pricelist" />
+        <label for="price_list_file"><strong>Existing price list:</strong></label>
+        <select id="price_list_file" name="price_list_file" required>
+          {% for f in downloaded_price_lists %}
+            <option value="{{ f }}" {% if f == selected_pricelist_file %}selected{% endif %}>{{ f }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit">Use Selected Price List</button>
+      </form>
+    {% endif %}
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post">
+      <input type="hidden" name="action" value="download_pricing" />
+      <label for="currency_code">Currency:</label>
+      <select id="currency_code" name="currency_code" required>
+        {% for c in currencies %}
+          <option value="{{ c }}" {% if c == selected_currency %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Download Latest Price List</button>
+    </form>
+
+    {% if selected_pricelist_info %}
+      <div class="result">
+        <h3>Active Price List</h3>
+        <p><strong>Currency:</strong> {{ selected_pricelist_info.currency }}</p>
+        <p><strong>Pricing entries:</strong> {{ selected_pricelist_info.item_count }}</p>
+        <p><strong>Selected file:</strong> <code>{{ selected_pricelist_info.file_path }}</code></p>
+      </div>
+    {% endif %}
+
+    {% if download_info %}
+      <div class="result">
+        <h3>Download Result</h3>
+        <p><strong>Currency:</strong> {{ download_info.currency }}</p>
+        <p><strong>Items retrieved:</strong> {{ download_info.item_count }}</p>
+        <p><strong>Oracle lastUpdated:</strong> {{ download_info.last_updated }}</p>
+        <p><strong>Saved file:</strong> <code>{{ download_info.file_path }}</code></p>
+      </div>
+    {% endif %}
+
+    <h2 style="margin-top: 2rem;">Step 2 - Select RVTools Export File</h2>
+    <p>Select one of the discovered RVTools export files from the <code>rvtools/</code> folder.</p>
+
+    <form method="post">
+      <input type="hidden" name="action" value="select_rvtools_file" />
+      <label for="rvtools_file">RVTools file:</label>
+      <select id="rvtools_file" name="rvtools_file" required>
+        <option value="">-- Select RVTools export --</option>
+        {% for f in rvtools_files %}
+          <option value="{{ f }}" {% if f == selected_rvtools_file %}selected{% endif %}>{{ f }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Select File</button>
+    </form>
+
+    {% if rvtools_file_info %}
+      <div class="result">
+        <h3>Selected RVTools File</h3>
+        <p><strong>File name:</strong> {{ rvtools_file_info.file_name }}</p>
+        <p><strong>Path:</strong> <code>{{ rvtools_file_info.file_path }}</code></p>
+        <p><strong>Size (KB):</strong> {{ rvtools_file_info.size_kb }}</p>
+        <p style="margin-top: 1rem;">
+          <a class="btn" href="{{ url_for('step3') }}">Go to Step 3 - Select VMs</a>
+        </p>
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>

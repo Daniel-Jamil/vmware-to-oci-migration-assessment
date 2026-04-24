@@ -1,0 +1,37 @@
+Windows Server 2016
+Windows Server 2019
+Windows Server 2022
+Windows Server 2025
+Ubuntu Linux 
+CentOS 6.9
+CentOS 7
+CentOS 8
+Debian 5
+Debian 6
+Debian 7
+Debian 8
+Debian GNU/Linux 11
+Debian GNU/Linux 10
+Debian GNU/Linux 9
+Debian GNU/Linux 8 
+Debian GNU/Linux 7
+Debian GNU/Linux 6 
+FreeBSD
+SUSE Linux Enterprise 12 
+SUSE Linux Enterprise 11
+SUSE openSUSE
+openSUSE 15
+Oracle Linux 5
+Oracle Linux 6
+Oracle Linux 7
+Oracle Linux 8
+Oracle Linux 9
+Red Hat Enterprise Linux 4
+Red Hat Enterprise Linux 5
+Red Hat Enterprise Linux 6
+Red Hat Enterprise Linux 7
+Red Hat Enterprise Linux 8
+Red Hat Enterprise Linux 9
+Red Hat Enterprise Linux 10
+SUSE 11
+SUSE 12
