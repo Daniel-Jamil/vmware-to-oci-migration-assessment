@@ -25,6 +25,65 @@ This application was originally based on an internal VMware-to-OCI sizing utilit
 - Compare monthly, annual, and 3-year price signals.
 - Export a presentation-ready Excel assessment workbook.
 
+## Quick Start on macOS
+
+Use these steps for teammates running the app locally on a Mac.
+
+Prerequisites:
+
+- macOS
+- Python 3.9 or newer
+- GitHub access to this private repository
+
+Clone the repository:
+
+```bash
+cd ~/Documents
+mkdir -p Projects
+cd Projects
+git clone https://github.com/Daniel-Jamil/vmware-to-oci-migration-assessment.git
+cd vmware-to-oci-migration-assessment
+```
+
+Create and activate a Python virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the app:
+
+```bash
+MIGRATION_ASSESSMENT_PORT=5059 python app.py
+```
+
+Open the app:
+
+```text
+http://127.0.0.1:5059/
+```
+
+To stop the app, return to Terminal and press `Ctrl + C`.
+
+If port `5059` is already in use, choose another port:
+
+```bash
+MIGRATION_ASSESSMENT_PORT=5060 python app.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5060/
+```
+
 ## Install
 
 Use Python 3.9 or newer.
