@@ -22,6 +22,8 @@ downloads/exports/
 *.zip
 /vmware2oci/
 /vmware2oci [0-9]*/
+/vmware-to-oci-migration-assessment/
+/vmware-to-oci-migration-assessment [0-9]*/
 
 # Downloaded/generated OCI price lists and local report data
 downloads/oci_pricing_*.json

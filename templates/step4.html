@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>vmw2oci - Settings</title>
+  <title>VMware to OCI Migration Assessment - Migration Paths</title>
   <style>
     :root {
       --bg: #f4f5f7;
@@ -2903,7 +2903,7 @@
         if (pageHeading) {
           pageHeading.textContent = pageTitles[targetId] || 'Migration Path Overview';
         }
-        document.title = `vmw2oci - ${mainTitleText}`;
+        document.title = `VMware to OCI Migration Assessment - ${mainTitleText}`;
         tabs.forEach((tab) => {
           const isActive = tab.dataset.scenarioTab === targetId;
           tab.classList.toggle('is-active', isActive);
@@ -2914,7 +2914,7 @@
           panel.classList.toggle('is-active', isActive);
           panel.hidden = !isActive;
         });
-        document.dispatchEvent(new CustomEvent('vmw2oci:scenario-tab-changed', { detail: { id: targetId } }));
+        document.dispatchEvent(new CustomEvent('migration-assessment:scenario-tab-changed', { detail: { id: targetId } }));
         if (updateHash) {
           window.history.replaceState(null, '', `#scenario-${targetId}`);
         }
@@ -3831,7 +3831,7 @@
           || Boolean(document.getElementById('scenario-panel-native')?.classList.contains('is-active'));
       }
 
-      document.addEventListener('vmw2oci:scenario-tab-changed', (event) => {
+      document.addEventListener('migration-assessment:scenario-tab-changed', (event) => {
         if (event.detail && event.detail.id === 'native') {
           initNativeEditor();
         }

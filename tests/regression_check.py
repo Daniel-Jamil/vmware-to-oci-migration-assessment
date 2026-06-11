@@ -20,7 +20,7 @@ import app as app_module
 
 TMP_ROOT = Path("/private/tmp") if Path("/private/tmp").exists() else Path("/tmp")
 RUN_ID = uuid4().hex
-REGRESSION_ROOT = TMP_ROOT / f"vmware2oci_regression_{RUN_ID}"
+REGRESSION_ROOT = TMP_ROOT / f"migration_assessment_regression_{RUN_ID}"
 app_module.DOWNLOADS_DIR = REGRESSION_ROOT / "downloads"
 app_module.RVTOOLS_DIR = REGRESSION_ROOT / "rvtools"
 app_module.APP_STATE_DIR = REGRESSION_ROOT / "app_state"

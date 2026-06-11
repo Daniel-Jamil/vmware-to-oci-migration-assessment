@@ -822,7 +822,7 @@ def fetch_oci_price_list(currency_code: str) -> dict[str, Any]:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) vmw2oci/1.0",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) vmware-to-oci-migration-assessment/1.0",
             "Accept": "application/json",
         },
     )

@@ -1,4 +1,4 @@
-# VMware to OCI Migration Path Price Comparison
+# VMware to OCI Migration Assessment
 
 Local Flask app for assessing VMware workload migration paths to Oracle Cloud Infrastructure.
 
@@ -26,7 +26,7 @@ This tool is for migration-path assessment and price comparison. It is not a fin
 Use Python 3.9 or newer.
 
 ```bash
-cd /path/to/vmware2oci
+cd /path/to/vmware-to-oci-migration-assessment
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -35,7 +35,7 @@ pip install -r requirements.txt
 Windows PowerShell:
 
 ```powershell
-cd C:\path\to\vmware2oci
+cd C:\path\to\vmware-to-oci-migration-assessment
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
