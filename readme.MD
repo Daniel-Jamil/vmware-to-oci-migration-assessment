@@ -25,15 +25,23 @@ This application was originally based on an internal VMware-to-OCI sizing utilit
 - Compare monthly, annual, and 3-year price signals.
 - Export a presentation-ready Excel assessment workbook.
 
-## Quick Start on macOS
+## Quick Start
 
-Use these steps for teammates running the app locally on a Mac.
+Use these steps to run the app locally on macOS or Windows.
 
 Prerequisites:
 
-- macOS
 - Python 3.9 or newer
-- GitHub access to this private repository
+- Git
+- A terminal application:
+  - macOS: Terminal
+  - Windows: PowerShell
+
+This project is intended to be available as a public GitHub repository. The app still runs locally on each user's computer at `127.0.0.1`; it is not a hosted multi-user web service.
+
+If Git is not installed, download the repository ZIP from GitHub, unzip it, and open a terminal in the extracted folder.
+
+### macOS
 
 Clone the repository:
 
@@ -84,50 +92,78 @@ Then open:
 http://127.0.0.1:5060/
 ```
 
-## Install
+### Windows
 
-Use Python 3.9 or newer.
-
-```bash
-cd /path/to/vmware-to-oci-migration-assessment
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Windows PowerShell:
+Open PowerShell, then clone the repository:
 
 ```powershell
-cd C:\path\to\vmware-to-oci-migration-assessment
+cd $env:USERPROFILE\Documents
+mkdir Projects -Force
+cd Projects
+git clone https://github.com/Daniel-Jamil/vmware-to-oci-migration-assessment.git
+cd vmware-to-oci-migration-assessment
+```
+
+Create and activate a Python virtual environment:
+
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation, run this once in the same PowerShell window, then activate again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
 pip install -r requirements.txt
 ```
 
-## Run
+Start the app:
 
-Default:
-
-```bash
+```powershell
+$env:MIGRATION_ASSESSMENT_PORT="5059"
 python app.py
 ```
 
-Open:
+Open the app:
 
 ```text
-http://127.0.0.1:5000/
+http://127.0.0.1:5059/
 ```
 
-Use another port if needed:
+To stop the app, return to PowerShell and press `Ctrl + C`.
 
-```bash
-MIGRATION_ASSESSMENT_PORT=5059 python app.py
+If port `5059` is already in use, choose another port:
+
+```powershell
+$env:MIGRATION_ASSESSMENT_PORT="5060"
+python app.py
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:5059/
+http://127.0.0.1:5060/
+```
+
+### Run From an Existing Folder
+
+If you already downloaded or cloned the project, open a terminal in the project folder and run:
+
+```bash
+python app.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5000/
 ```
 
 ## Basic Workflow
