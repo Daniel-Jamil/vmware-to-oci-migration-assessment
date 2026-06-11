@@ -58,7 +58,7 @@ http://127.0.0.1:5000/
 Use another port if needed:
 
 ```bash
-VMW2OCI_PORT=5059 python app.py
+MIGRATION_ASSESSMENT_PORT=5059 python app.py
 ```
 
 Then open:

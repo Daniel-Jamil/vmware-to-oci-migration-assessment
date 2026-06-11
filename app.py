@@ -27,8 +27,16 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 
-def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
-    raw_value = os.environ.get(name)
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        raw_value = os.environ.get(name)
+        if raw_value is not None:
+            return raw_value
+    return None
+
+
+def _env_int(*names: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw_value = _first_env(*names)
     if raw_value is None:
         return default
     try:
@@ -42,19 +50,39 @@ def _env_int(name: str, default: int, *, min_value: int | None = None, max_value
     return value
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw_value = os.environ.get(name)
+def _env_bool(*names: str, default: bool = False) -> bool:
+    raw_value = _first_env(*names)
     if raw_value is None:
         return default
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("VMW2OCI_SECRET_KEY") or os.environ.get("FLASK_SECRET_KEY") or uuid4().hex
-app.config["MAX_CONTENT_LENGTH"] = _env_int("VMW2OCI_MAX_UPLOAD_MB", 250, min_value=1) * 1024 * 1024
+app.config["SECRET_KEY"] = (
+    os.environ.get("MIGRATION_ASSESSMENT_SECRET_KEY")
+    or os.environ.get("VMW2OCI_SECRET_KEY")
+    or os.environ.get("FLASK_SECRET_KEY")
+    or uuid4().hex
+)
+app.config["MAX_CONTENT_LENGTH"] = _env_int(
+    "MIGRATION_ASSESSMENT_MAX_UPLOAD_MB",
+    "VMW2OCI_MAX_UPLOAD_MB",
+    default=250,
+    min_value=1,
+) * 1024 * 1024
 # Step 4 can submit thousands of small per-VM form fields for large inventories.
-app.config["MAX_FORM_MEMORY_SIZE"] = _env_int("VMW2OCI_MAX_FORM_MB", 128, min_value=1) * 1024 * 1024
-app.config["MAX_FORM_PARTS"] = _env_int("VMW2OCI_MAX_FORM_PARTS", 50000, min_value=1000)
+app.config["MAX_FORM_MEMORY_SIZE"] = _env_int(
+    "MIGRATION_ASSESSMENT_MAX_FORM_MB",
+    "VMW2OCI_MAX_FORM_MB",
+    default=128,
+    min_value=1,
+) * 1024 * 1024
+app.config["MAX_FORM_PARTS"] = _env_int(
+    "MIGRATION_ASSESSMENT_MAX_FORM_PARTS",
+    "VMW2OCI_MAX_FORM_PARTS",
+    default=50000,
+    min_value=1000,
+)
 APP_INSTANCE_ID = uuid4().hex
 
 
@@ -62,7 +90,8 @@ APP_INSTANCE_ID = uuid4().hex
 def request_entity_too_large(_: RequestEntityTooLarge) -> Any:
     flash(
         "The submitted form is larger than the current local limit. "
-        "For very large inventories, increase VMW2OCI_MAX_FORM_MB or VMW2OCI_MAX_FORM_PARTS and restart the app.",
+        "For very large inventories, increase MIGRATION_ASSESSMENT_MAX_FORM_MB or "
+        "MIGRATION_ASSESSMENT_MAX_FORM_PARTS and restart the app.",
         "error",
     )
     if request.path.startswith(("/step4", "/scenario", "/step5")):
@@ -5848,7 +5877,7 @@ def step5() -> str:
 
 if __name__ == "__main__":
     app.run(
-        host=os.environ.get("VMW2OCI_HOST", "127.0.0.1"),
-        port=_env_int("VMW2OCI_PORT", 5000, min_value=1, max_value=65535),
-        debug=_env_bool("VMW2OCI_DEBUG", False),
+        host=_first_env("MIGRATION_ASSESSMENT_HOST", "VMW2OCI_HOST") or "127.0.0.1",
+        port=_env_int("MIGRATION_ASSESSMENT_PORT", "VMW2OCI_PORT", default=5000, min_value=1, max_value=65535),
+        debug=_env_bool("MIGRATION_ASSESSMENT_DEBUG", "VMW2OCI_DEBUG", default=False),
     )
