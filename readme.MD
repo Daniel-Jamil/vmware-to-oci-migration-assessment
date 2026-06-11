@@ -21,7 +21,7 @@ This application was originally based on an internal VMware-to-OCI sizing utilit
 - Check OCI Native OS support.
 - Estimate OCI Native compute, storage, VPU, and Windows license-included costs.
 - Estimate OCVS node count, shape, datastore cost, and optional VCF license exposure.
-- Model Hybrid placement between OCI Native and OCVS.
+- Model Hybrid placement between OCI Native and OCVS, marking VMs not supported on OCI Native for OCVS while still allowing manual placement.
 - Compare monthly, annual, and 3-year price signals.
 - Export a presentation-ready Excel assessment workbook.
 
