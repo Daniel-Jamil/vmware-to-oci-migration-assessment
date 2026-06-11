@@ -16,7 +16,7 @@ This application was originally based on an internal VMware-to-OCI sizing utilit
 
 ## Main Capabilities
 
-- Import VM inventory from RVTools, VMwareInventory, or compatible Excel/CSV files.
+- Import VM inventory from RVTools exports.
 - Select the VMs included in the assessment.
 - Check OCI Native OS support.
 - Estimate OCI Native compute, storage, VPU, and Windows license-included costs.
