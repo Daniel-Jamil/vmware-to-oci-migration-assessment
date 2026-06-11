@@ -10,6 +10,10 @@ It compares estimated OCI infrastructure and licensing run-rate for:
 
 This tool is for migration-path assessment and price comparison. It is not a final quote, OCI Cost Estimator replacement, or full TCO/business-case model. Final sizing and pricing must be validated with official Oracle tools before customer sign-off.
 
+## Project Origin
+
+This application was originally based on an internal VMware-to-OCI sizing utility and has been significantly extended into a migration assessment tool covering OCI Native, OCVS, Hybrid placement, price comparison, and Excel reporting.
+
 ## Main Capabilities
 
 - Import VM inventory from RVTools, VMwareInventory, or compatible Excel/CSV files.
