@@ -16,8 +16,26 @@ desktop.ini
 ._*
 
 # Project temp runtime state
-downloads/app_state/*.json
-downloads/app_state/*_snapshot.json
+.codex_snapshots/
+downloads/app_state/
+downloads/exports/
+*.zip
+/vmware2oci/
+/vmware2oci [0-9]*/
 
-# Downloaded OCI price lists
+# Downloaded/generated OCI price lists and local report data
 downloads/oci_pricing_*.json
+downloads/*.json
+
+# Local customer inventories and spreadsheet working copies
+rvtools/*
+!rvtools/
+!rvtools/README.txt
+!rvtools/example_RVTools_tabvInfo.csv
+~$*.xlsx
+~$*.xlsm
+
+# Legacy local scratch copies not used by app.py routes
+app2.py
+templates/scenario.html
+templates/step5.html

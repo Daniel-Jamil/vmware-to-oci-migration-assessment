@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 import csv
+import hashlib
 import math
 import io
+import re
+import subprocess
+import sys
 import zipfile
 import ssl
 import xml.etree.ElementTree as ET
@@ -18,43 +22,249 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import time
 
-from flask import Flask, Response, flash, redirect, render_template, request, session, url_for
+from flask import Flask, flash, redirect, render_template, request, send_file, session, url_for
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "change-me-in-production"
+app.config["SECRET_KEY"] = os.environ.get("VMW2OCI_SECRET_KEY") or os.environ.get("FLASK_SECRET_KEY") or uuid4().hex
+app.config["MAX_CONTENT_LENGTH"] = _env_int("VMW2OCI_MAX_UPLOAD_MB", 250, min_value=1) * 1024 * 1024
+# Step 4 can submit thousands of small per-VM form fields for large inventories.
+app.config["MAX_FORM_MEMORY_SIZE"] = _env_int("VMW2OCI_MAX_FORM_MB", 128, min_value=1) * 1024 * 1024
+app.config["MAX_FORM_PARTS"] = _env_int("VMW2OCI_MAX_FORM_PARTS", 50000, min_value=1000)
+APP_INSTANCE_ID = uuid4().hex
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_entity_too_large(_: RequestEntityTooLarge) -> Any:
+    flash(
+        "The submitted form is larger than the current local limit. "
+        "For very large inventories, increase VMW2OCI_MAX_FORM_MB or VMW2OCI_MAX_FORM_PARTS and restart the app.",
+        "error",
+    )
+    if request.path.startswith(("/step4", "/scenario", "/step5")):
+        return redirect(step4_tab_redirect("native")), 303
+    return redirect(url_for("index")), 303
+
+
+@app.before_request
+def reset_session_for_new_app_start() -> None:
+    """Start each freshly launched app process with a clean browser session."""
+    if session.get("_app_instance_id") != APP_INSTANCE_ID:
+        session.clear()
+        session["_app_instance_id"] = APP_INSTANCE_ID
+
+
+@app.after_request
+def add_html_no_cache_headers(response: Any) -> Any:
+    if response.mimetype == "text/html":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 OCI_PRODUCTS_API_BASE = "https://apexapps.oracle.com/pls/apex/cetools/api/v1/products/"
 DOWNLOADS_DIR = Path("downloads")
 RVTOOLS_DIR = Path("rvtools")
+EXPORTS_DIR = DOWNLOADS_DIR / "exports"
 
-# Common currencies supported by OCI pricing API.
+# Currencies exposed by the local assessment UI.
 SUPPORTED_CURRENCIES = [
     "USD",
     "EUR",
     "GBP",
-    "AUD",
-    "CAD",
-    "JPY",
-    "SGD",
     "CHF",
     "SEK",
     "NOK",
     "DKK",
 ]
 
-SUPPORTED_RVTOOLS_EXTENSIONS = {".xlsx", ".csv"}
+SUPPORTED_RVTOOLS_EXTENSIONS = {".xlsx", ".xlsm", ".csv"}
 OS_MAPPING_CONFIG_PATH = Path("config/os_mapping.json")
 OCI_SUPPORTED_OS_PATH = Path("OCI-SupportedOS.txt")
 OCI_PRICE_MAPPING_PATH = Path("OCI-PriceMapping")
 APP_STATE_DIR = Path("downloads/app_state")
+PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
+MAX_VISIBLE_PRICE_LISTS = 10
+NATIVE_VM_INPUT_ROW_LIMIT = 500
 
+HOURS_PER_MONTH = 730.0
+MIN_BLOCK_VOLUME_GB = 50
+VPU_OPTIONS = list(range(10, 121, 10))
+VALID_BURST_VALUES = {"100%", "50%", "12.5%", "1:1"}
+VALID_OCVS_DR_NODE_COUNTS = {0, 1, 2}
+BURST_FACTOR_MAP = {
+    "100%": 1.0,
+    "1:1": 1.0,
+    "50%": 0.5,
+    "12.5%": 0.125,
+}
+OS_LICENSE_VALUES = {"BYOL", "Lic Include"}
+HYBRID_PLACEMENT_VALUES = {"native", "ocvs"}
+HYBRID_PLACEMENT_LABELS = {
+    "native": "OCI Native",
+    "ocvs": "OCVS",
+}
+HYBRID_PLACEMENT_OPTIONS = [
+    {"value": "native", "label": "OCI Native"},
+    {"value": "ocvs", "label": "OCVS"},
+]
 
+OCVS_DEFAULT_SIZING_POLICY = {
+    "vcpu_per_ocpu": 4.0,
+    "cpu_headroom_pct": 20.0,
+    "memory_headroom_pct": 20.0,
+    "storage_headroom_pct": 25.0,
+    "dense_vsan_usable_pct": 50.0,
+    "standard_storage_vpu": 10,
+}
+
+OCVS_HOST_PROFILES = [
+    {
+        "shape": "BM.DenseIO2.52",
+        "label": "OCVS DenseIO2",
+        "host_type": "Dense",
+        "ocpus": 52,
+        "memory_gb": 768,
+        "nvme_tb": 51.2,
+        "min_hosts": 3,
+        "max_hosts": 64,
+        "ocpu_display_name": "Compute - Virtual Machine Dense I/O - X7",
+        "memory_display_name": "",
+        "nvme_display_name": "",
+    },
+    {
+        "shape": "BM.DenseIO.E4.128",
+        "label": "OCVS Dense E4",
+        "host_type": "Dense",
+        "ocpus": 128,
+        "memory_gb": 2048,
+        "nvme_tb": 54.4,
+        "min_hosts": 3,
+        "max_hosts": 64,
+        "ocpu_display_name": "Compute - Dense I/O - E4 - OCPU",
+        "memory_display_name": "Compute - Dense I/O - E4 - Memory",
+        "nvme_display_name": "Compute - Dense I/O - E4 - NVMe",
+    },
+    {
+        "shape": "BM.DenseIO.E5.128",
+        "label": "OCVS Dense E5",
+        "host_type": "Dense",
+        "ocpus": 128,
+        "memory_gb": 1536,
+        "nvme_tb": 81.6,
+        "min_hosts": 3,
+        "max_hosts": 64,
+        "ocpu_display_name": "Oracle Cloud Infrastructure - Compute - Dense I/O - E5 OCPU",
+        "memory_display_name": "Oracle Cloud Infrastructure - Compute - Dense I/O - E5 Memory",
+        "nvme_display_name": "Oracle Cloud Infrastructure - Compute - Dense I/O - E5 NVMe",
+    },
+    {
+        "shape": "BM.Standard2.52",
+        "label": "OCVS Standard2",
+        "host_type": "Standard",
+        "ocpus": 52,
+        "memory_gb": 768,
+        "nvme_tb": 0.0,
+        "min_hosts": 3,
+        "max_hosts": 32,
+        "ocpu_display_name": "Compute - Virtual Machine Standard - X7",
+        "memory_display_name": "",
+        "nvme_display_name": "",
+    },
+    {
+        "shape": "BM.Standard3.64",
+        "label": "OCVS Standard3",
+        "host_type": "Standard",
+        "ocpus": 64,
+        "memory_gb": 1024,
+        "nvme_tb": 0.0,
+        "min_hosts": 3,
+        "max_hosts": 32,
+        "ocpu_display_name": "Compute - Standard - X9 - OCPU",
+        "memory_display_name": "Compute - Standard - X9 - Memory",
+        "nvme_display_name": "",
+    },
+    {
+        "shape": "BM.Standard.E4.128",
+        "label": "OCVS Standard E4",
+        "host_type": "Standard",
+        "ocpus": 128,
+        "memory_gb": 2048,
+        "nvme_tb": 0.0,
+        "min_hosts": 3,
+        "max_hosts": 32,
+        "ocpu_display_name": "Compute - Standard - E4 - OCPU",
+        "memory_display_name": "Compute - Standard - E4  - Memory",
+        "nvme_display_name": "",
+    },
+    {
+        "shape": "BM.Standard.E5.192",
+        "label": "OCVS Standard E5",
+        "host_type": "Standard",
+        "ocpus": 192,
+        "memory_gb": 2304,
+        "nvme_tb": 0.0,
+        "min_hosts": 3,
+        "max_hosts": 32,
+        "ocpu_display_name": "Compute - Standard - E5 - OCPU",
+        "memory_display_name": "Compute - Standard - E5 - Memory",
+        "nvme_display_name": "",
+    },
+]
 
 def _cleanup_legacy_session_keys() -> None:
     """Remove large legacy client-side session keys (cookie bloat guard)."""
     session.pop("selected_vm_names", None)
     session.pop("step4_os_shapes", None)
+
+
+def normalize_customer_name(value: Any) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    return clean[:120]
+
+
+def customer_file_slug(customer_name: str) -> str:
+    clean = normalize_customer_name(customer_name).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", clean).strip("_")
+    return (slug[:64].strip("_") or "customer")
+
+
+def build_export_filename(
+    customer_name: str,
+    artifact_name: str,
+    extension: str,
+    timestamp: str | None = None,
+) -> str:
+    artifact_slug = re.sub(r"[^a-z0-9]+", "_", str(artifact_name or "export").lower()).strip("_")
+    artifact_slug = artifact_slug or "export"
+    ext = str(extension or "").lstrip(".") or "dat"
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{customer_file_slug(customer_name)}_{artifact_slug}_{timestamp}.{ext}"
 
 
 def _default_app_state() -> dict[str, Any]:
@@ -66,7 +276,56 @@ def _default_app_state() -> dict[str, Any]:
         "step4_vm_bursts": {},
         "step4_vm_vpus": {},
         "step4_vm_os_license": {},
+        "step4_hybrid_placements": {},
         "step4_iaas_discount_pct": 0.0,
+        "step4_ocvs_profile": "best_fit",
+        "step4_ocvs_policy": dict(OCVS_DEFAULT_SIZING_POLICY),
+        "step4_vmware_license_price_per_core_yearly": 0.0,
+        "step4_ocvs_dr_nodes": 0,
+        "step4_last_updated_at": "",
+    }
+
+
+def normalize_ocvs_profile(value: Any) -> str:
+    selected = str(value or "best_fit").strip()
+    valid_shapes = {str(profile.get("shape", "")).strip() for profile in OCVS_HOST_PROFILES}
+    return selected if selected == "best_fit" or selected in valid_shapes else "best_fit"
+
+
+def normalize_ocvs_dr_nodes(value: Any) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        parsed = 0
+    return parsed if parsed in VALID_OCVS_DR_NODE_COUNTS else 0
+
+
+def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def normalize_ocvs_policy(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    default = OCVS_DEFAULT_SIZING_POLICY
+    return {
+        "vcpu_per_ocpu": _bounded_float(raw.get("vcpu_per_ocpu"), float(default["vcpu_per_ocpu"]), 1.0, 16.0),
+        "cpu_headroom_pct": _bounded_float(raw.get("cpu_headroom_pct"), float(default["cpu_headroom_pct"]), 0.0, 90.0),
+        "memory_headroom_pct": _bounded_float(raw.get("memory_headroom_pct"), float(default["memory_headroom_pct"]), 0.0, 90.0),
+        "storage_headroom_pct": _bounded_float(raw.get("storage_headroom_pct"), float(default["storage_headroom_pct"]), 0.0, 90.0),
+        "dense_vsan_usable_pct": _bounded_float(raw.get("dense_vsan_usable_pct"), float(default["dense_vsan_usable_pct"]), 10.0, 95.0),
+        "standard_storage_vpu": _bounded_int(raw.get("standard_storage_vpu"), int(default["standard_storage_vpu"]), 10, 120),
     }
 
 
@@ -89,6 +348,38 @@ def _step4_snapshot_file_path() -> Path:
 
     APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
     return APP_STATE_DIR / f"{state_id}_step4_snapshot.json"
+
+
+def _preferences_file_path() -> Path:
+    APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return APP_STATE_DIR / "preferences.json"
+
+
+def load_preferences() -> dict[str, Any]:
+    preferences_file = _preferences_file_path()
+    if not preferences_file.exists():
+        return {}
+    try:
+        loaded = json.loads(preferences_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def save_preferences(preferences: dict[str, Any]) -> None:
+    preferences_file = _preferences_file_path()
+    preferences_file.write_text(json.dumps(preferences, indent=2), encoding="utf-8")
+
+
+def remember_price_list_selection(file_path: str, currency: str = "") -> None:
+    clean_file = str(file_path or "").strip().replace("\\", "/")
+    if not clean_file:
+        return
+    preferences = load_preferences()
+    preferences["last_selected_pricelist_file"] = clean_file
+    if currency:
+        preferences["last_selected_currency"] = str(currency).upper().strip()
+    save_preferences(preferences)
 
 
 def load_step4_snapshot() -> dict[str, Any]:
@@ -147,11 +438,28 @@ def load_app_state() -> dict[str, Any]:
         default["step4_vm_vpus"] = {}
     if not isinstance(default.get("step4_vm_os_license"), dict):
         default["step4_vm_os_license"] = {}
+    if not isinstance(default.get("step4_hybrid_placements"), dict):
+        default["step4_hybrid_placements"] = {}
+    else:
+        default["step4_hybrid_placements"] = {
+            str(vm_name): normalize_hybrid_placement(value, "ocvs")
+            for vm_name, value in default["step4_hybrid_placements"].items()
+        }
     try:
         discount_value = float(default.get("step4_iaas_discount_pct", 0.0))
     except (TypeError, ValueError):
         discount_value = 0.0
     default["step4_iaas_discount_pct"] = max(0.0, min(100.0, discount_value))
+    default["step4_ocvs_profile"] = normalize_ocvs_profile(default.get("step4_ocvs_profile", "best_fit"))
+    default["step4_ocvs_policy"] = normalize_ocvs_policy(default.get("step4_ocvs_policy", {}))
+    default["step4_vmware_license_price_per_core_yearly"] = _bounded_float(
+        default.get("step4_vmware_license_price_per_core_yearly"),
+        0.0,
+        0.0,
+        1_000_000.0,
+    )
+    default["step4_ocvs_dr_nodes"] = normalize_ocvs_dr_nodes(default.get("step4_ocvs_dr_nodes", 0))
+    default.pop("step4_vmware_license_discount_pct", None)
     return default
 
 
@@ -250,6 +558,25 @@ def list_downloaded_price_lists() -> list[str]:
     return [str(p).replace("\\", "/") for p in files]
 
 
+def find_downloaded_price_list_for_currency(currency_code: str) -> str:
+    """Return newest downloaded OCI price list that matches the requested currency."""
+    wanted = str(currency_code or "").upper().strip()
+    if not wanted:
+        return ""
+
+    for file_path in list_downloaded_price_lists():
+        path = Path(file_path)
+        name_parts = path.stem.split("_")
+        if len(name_parts) >= 3 and name_parts[2].upper() == wanted:
+            return str(path).replace("\\", "/")
+
+        _, loaded_currency, source_file = load_price_lookup(file_path)
+        if loaded_currency.upper() == wanted:
+            return source_file or str(path).replace("\\", "/")
+
+    return ""
+
+
 def load_price_lookup(preferred_file: str | None = None) -> tuple[dict[str, float], str, str]:
     """Load OCI price lookup from a preferred file, falling back to latest."""
     candidate: Path | None = None
@@ -319,6 +646,172 @@ def load_price_lookup(preferred_file: str | None = None) -> tuple[dict[str, floa
     return lookup, currency, str(candidate).replace("\\", "/")
 
 
+def _to_number(value: Any) -> float:
+    try:
+        return float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _find_price_by_terms(
+    price_lookup: dict[str, float],
+    exact_name: str,
+    required_terms: tuple[str, ...],
+    excluded_terms: tuple[str, ...] = (),
+) -> float:
+    """Find an OCI unit price by exact display name, then by stable name terms."""
+    if exact_name in price_lookup:
+        return float(price_lookup.get(exact_name, 0.0))
+
+    for display_name, value in price_lookup.items():
+        normalized = str(display_name).lower()
+        if all(term in normalized for term in required_terms) and not any(
+            term in normalized for term in excluded_terms
+        ):
+            return float(value)
+    return 0.0
+
+
+def resolve_pricing_unit_prices(price_lookup: dict[str, float]) -> dict[str, float]:
+    """Resolve shared unit prices used by native VM and OCVS costing."""
+    return {
+        "block_storage_unit_price": _find_price_by_terms(
+            price_lookup,
+            "Storage - Block Volume - Storage",
+            ("block volume", "storage"),
+            ("free",),
+        ),
+        "block_perf_unit_price": _find_price_by_terms(
+            price_lookup,
+            "Storage - Block Volume - Performance Units",
+            ("block volume", "performance units"),
+        ),
+        "windows_os_unit_price": float(price_lookup.get("Compute - Windows OS", 0.0)),
+    }
+
+
+def normalize_burst_value(value: Any) -> str:
+    burst = str(value or "100%").strip()
+    if burst == "1:1":
+        return "100%"
+    return burst if burst in VALID_BURST_VALUES else "100%"
+
+
+def build_vm_cost_row(
+    vm: dict[str, Any],
+    *,
+    shape_options: list[str],
+    shape_pricing_map: dict[str, dict[str, str]],
+    price_lookup: dict[str, float],
+    block_storage_unit_price: float,
+    block_perf_unit_price: float,
+    windows_os_unit_price: float,
+    iaas_discount_pct: float,
+    vm_shape_selection: dict[str, Any],
+    vm_ocpu_selection: dict[str, Any],
+    vm_burst_selection: dict[str, Any],
+    vm_vpu_selection: dict[str, Any],
+    vm_os_license_selection: dict[str, Any],
+    valid_shape_values: set[str] | None = None,
+    valid_vpu_values: set[int] | None = None,
+) -> dict[str, Any]:
+    vm_name = str(vm.get("name") or "").strip()
+    cpu_val = int(_to_number(vm.get("cpus")))
+    default_ocpu = max(1, cpu_val // 2)
+
+    try:
+        effective_ocpu = max(1, int(vm_ocpu_selection.get(vm_name, default_ocpu)))
+    except (TypeError, ValueError):
+        effective_ocpu = default_ocpu
+
+    burst = normalize_burst_value(vm_burst_selection.get(vm_name, "100%"))
+    burst_factor = float(BURST_FACTOR_MAP.get(burst, 1.0))
+
+    valid_shape_values = valid_shape_values or set(shape_options)
+    fallback_shape = shape_options[0] if shape_options else ""
+    selected_shape = str(vm_shape_selection.get(vm_name, fallback_shape)).strip()
+    if selected_shape not in valid_shape_values:
+        selected_shape = fallback_shape
+
+    valid_vpu_values = valid_vpu_values or set(VPU_OPTIONS)
+    try:
+        saved_vpu = int(vm_vpu_selection.get(vm_name, 10))
+    except (TypeError, ValueError):
+        saved_vpu = 10
+    vpu_value = saved_vpu if saved_vpu in valid_vpu_values else 10
+
+    raw_os_value = str(vm.get("raw_os") or "").strip()
+    is_windows_server = "windows server" in raw_os_value.lower()
+    os_license = ""
+    if is_windows_server:
+        saved_license = str(vm_os_license_selection.get(vm_name, "BYOL")).strip()
+        os_license = saved_license if saved_license in OS_LICENSE_VALUES else "BYOL"
+
+    shape_map = shape_pricing_map.get(selected_shape, {})
+    ocpu_display = str(shape_map.get("ocpu_display_name", "")).strip()
+    memory_display = str(shape_map.get("memory_display_name", "")).strip()
+    ocpu_unit_price = float(price_lookup.get(ocpu_display, 0.0))
+    memory_unit_price = float(price_lookup.get(memory_display, 0.0))
+
+    memory_mb = int(_to_number(vm.get("memory_mb")))
+    provisioned_mib = int(_to_number(vm.get("provisioned_mib")))
+    memory_gb = int(math.ceil(memory_mb / 1024.0))
+    raw_provisioned_gb = int(math.ceil(provisioned_mib / 1024.0))
+    provisioned_gb = max(MIN_BLOCK_VOLUME_GB, raw_provisioned_gb)
+
+    cpu_monthly_cost = effective_ocpu * ocpu_unit_price * HOURS_PER_MONTH * burst_factor
+    ram_monthly_cost = memory_gb * memory_unit_price * HOURS_PER_MONTH
+    cpu_ram_monthly_cost = cpu_monthly_cost + ram_monthly_cost
+    storage_capacity_monthly_cost = provisioned_gb * block_storage_unit_price
+    storage_performance_monthly_cost = provisioned_gb * vpu_value * block_perf_unit_price
+    storage_monthly_cost = storage_capacity_monthly_cost + storage_performance_monthly_cost
+    os_license_monthly_cost = (
+        windows_os_unit_price * effective_ocpu * HOURS_PER_MONTH * burst_factor
+    ) if os_license == "Lic Include" else 0.0
+
+    discount_factor = max(0.0, min(1.0, 1.0 - (iaas_discount_pct / 100.0)))
+    cpu_monthly_cost *= discount_factor
+    ram_monthly_cost *= discount_factor
+    cpu_ram_monthly_cost *= discount_factor
+    storage_capacity_monthly_cost *= discount_factor
+    storage_performance_monthly_cost *= discount_factor
+    storage_monthly_cost *= discount_factor
+
+    return {
+        "vm_name": vm_name,
+        "os_name": raw_os_value or "Unknown / Empty",
+        "power_state": str(vm.get("power_state") or "").strip(),
+        "is_windows_server": is_windows_server,
+        "os_license": os_license,
+        "cpus": cpu_val,
+        "ocpu": effective_ocpu,
+        "burst": burst,
+        "memory_mb": memory_mb,
+        "provisioned_mib": provisioned_mib,
+        "memory_gb": memory_gb,
+        "raw_provisioned_gb": raw_provisioned_gb,
+        "provisioned_gb": provisioned_gb,
+        "vpu": vpu_value,
+        "oci_shape": selected_shape,
+        "ocpu_unit_price": ocpu_unit_price,
+        "memory_unit_price": memory_unit_price,
+        "cpu_ram_monthly_cost": cpu_ram_monthly_cost,
+        "cpu_monthly_cost": cpu_monthly_cost,
+        "ram_monthly_cost": ram_monthly_cost,
+        "storage_capacity_monthly_cost": storage_capacity_monthly_cost,
+        "storage_performance_monthly_cost": storage_performance_monthly_cost,
+        "storage_monthly_cost": storage_monthly_cost,
+        "os_license_monthly_cost": os_license_monthly_cost,
+    }
+
+
+def build_vm_cost_rows(
+    vms: list[dict[str, Any]],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    return [build_vm_cost_row(vm, **kwargs) for vm in vms]
+
+
 def fetch_oci_price_list(currency_code: str) -> dict[str, Any]:
     """Fetch OCI list pricing from Oracle CE tools API for a specific currency."""
     params = urlencode({"currencyCode": currency_code})
@@ -349,15 +842,12 @@ def fetch_oci_price_list(currency_code: str) -> dict[str, Any]:
     for ctx in ssl_contexts:
         for attempt in range(1, 4):
             try:
-                with urlopen(req, timeout=60, context=ctx) as response:
+                with urlopen(req, timeout=PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS, context=ctx) as response:
                     body = response.read().decode("utf-8")
                 break
             except (URLError, TimeoutError, ConnectionResetError) as exc:
                 last_network_exc = exc
-                if attempt == 3:
-                    # try next SSL context before giving up
-                    pass
-                else:
+                if attempt < 3:
                     time.sleep(attempt)
                     continue
         else:
@@ -418,10 +908,30 @@ def list_rvtools_export_files() -> list[str]:
     for root, _, filenames in os.walk(RVTOOLS_DIR):
         root_path = Path(root)
         for name in filenames:
+            if name.startswith("~$") or name.startswith("."):
+                continue
             file_path = root_path / name
             if file_path.suffix.lower() in SUPPORTED_RVTOOLS_EXTENSIONS:
                 files.append(str(file_path).replace("\\", "/"))
     return sorted(files)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_sha256(upload: Any) -> str:
+    digest = hashlib.sha256()
+    stream = upload.stream
+    stream.seek(0)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest()
 
 
 def load_os_mapping_config() -> dict[str, Any]:
@@ -472,7 +982,7 @@ def resolve_vinfo_csv(selected_path: str) -> Path:
     # RVTools names the vInfo file RVTools_tabvInfo.csv; also allow prefixed names
     # (e.g. example_RVTools_tabvInfo.csv) when the file is a direct CSV selection.
     n = selected.name.lower()
-    if selected.is_file() and n.endswith("rvtools_tabvinfo.csv"):
+    if selected.is_file() and selected.suffix.lower() == ".csv":
         return selected
 
     # If an export archive was selected, try extracted folder with same stem.
@@ -486,8 +996,8 @@ def resolve_vinfo_csv(selected_path: str) -> Path:
                 return candidate
 
     raise FileNotFoundError(
-        "Could not locate RVTools_tabvInfo.csv for the selected export. "
-        "Please select a matching RVTools export file/folder."
+        "Could not locate a supported VM inventory CSV for the selected export. "
+        "Please select a matching RVTools or VMwareInventory export file/folder."
     )
 
 
@@ -499,8 +1009,155 @@ def _col_letters_to_index(col_letters: str) -> int:
     return max(idx - 1, 0)
 
 
-def parse_vinfo_from_xlsx(xlsx_path: Path) -> list[dict[str, str]]:
-    """Parse vInfo sheet from RVTools XLSX without external dependencies."""
+VM_NAME_HEADERS = (
+    "VM",
+    "VM ID",
+    "VM-ID",
+    "VMID",
+    "MOB ID",
+    "VM Name",
+    "Name",
+    "Server Name",
+    "Hostname",
+    "Host Name",
+    "Machine Name",
+    "Virtual Machine",
+    "Full Qualified Domain Name",
+    "Fully Qualified Domain Name",
+    "FQDN",
+)
+POWER_STATE_HEADERS = ("Powerstate", "PowerState", "Power State", "IsRunning", "Running", "State")
+TEMPLATE_HEADERS = ("Template", "Is Template")
+OS_HEADERS = (
+    "OS according to the configuration file",
+    "OS according to configuration file",
+    "OS according to VMware Tools",
+    "OS according to the VMware Tools",
+    "Guest Version",
+    "VM OS",
+    "Guest OS",
+    "Operating System",
+    "OS",
+)
+CPU_HEADERS = ("CPUs", "CPU", "vCPU", "vCPUs", "Virtual CPU", "Virtual CPUs", "CPU Count", "# vCPU", "Cores", "Core")
+MEMORY_MIB_HEADERS = ("Memory", "Memory MiB", "Memory MB", "Provisioned Memory (MiB)", "Provisioned Memory MB", "Size MiB")
+MEMORY_GB_HEADERS = ("Memory GB", "Memory (GB)", "RAM GB", "RAM (GB)", "RAM", "Mem GB")
+STORAGE_MIB_HEADERS = (
+    "Provisioned MiB",
+    "Provisioned MB",
+    "Virtual Disk Size (MiB)",
+    "Guest VM Disk Capacity (MiB)",
+    "Provisioned Storage MiB",
+    "Capacity MiB",
+)
+STORAGE_GB_HEADERS = (
+    "Storage GB",
+    "Storage (GB)",
+    "Provisioned GB",
+    "Provisioned Storage GB",
+    "Disk GB",
+    "Total Storage GB",
+    "Storage",
+    "Total Disk (GB)",
+    "Total Disk GB",
+    "Disk (GB)",
+    "Disk GB",
+)
+
+
+def _normalize_header_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _normalized_header_set(headers: tuple[str, ...]) -> set[str]:
+    return {_normalize_header_name(header) for header in headers if str(header or "").strip()}
+
+
+VM_NAME_HEADER_SET = _normalized_header_set(VM_NAME_HEADERS)
+POWER_STATE_HEADER_SET = _normalized_header_set(POWER_STATE_HEADERS)
+TEMPLATE_HEADER_SET = _normalized_header_set(TEMPLATE_HEADERS)
+OS_HEADER_SET = _normalized_header_set(OS_HEADERS)
+CPU_HEADER_SET = _normalized_header_set(CPU_HEADERS)
+MEMORY_MIB_HEADER_SET = _normalized_header_set(MEMORY_MIB_HEADERS)
+MEMORY_GB_HEADER_SET = _normalized_header_set(MEMORY_GB_HEADERS)
+STORAGE_MIB_HEADER_SET = _normalized_header_set(STORAGE_MIB_HEADERS)
+STORAGE_GB_HEADER_SET = _normalized_header_set(STORAGE_GB_HEADERS)
+
+
+def _record_first_value(record: dict[str, Any], *headers: str) -> str:
+    for header in headers:
+        value = record.get(header)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    normalized_lookup = {
+        _normalize_header_name(key): value
+        for key, value in record.items()
+        if str(key or "").strip()
+    }
+    for header in headers:
+        value = normalized_lookup.get(_normalize_header_name(header))
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _record_first_value_from_set(record: dict[str, Any], header_set: set[str]) -> str:
+    for key, value in record.items():
+        if _normalize_header_name(key) in header_set and value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _size_text_to_mib(value: Any, default_unit: str) -> str:
+    text = str(value or "").strip().lower().replace("\xa0", " ")
+    if not text:
+        return ""
+
+    compact = text.replace(" ", "")
+    if "," in compact and "." not in compact:
+        compact = compact.replace(",", ".")
+    else:
+        compact = compact.replace(",", "")
+
+    match = re.search(r"-?\d+(?:\.\d+)?", compact)
+    if not match:
+        return ""
+
+    try:
+        number = float(match.group(0))
+    except ValueError:
+        return ""
+
+    if number < 0:
+        return ""
+
+    if "tib" in compact or re.search(r"\btb\b", text):
+        mib = number * 1024.0 * 1024.0
+    elif "gib" in compact or re.search(r"\bgb\b", text):
+        mib = number * 1024.0
+    elif "mib" in compact or re.search(r"\bmb\b", text):
+        mib = number
+    elif default_unit == "gb":
+        mib = number * 1024.0
+    elif default_unit == "tb":
+        mib = number * 1024.0 * 1024.0
+    else:
+        mib = number
+
+    return str(int(math.ceil(mib)))
+
+
+def _normalize_xlsx_target_path(target: str) -> str:
+    normalized = str(target or "").replace("\\", "/").lstrip("/")
+    while normalized.startswith("../"):
+        normalized = normalized[3:]
+    if normalized.startswith("xl/"):
+        return normalized
+    return f"xl/{normalized}"
+
+
+def _read_xlsx_sheets(xlsx_path: Path) -> dict[str, list[dict[int, str]]]:
     ns_main = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
     offdoc_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -513,26 +1170,6 @@ def parse_vinfo_from_xlsx(xlsx_path: Path) -> list[dict[str, str]]:
             for rel in rels_xml.findall(f"{{{rel_ns}}}Relationship")
         }
 
-        vinfo_target: str | None = None
-        sheets = workbook_xml.find("m:sheets", ns_main)
-        if sheets is not None:
-            for sheet in sheets:
-                name = (sheet.attrib.get("name") or "").strip().lower()
-                rel_id = sheet.attrib.get(f"{{{offdoc_rel_ns}}}id", "")
-                if name == "vinfo":
-                    vinfo_target = rel_map.get(rel_id)
-                    break
-
-        if not vinfo_target:
-            raise ValueError("Could not find vInfo sheet in selected XLSX.")
-
-        normalized_target = str(vinfo_target or "").replace("\\", "/").lstrip("/")
-        if normalized_target.startswith("xl/"):
-            sheet_xml_path = normalized_target
-        else:
-            sheet_xml_path = f"xl/{normalized_target}"
-        sheet_xml = ET.fromstring(z.read(sheet_xml_path))
-
         shared_strings: list[str] = []
         if "xl/sharedStrings.xml" in z.namelist():
             sst_xml = ET.fromstring(z.read("xl/sharedStrings.xml"))
@@ -543,98 +1180,413 @@ def parse_vinfo_from_xlsx(xlsx_path: Path) -> list[dict[str, str]]:
         def read_cell_value(cell: ET.Element) -> str:
             cell_type = cell.attrib.get("t", "")
             if cell_type == "inlineStr":
-                t = cell.find("m:is/m:t", ns_main)
-                return (t.text or "") if t is not None else ""
+                text_node = cell.find("m:is/m:t", ns_main)
+                return (text_node.text or "") if text_node is not None else ""
 
-            v = cell.find("m:v", ns_main)
-            raw = (v.text or "") if v is not None else ""
+            value_node = cell.find("m:v", ns_main)
+            raw = (value_node.text or "") if value_node is not None else ""
             if cell_type == "s" and raw.isdigit():
                 idx = int(raw)
                 if 0 <= idx < len(shared_strings):
                     return shared_strings[idx]
             return raw
 
-        rows: list[dict[int, str]] = []
-        sheet_data = sheet_xml.find("m:sheetData", ns_main)
-        if sheet_data is None:
-            return []
+        parsed_sheets: dict[str, list[dict[int, str]]] = {}
+        sheets = workbook_xml.find("m:sheets", ns_main)
+        if sheets is None:
+            return parsed_sheets
 
-        for row in sheet_data.findall("m:row", ns_main):
-            data: dict[int, str] = {}
-            for cell in row.findall("m:c", ns_main):
-                ref = cell.attrib.get("r", "")
-                col_letters = "".join(ch for ch in ref if ch.isalpha()).upper()
-                col_idx = _col_letters_to_index(col_letters) if col_letters else len(data)
-                data[col_idx] = read_cell_value(cell).strip()
-            rows.append(data)
+        for sheet in sheets:
+            original_name = (sheet.attrib.get("name") or "").strip()
+            rel_id = sheet.attrib.get(f"{{{offdoc_rel_ns}}}id", "")
+            sheet_target = rel_map.get(rel_id, "")
+            sheet_xml_path = _normalize_xlsx_target_path(sheet_target)
+            if not original_name or sheet_xml_path not in z.namelist():
+                continue
 
-        if not rows:
-            return []
+            sheet_xml = ET.fromstring(z.read(sheet_xml_path))
+            sheet_data = sheet_xml.find("m:sheetData", ns_main)
+            rows: list[dict[int, str]] = []
+            if sheet_data is None:
+                parsed_sheets[original_name] = rows
+                continue
 
-        headers_by_idx = rows[0]
-        headers: dict[int, str] = {
-            idx: value.strip() for idx, value in headers_by_idx.items() if value.strip()
-        }
+            for row in sheet_data.findall("m:row", ns_main):
+                data: dict[int, str] = {}
+                for cell in row.findall("m:c", ns_main):
+                    ref = cell.attrib.get("r", "")
+                    col_letters = "".join(ch for ch in ref if ch.isalpha()).upper()
+                    col_idx = _col_letters_to_index(col_letters) if col_letters else len(data)
+                    data[col_idx] = read_cell_value(cell).strip()
+                rows.append(data)
+            parsed_sheets[original_name] = rows
 
-        parsed: list[dict[str, str]] = []
-        for row in rows[1:]:
-            record: dict[str, str] = {}
-            for idx, header in headers.items():
-                record[header] = row.get(idx, "")
-            if any(v.strip() for v in record.values()):
-                parsed.append(record)
+        return parsed_sheets
 
-        return parsed
+
+def _records_from_sheet_rows(rows: list[dict[int, str]], header_row_idx: int = 0) -> list[dict[str, str]]:
+    if header_row_idx >= len(rows):
+        return []
+
+    headers_by_idx = rows[header_row_idx]
+    headers: dict[int, str] = {
+        idx: value.strip() for idx, value in headers_by_idx.items() if value.strip()
+    }
+    if not headers:
+        return []
+
+    parsed: list[dict[str, str]] = []
+    for row in rows[header_row_idx + 1 :]:
+        record = {header: row.get(idx, "") for idx, header in headers.items()}
+        if any(str(value or "").strip() for value in record.values()):
+            parsed.append(record)
+    return parsed
+
+
+def _header_roles(headers: list[str]) -> set[str]:
+    roles: set[str] = set()
+    for header in headers:
+        normalized = _normalize_header_name(header)
+        if normalized in VM_NAME_HEADER_SET:
+            roles.add("vm")
+        if normalized in CPU_HEADER_SET:
+            roles.add("cpu")
+        if normalized in MEMORY_MIB_HEADER_SET or normalized in MEMORY_GB_HEADER_SET:
+            roles.add("memory")
+        if normalized in STORAGE_MIB_HEADER_SET or normalized in STORAGE_GB_HEADER_SET:
+            roles.add("storage")
+        if normalized in OS_HEADER_SET:
+            roles.add("os")
+        if normalized in POWER_STATE_HEADER_SET:
+            roles.add("power")
+    return roles
+
+
+def _looks_like_generic_vm_header(row: dict[int, str]) -> bool:
+    headers = [value for value in row.values() if str(value or "").strip()]
+    roles = _header_roles(headers)
+    return {"vm", "cpu", "memory", "storage"}.issubset(roles)
+
+
+def _looks_like_oci_estimate_workbook(sheet_rows_by_name: dict[str, list[dict[int, str]]]) -> bool:
+    for rows in sheet_rows_by_name.values():
+        for row in rows[:25]:
+            values = [str(value or "").strip() for value in row.values() if str(value or "").strip()]
+            if not values:
+                continue
+            row_text = " ".join(values).lower()
+            if "oracle investment proposal" in row_text or "oci cost estimator" in row_text:
+                return True
+            normalized_values = {_normalize_header_name(value) for value in values}
+            if {"part", "description", "unit price"}.issubset(normalized_values) and (
+                "monthly cost" in normalized_values or "total cost 12 months" in normalized_values
+            ):
+                return True
+    return False
+
+
+def _vm_name_from_record(record: dict[str, Any]) -> str:
+    return _record_first_value_from_set(record, VM_NAME_HEADER_SET)
+
+
+def _records_by_vm(records: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    indexed: dict[str, dict[str, str]] = {}
+    for record in records:
+        vm_name = _vm_name_from_record(record)
+        if vm_name and vm_name not in indexed:
+            indexed[vm_name] = record
+    return indexed
+
+
+def _sum_storage_mib_by_vm(records: list[dict[str, str]]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for record in records:
+        vm_name = _vm_name_from_record(record)
+        if not vm_name:
+            continue
+        raw_mib = _record_first_value_from_set(record, STORAGE_MIB_HEADER_SET)
+        storage_mib = _size_text_to_mib(raw_mib, "mib") if raw_mib else ""
+        if not storage_mib:
+            raw_gb = _record_first_value_from_set(record, STORAGE_GB_HEADER_SET)
+            storage_mib = _size_text_to_mib(raw_gb, "gb") if raw_gb else ""
+        totals[vm_name] = totals.get(vm_name, 0) + int(_to_number(storage_mib))
+    return totals
+
+
+def _first_indexed_record_value(index: dict[str, dict[str, str]], vm_name: str, header_set: set[str]) -> str:
+    record = index.get(vm_name)
+    if not record:
+        return ""
+    return _record_first_value_from_set(record, header_set)
+
+
+def _sheet_records_by_lower_name(sheet_rows_by_name: dict[str, list[dict[int, str]]]) -> dict[str, list[dict[str, str]]]:
+    return {
+        sheet_name.lower(): _records_from_sheet_rows(rows, 0)
+        for sheet_name, rows in sheet_rows_by_name.items()
+    }
+
+
+def _enrich_with_rvtools_detail_sheets(
+    records: list[dict[str, str]],
+    sheet_rows_by_name: dict[str, list[dict[int, str]]],
+) -> list[dict[str, str]]:
+    records_by_sheet = _sheet_records_by_lower_name(sheet_rows_by_name)
+    cpu_index = _records_by_vm(records_by_sheet.get("vcpu", []))
+    memory_index = _records_by_vm(records_by_sheet.get("vmemory", []))
+    disk_records = records_by_sheet.get("vdisk", [])
+    disk_totals = _sum_storage_mib_by_vm(disk_records)
+
+    os_indexes = [
+        _records_by_vm(records_by_sheet.get(sheet_name, []))
+        for sheet_name in ("vinfo", "vtools", "vcd")
+    ]
+    power_indexes = [
+        _records_by_vm(records_by_sheet.get(sheet_name, []))
+        for sheet_name in ("vinfo", "vcpu", "vmemory", "vdisk", "vtools", "vcd")
+    ]
+
+    if not records:
+        vm_names = sorted(set(cpu_index) | set(memory_index) | set(disk_totals))
+        records = [{"VM": vm_name} for vm_name in vm_names]
+
+    enriched: list[dict[str, str]] = []
+    for original_record in records:
+        record = dict(original_record)
+        vm_name = _vm_name_from_record(record)
+        if not vm_name:
+            continue
+
+        if not _record_first_value_from_set(record, CPU_HEADER_SET):
+            value = _first_indexed_record_value(cpu_index, vm_name, CPU_HEADER_SET)
+            if value:
+                record["CPUs"] = value
+
+        if not _record_first_value_from_set(record, MEMORY_MIB_HEADER_SET):
+            value = _first_indexed_record_value(memory_index, vm_name, MEMORY_MIB_HEADER_SET)
+            if value:
+                record["Memory MiB"] = value
+
+        if not _record_first_value_from_set(record, STORAGE_MIB_HEADER_SET) and disk_totals.get(vm_name):
+            record["Provisioned MiB"] = str(disk_totals[vm_name])
+
+        if not _record_first_value_from_set(record, OS_HEADER_SET):
+            for index in os_indexes:
+                value = _first_indexed_record_value(index, vm_name, OS_HEADER_SET)
+                if value:
+                    record["OS according to the configuration file"] = value
+                    break
+
+        if not _record_first_value_from_set(record, POWER_STATE_HEADER_SET):
+            for index in power_indexes:
+                value = _first_indexed_record_value(index, vm_name, POWER_STATE_HEADER_SET)
+                if value:
+                    record["Powerstate"] = value
+                    break
+
+        if not _record_first_value_from_set(record, TEMPLATE_HEADER_SET):
+            value = _first_indexed_record_value(cpu_index, vm_name, TEMPLATE_HEADER_SET)
+            if value:
+                record["Template"] = value
+
+        enriched.append(record)
+
+    return enriched
+
+
+def _find_generic_inventory_records(
+    sheet_rows_by_name: dict[str, list[dict[int, str]]],
+) -> tuple[list[dict[str, str]], str] | None:
+    candidates: list[tuple[int, int, str, int, list[dict[str, str]]]] = []
+    for sheet_name, rows in sheet_rows_by_name.items():
+        for header_row_idx, row in enumerate(rows[:30]):
+            if not _looks_like_generic_vm_header(row):
+                continue
+            records = _records_from_sheet_rows(rows, header_row_idx)
+            vm_record_count = sum(1 for record in records if _vm_name_from_record(record))
+            if not vm_record_count:
+                continue
+            normalized_sheet_name = _normalize_header_name(sheet_name)
+            name_score = 0
+            if "pivot" in normalized_sheet_name:
+                name_score -= 100
+            if "data vm" in normalized_sheet_name or normalized_sheet_name in {"vms", "virtual machines"}:
+                name_score += 40
+            elif "vm" in normalized_sheet_name:
+                name_score += 20
+            if "mssql" in normalized_sheet_name or "sql" in normalized_sheet_name:
+                name_score -= 5
+            candidates.append((name_score, vm_record_count, sheet_name, header_row_idx, records))
+
+    if not candidates:
+        return None
+
+    _, _, sheet_name, header_row_idx, records = max(candidates, key=lambda item: (item[0], item[1]))
+    return records, f"{sheet_name} row {header_row_idx + 1}"
+
+
+def _find_partial_inventory_diagnostic(sheet_rows_by_name: dict[str, list[dict[int, str]]]) -> str:
+    for sheet_name, rows in sheet_rows_by_name.items():
+        for header_row_idx, row in enumerate(rows[:30]):
+            headers = [value for value in row.values() if str(value or "").strip()]
+            roles = _header_roles(headers)
+            if "vm" not in roles:
+                continue
+
+            missing: list[str] = []
+            if "cpu" not in roles:
+                missing.append("vCPU")
+            if "memory" not in roles:
+                missing.append("RAM")
+            if "storage" not in roles:
+                missing.append("storage")
+
+            if missing:
+                return (
+                    f"The workbook looks like a VM list or workload categorization file on sheet "
+                    f"'{sheet_name}' row {header_row_idx + 1}, but it is missing required sizing columns: "
+                    f"{', '.join(missing)}. Upload this as supplementary categorization later, or use a VM inventory "
+                    "with VM name, vCPU, RAM, storage, and OS columns for sizing."
+                )
+    return ""
+
+
+def _find_aggregate_capacity_diagnostic(sheet_rows_by_name: dict[str, list[dict[int, str]]]) -> str:
+    for sheet_name, rows in sheet_rows_by_name.items():
+        for header_row_idx, row in enumerate(rows[:30]):
+            normalized_values = {
+                _normalize_header_name(value)
+                for value in row.values()
+                if str(value or "").strip()
+            }
+            if "environment" in normalized_values and "core" in normalized_values and "memory" in normalized_values and "storage" in normalized_values:
+                return (
+                    f"The workbook looks like an aggregate infrastructure capacity assessment on sheet "
+                    f"'{sheet_name}'. It contains environment-level cores, RAM, and storage totals, but not "
+                    "per-VM rows. Use it as advisory input, or upload VM-level inventory for sizing and "
+                    "migration-path analysis."
+                )
+    return ""
+
+
+def parse_vinfo_from_xlsx(xlsx_path: Path) -> tuple[list[dict[str, str]], str]:
+    """Parse VM inventory records from RVTools, VMwareInventory, or generic VM inventory sheets."""
+    sheet_rows_by_name = _read_xlsx_sheets(xlsx_path)
+    if not sheet_rows_by_name:
+        raise ValueError("The selected workbook does not contain readable worksheets.")
+
+    lower_to_name = {sheet_name.lower(): sheet_name for sheet_name in sheet_rows_by_name}
+
+    if "vinfo" in lower_to_name:
+        source_sheet = lower_to_name["vinfo"]
+        records = _records_from_sheet_rows(sheet_rows_by_name[source_sheet], 0)
+        records = _enrich_with_rvtools_detail_sheets(records, sheet_rows_by_name)
+        return records, f"{source_sheet} + RVTools detail tabs"
+
+    for candidate in ("vms", "virtual machines"):
+        if candidate in lower_to_name:
+            source_sheet = lower_to_name[candidate]
+            records = _records_from_sheet_rows(sheet_rows_by_name[source_sheet], 0)
+            return records, source_sheet
+
+    rvtools_detail_sheets = {"vcpu", "vmemory", "vdisk"}
+    if rvtools_detail_sheets.issubset(set(lower_to_name)):
+        records = _enrich_with_rvtools_detail_sheets([], sheet_rows_by_name)
+        if records:
+            return records, "RVTools detail tabs"
+
+    generic_match = _find_generic_inventory_records(sheet_rows_by_name)
+    if generic_match:
+        return generic_match
+
+    partial_inventory_message = _find_partial_inventory_diagnostic(sheet_rows_by_name)
+    if partial_inventory_message:
+        raise ValueError(partial_inventory_message)
+
+    aggregate_capacity_message = _find_aggregate_capacity_diagnostic(sheet_rows_by_name)
+    if aggregate_capacity_message:
+        raise ValueError(aggregate_capacity_message)
+
+    if _looks_like_oci_estimate_workbook(sheet_rows_by_name):
+        raise ValueError(
+            "The selected workbook appears to be an OCI pricing estimate, not a VM-level inventory. "
+            "Please upload an RVTools export or a spreadsheet with VM name, vCPU, RAM, storage, and OS columns."
+        )
+
+    raise ValueError(
+        "Could not find a VM-level inventory table. Supported workbooks need RVTools tabs "
+        "(vInfo, or vCPU/vMemory/vDisk) or a table with VM name, vCPU, RAM, storage, and OS columns."
+    )
 
 
 def load_vms_from_vinfo(selected_path: str) -> tuple[list[dict[str, Any]], str]:
-    """Load VM list from RVTools vInfo CSV and return rows + source CSV path."""
+    """Load VM rows from a supported RVTools or VMwareInventory export."""
     selected = Path(selected_path)
     mapping_config = load_os_mapping_config()
 
     def _build_vm_rows(records: list[dict[str, str]]) -> list[dict[str, Any]]:
         def _first_value(rec: dict[str, str], *keys: str) -> str:
-            for key in keys:
-                val = rec.get(key)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
-            return ""
+            return _record_first_value(rec, *keys)
 
         def _to_short_power_state(raw_value: str) -> str:
             value = str(raw_value or "").strip().lower().replace(" ", "")
-            if value in {"poweredon", "on", "running"}:
+            if value in {"poweredon", "on", "running", "true", "yes", "1"}:
                 return "On"
+            if not value:
+                return "Unknown"
             return "Off"
 
         parsed_rows: list[dict[str, Any]] = []
+        seen_names: dict[str, int] = {}
         for rec in records:
-            # Prefer VM name; if blank (some exports), use VM ID (RVTools column is often "VM ID").
-            vm_name = _first_value(rec, "VM", "VM ID", "VM-ID", "VMID")
-            if not vm_name:
+            # Prefer VM name; if blank, use VM/MOB ID from alternate inventory exports.
+            source_vm_name = _first_value(rec, "VM", "VM ID", "VM-ID", "VMID", "MOB ID", *VM_NAME_HEADERS)
+            if not source_vm_name:
                 continue
-            raw_os = (rec.get("OS according to the configuration file") or "").strip()
-            power_state_raw = _first_value(rec, "Powerstate", "PowerState", "Power State")
-            cpus_raw = (rec.get("CPUs") or "").strip()
-            mem_raw = (rec.get("Memory") or "").strip()
-            provisioned_mib_raw = _first_value(rec, "Provisioned MiB", "Provisioned MB")
+            occurrence = seen_names.get(source_vm_name, 0) + 1
+            seen_names[source_vm_name] = occurrence
+            vm_name = source_vm_name if occurrence == 1 else f"{source_vm_name} [{occurrence}]"
+            raw_os = _first_value(
+                rec,
+                *OS_HEADERS,
+            )
+            power_state_raw = _first_value(rec, *POWER_STATE_HEADERS)
+            cpus_raw = _first_value(rec, *CPU_HEADERS)
+
+            mem_mib_raw = _record_first_value_from_set(rec, MEMORY_MIB_HEADER_SET)
+            mem_gb_raw = _record_first_value_from_set(rec, MEMORY_GB_HEADER_SET)
+            mem_raw = _size_text_to_mib(mem_mib_raw, "mib") if mem_mib_raw else ""
+            if not mem_raw and mem_gb_raw:
+                mem_raw = _size_text_to_mib(mem_gb_raw, "gb")
+
+            provisioned_mib_raw = _record_first_value_from_set(rec, STORAGE_MIB_HEADER_SET)
+            provisioned_gb_raw = _record_first_value_from_set(rec, STORAGE_GB_HEADER_SET)
+            provisioned_mib = _size_text_to_mib(provisioned_mib_raw, "mib") if provisioned_mib_raw else ""
+            if not provisioned_mib and provisioned_gb_raw:
+                provisioned_mib = _size_text_to_mib(provisioned_gb_raw, "gb")
 
             parsed_rows.append(
                 {
                     "name": vm_name,
+                    "source_name": source_vm_name,
+                    "duplicate_index": occurrence,
                     "power_state": _to_short_power_state(power_state_raw),
                     "raw_os": raw_os,
                     "mapped_os": map_os_name(raw_os, mapping_config),
                     "cpus": cpus_raw,
                     "memory_mb": mem_raw,
-                    "provisioned_mib": provisioned_mib_raw,
+                    "provisioned_mib": provisioned_mib,
                 }
             )
         return parsed_rows
 
-    # If a workbook was selected, parse vInfo directly from that workbook.
-    if selected.suffix.lower() == ".xlsx":
-        records = parse_vinfo_from_xlsx(selected)
-        return _build_vm_rows(records), f"{str(selected).replace('\\', '/')}::vInfo"
+    # If a workbook was selected, parse a supported VM inventory sheet directly.
+    if selected.suffix.lower() in {".xlsx", ".xlsm"}:
+        records, source_sheet = parse_vinfo_from_xlsx(selected)
+        selected_path = str(selected).replace("\\", "/")
+        rows = _build_vm_rows(records)
+        _validate_loaded_inventory_rows(rows)
+        return rows, f"{selected_path}::{source_sheet}"
 
     vinfo_csv = resolve_vinfo_csv(selected_path)
 
@@ -643,7 +1595,13 @@ def load_vms_from_vinfo(selected_path: str) -> tuple[list[dict[str, Any]], str]:
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             with vinfo_csv.open("r", encoding=enc, newline="") as f:
-                reader = csv.DictReader(f)
+                sample = f.read(8192)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                except csv.Error:
+                    dialect = csv.excel
+                reader = csv.DictReader(f, dialect=dialect)
                 records = [dict(r) for r in reader]
             break
         except UnicodeDecodeError as exc:
@@ -652,7 +1610,110 @@ def load_vms_from_vinfo(selected_path: str) -> tuple[list[dict[str, Any]], str]:
     if not records and last_exc is not None:
         raise last_exc
 
-    return _build_vm_rows(records), str(vinfo_csv).replace("\\", "/")
+    rows = _build_vm_rows(records)
+    _validate_loaded_inventory_rows(rows)
+    return rows, str(vinfo_csv).replace("\\", "/")
+
+
+def _is_empty_or_zero(value: Any) -> bool:
+    return _to_number(value) <= 0.0
+
+
+def _is_unknown_os(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"", "n/a", "na", "nan", "none", "unknown", "unknown / empty"}
+
+
+def _validate_loaded_inventory_rows(vm_rows: list[dict[str, Any]]) -> None:
+    if not vm_rows:
+        raise ValueError("No VM rows were found in the selected inventory.")
+
+    if all(_is_empty_or_zero(row.get("cpus")) for row in vm_rows):
+        raise ValueError("No usable vCPU values were found. Check the inventory CPU/vCPU column mapping.")
+    if all(_is_empty_or_zero(row.get("memory_mb")) for row in vm_rows):
+        raise ValueError("No usable RAM values were found. Check the inventory memory column and units.")
+    if all(_is_empty_or_zero(row.get("provisioned_mib")) for row in vm_rows):
+        raise ValueError("No usable storage values were found. Check the inventory storage column and units.")
+
+
+def build_inventory_import_summary(vm_rows: list[dict[str, Any]], source: str) -> dict[str, Any]:
+    source_name_counts: dict[str, int] = {}
+    for row in vm_rows:
+        source_name = str(row.get("source_name") or row.get("name") or "").strip()
+        if source_name:
+            source_name_counts[source_name] = source_name_counts.get(source_name, 0) + 1
+
+    duplicate_name_count = sum(1 for count in source_name_counts.values() if count > 1)
+    duplicate_row_count = sum(max(0, count - 1) for count in source_name_counts.values())
+    missing_cpu_count = sum(1 for row in vm_rows if _is_empty_or_zero(row.get("cpus")))
+    missing_memory_count = sum(1 for row in vm_rows if _is_empty_or_zero(row.get("memory_mb")))
+    missing_storage_count = sum(1 for row in vm_rows if _is_empty_or_zero(row.get("provisioned_mib")))
+    unknown_os_count = sum(1 for row in vm_rows if _is_unknown_os(row.get("raw_os")))
+    unknown_power_count = sum(1 for row in vm_rows if str(row.get("power_state") or "").strip().lower() == "unknown")
+
+    warning_messages: list[str] = []
+    if duplicate_row_count:
+        warning_messages.append(
+            f"{duplicate_row_count:,} duplicate VM name row(s) detected across {duplicate_name_count:,} VM name(s); duplicates were kept with a numeric suffix."
+        )
+    if missing_cpu_count:
+        warning_messages.append(f"{missing_cpu_count:,} VM row(s) have missing or zero vCPU.")
+    if missing_memory_count:
+        warning_messages.append(f"{missing_memory_count:,} VM row(s) have missing or zero RAM.")
+    if missing_storage_count:
+        warning_messages.append(
+            f"{missing_storage_count:,} VM row(s) have missing or zero storage; OCI Native costing applies the minimum block volume size when selected."
+        )
+    if unknown_os_count:
+        warning_messages.append(f"{unknown_os_count:,} VM row(s) have missing or unknown OS.")
+    if unknown_power_count:
+        warning_messages.append(f"{unknown_power_count:,} VM row(s) have unknown power state because the source did not provide it.")
+
+    total_memory_mb = int(sum(_to_number(row.get("memory_mb")) for row in vm_rows))
+    total_storage_mib = int(sum(_to_number(row.get("provisioned_mib")) for row in vm_rows))
+
+    return {
+        "source": source,
+        "vm_count": len(vm_rows),
+        "total_vcpus": int(sum(_to_number(row.get("cpus")) for row in vm_rows)),
+        "total_memory_gb": int(math.ceil(total_memory_mb / 1024.0)) if total_memory_mb else 0,
+        "total_storage_gb": int(math.ceil(total_storage_mib / 1024.0)) if total_storage_mib else 0,
+        "unknown_power_count": unknown_power_count,
+        "unknown_os_count": unknown_os_count,
+        "missing_cpu_count": missing_cpu_count,
+        "missing_memory_count": missing_memory_count,
+        "missing_storage_count": missing_storage_count,
+        "duplicate_name_count": duplicate_name_count,
+        "duplicate_row_count": duplicate_row_count,
+        "warning_messages": warning_messages,
+    }
+
+
+def build_rejected_inventory_info(file_info: dict[str, Any], reason: str) -> dict[str, Any]:
+    reason_text = str(reason or "").strip()
+    normalized_reason = reason_text.lower()
+    category = "Unsupported inventory format"
+    recommended_use = "Upload a VM-level inventory file for sizing and use this file only as reference material."
+
+    if "workload categorization" in normalized_reason or "vm list" in normalized_reason:
+        category = "Workload categorization file"
+        recommended_use = "Use later as supplementary input for migration waves, placement review, or application grouping after a sizing inventory is loaded."
+    elif "aggregate infrastructure capacity assessment" in normalized_reason:
+        category = "Aggregate capacity assessment"
+        recommended_use = "Use as advisory context only. It can inform architecture discussion, but it cannot drive per-VM OCI sizing without VM-level rows."
+    elif "oci pricing estimate" in normalized_reason or "oracle investment proposal" in normalized_reason:
+        category = "OCI pricing estimate"
+        recommended_use = "Use later as a reference estimate or commercial benchmark, not as source workload inventory."
+
+    return {
+        "file_path": file_info.get("file_path", ""),
+        "file_name": file_info.get("file_name", ""),
+        "size_kb": file_info.get("size_kb", ""),
+        "category": category,
+        "reason": reason_text,
+        "recommended_use": recommended_use,
+        "required_input": "Primary sizing requires VM name, vCPU, RAM, storage, and OS columns.",
+    }
 
 
 def format_total_memory_gb_or_tb(total_mb: int) -> str:
@@ -664,6 +1725,3013 @@ def format_total_memory_gb_or_tb(total_mb: int) -> str:
     return f"{total_gb / 1024.0:,.2f} TB"
 
 
+def _ceil_div_positive(numerator: float, denominator: float) -> int:
+    if numerator <= 0:
+        return 0
+    if denominator <= 0:
+        return 10**9
+    return int(math.ceil(numerator / denominator))
+
+
+def normalize_step4_scenario_tab(value: Any, default: str = "paths") -> str:
+    tab = str(value or default).strip().lower().replace("scenario-", "")
+    return tab if tab in {"paths", "native", "ocvs", "hybrid", "price"} else default
+
+
+def step4_tab_redirect(tab: str = "paths") -> str:
+    normalized_tab = normalize_step4_scenario_tab(tab)
+    return f"{url_for('step4', tab=normalized_tab)}#scenario-{normalized_tab}"
+
+
+def normalize_hybrid_placement(value: Any, default: str = "ocvs") -> str:
+    fallback = default if default in HYBRID_PLACEMENT_VALUES else "ocvs"
+    placement = str(value or fallback).strip().lower()
+    return placement if placement in HYBRID_PLACEMENT_VALUES else fallback
+
+
+def build_hybrid_placement_plan(
+    vm_rows: list[dict[str, Any]],
+    hybrid_placement_selection: dict[str, Any] | None,
+    supported_signatures: list[str],
+) -> dict[str, Any]:
+    support_source_available = bool(supported_signatures)
+    selection = hybrid_placement_selection if isinstance(hybrid_placement_selection, dict) else {}
+    rows: list[dict[str, Any]] = []
+
+    for source_row in vm_rows:
+        vm_name = str(source_row.get("vm_name", "")).strip()
+        os_name = str(source_row.get("os_name", ""))
+        is_supported = bool(support_source_available and is_oci_supported_os(os_name, supported_signatures))
+        recommended = "native" if is_supported else "ocvs"
+        placement = normalize_hybrid_placement(selection.get(vm_name), recommended)
+        effective_target = "native" if placement == "native" else "ocvs"
+
+        if placement == recommended:
+            if recommended == "native":
+                reason = "OCI-supported OS"
+            elif support_source_available:
+                reason = "Not OCI-native-supported"
+            else:
+                reason = "Support source missing; validate final target"
+            manual_override = False
+        else:
+            reason = f"Manual override from {HYBRID_PLACEMENT_LABELS.get(recommended, recommended)} recommendation"
+            manual_override = True
+
+        rows.append(
+            {
+                **source_row,
+                "hybrid_placement": placement,
+                "hybrid_placement_label": HYBRID_PLACEMENT_LABELS.get(placement, placement),
+                "hybrid_effective_target": effective_target,
+                "hybrid_recommended_placement": recommended,
+                "hybrid_recommended_label": HYBRID_PLACEMENT_LABELS.get(recommended, recommended),
+                "hybrid_manual_override": manual_override,
+                "hybrid_is_oci_supported": is_supported,
+                "hybrid_reason": reason,
+            }
+        )
+
+    native_rows = [row for row in rows if row["hybrid_effective_target"] == "native"]
+    ocvs_rows = [row for row in rows if row["hybrid_effective_target"] == "ocvs"]
+    review_rows: list[dict[str, Any]] = []
+    explicit_ocvs_rows = [row for row in rows if row["hybrid_placement"] == "ocvs"]
+    manual_override_rows = [row for row in rows if row["hybrid_manual_override"]]
+
+    return {
+        "rows": rows,
+        "native_rows": native_rows,
+        "ocvs_rows": ocvs_rows,
+        "review_rows": review_rows,
+        "explicit_ocvs_rows": explicit_ocvs_rows,
+        "manual_override_rows": manual_override_rows,
+        "native_count": len(native_rows),
+        "ocvs_count": len(explicit_ocvs_rows),
+        "review_count": len(review_rows),
+        "ocvs_priced_count": len(ocvs_rows),
+        "manual_override_count": len(manual_override_rows),
+        "support_source_available": support_source_available,
+    }
+
+
+def build_ocvs_price_summary(
+    vm_rows: list[dict[str, Any]],
+    price_lookup: dict[str, float],
+    block_storage_unit_price: float,
+    block_perf_unit_price: float,
+    iaas_discount_pct: float,
+    policy: dict[str, Any] | None = None,
+    selected_profile: str = "best_fit",
+    dr_node_count: int = 0,
+    vmware_license_price_per_core_yearly: float = 0.0,
+) -> dict[str, Any]:
+    """Size OCVS host options from selected VM totals and return the lowest-cost profile."""
+    total_vcpus = sum(int(row.get("cpus", 0) or 0) for row in vm_rows)
+    total_memory_gb = sum(int(row.get("memory_gb", 0) or 0) for row in vm_rows)
+    total_storage_gb = sum(int(row.get("provisioned_gb", 0) or 0) for row in vm_rows)
+    has_workload = bool(total_vcpus or total_memory_gb or total_storage_gb)
+
+    policy = normalize_ocvs_policy(policy or OCVS_DEFAULT_SIZING_POLICY)
+    selected_profile = normalize_ocvs_profile(selected_profile)
+    dr_node_count = normalize_ocvs_dr_nodes(dr_node_count)
+    vcpu_per_ocpu = max(1.0, float(policy["vcpu_per_ocpu"]))
+    cpu_headroom_factor = max(0.01, 1.0 - (float(policy["cpu_headroom_pct"]) / 100.0))
+    memory_headroom_factor = max(0.01, 1.0 - (float(policy["memory_headroom_pct"]) / 100.0))
+    storage_headroom_factor = max(0.01, 1.0 - (float(policy["storage_headroom_pct"]) / 100.0))
+    dense_vsan_usable_factor = max(0.01, min(1.0, float(policy["dense_vsan_usable_pct"]) / 100.0))
+    standard_storage_vpu = _bounded_int(policy.get("standard_storage_vpu"), 10, 10, 120)
+    discount_factor = max(0.0, min(1.0, 1.0 - (float(iaas_discount_pct or 0.0) / 100.0)))
+    price_per_core_yearly = max(0.0, float(vmware_license_price_per_core_yearly or 0.0))
+
+    profile_results: list[dict[str, Any]] = []
+    for profile in OCVS_HOST_PROFILES:
+        ocpus = int(profile.get("ocpus", 0) or 0)
+        memory_gb = int(profile.get("memory_gb", 0) or 0)
+        nvme_tb = float(profile.get("nvme_tb", 0.0) or 0.0)
+        min_hosts = int(profile.get("min_hosts", 1) or 1)
+        max_hosts = int(profile.get("max_hosts", 0) or 0)
+        host_type = str(profile.get("host_type", "Dense"))
+
+        cpu_capacity_per_host = ocpus * vcpu_per_ocpu * cpu_headroom_factor
+        memory_capacity_per_host = memory_gb * memory_headroom_factor
+        hosts_by_cpu = _ceil_div_positive(total_vcpus, cpu_capacity_per_host)
+        hosts_by_memory = _ceil_div_positive(total_memory_gb, memory_capacity_per_host)
+
+        raw_storage_gb_per_host = nvme_tb * 1024.0
+        dense_usable_storage_gb_per_host = raw_storage_gb_per_host * dense_vsan_usable_factor
+        storage_capacity_per_host = dense_usable_storage_gb_per_host * storage_headroom_factor
+        if host_type == "Standard":
+            hosts_by_storage = 0
+            storage_monthly_cost = (
+                (total_storage_gb * float(block_storage_unit_price or 0.0))
+                + (total_storage_gb * standard_storage_vpu * float(block_perf_unit_price or 0.0))
+            ) * discount_factor
+        else:
+            hosts_by_storage = _ceil_div_positive(total_storage_gb, storage_capacity_per_host)
+            storage_monthly_cost = 0.0
+
+        if has_workload:
+            base_host_count = max(min_hosts, hosts_by_cpu, hosts_by_memory, hosts_by_storage)
+            applied_dr_node_count = dr_node_count
+            host_count = base_host_count + applied_dr_node_count
+        else:
+            base_host_count = 0
+            applied_dr_node_count = 0
+            host_count = 0
+            storage_monthly_cost = 0.0
+        is_within_limit = max_hosts <= 0 or host_count <= max_hosts
+        cluster_count = _ceil_div_positive(host_count, max_hosts) if max_hosts > 0 else (1 if host_count else 0)
+        cluster_split_required = bool(max_hosts > 0 and host_count > max_hosts)
+
+        ocpu_unit_price = float(price_lookup.get(str(profile.get("ocpu_display_name", "")).strip(), 0.0))
+        memory_unit_price = float(price_lookup.get(str(profile.get("memory_display_name", "")).strip(), 0.0))
+        nvme_unit_price = float(price_lookup.get(str(profile.get("nvme_display_name", "")).strip(), 0.0))
+        host_monthly_cost = (
+            (ocpus * ocpu_unit_price * HOURS_PER_MONTH)
+            + (memory_gb * memory_unit_price * HOURS_PER_MONTH)
+            + (nvme_tb * nvme_unit_price * HOURS_PER_MONTH)
+        ) * discount_factor
+        total_monthly_cost = (host_count * host_monthly_cost) + storage_monthly_cost
+        physical_cores = host_count * ocpus
+        vmware_license_yearly_cost = physical_cores * price_per_core_yearly
+        vmware_license_monthly_cost = vmware_license_yearly_cost / 12.0
+        selection_monthly_cost = total_monthly_cost + vmware_license_monthly_cost
+
+        sizing_reasons = {
+            "minimum": min_hosts,
+            "cpu": hosts_by_cpu,
+            "memory": hosts_by_memory,
+            "storage": hosts_by_storage,
+        }
+        constraint = max(sizing_reasons, key=sizing_reasons.get) if has_workload else "none"
+        if has_workload and sizing_reasons[constraint] < min_hosts:
+            constraint = "minimum"
+
+        total_cpu_capacity = max(1.0, host_count * ocpus * vcpu_per_ocpu)
+        total_memory_capacity = max(1.0, host_count * memory_gb)
+        if host_type == "Standard":
+            total_storage_capacity = max(1.0, float(total_storage_gb or 1))
+        else:
+            total_storage_capacity = max(1.0, host_count * dense_usable_storage_gb_per_host)
+
+        profile_results.append(
+            {
+                "shape": profile.get("shape", ""),
+                "label": profile.get("label", ""),
+                "host_type": host_type,
+                "host_count": host_count,
+                "base_host_count": base_host_count,
+                "dr_node_count": applied_dr_node_count,
+                "max_hosts": max_hosts,
+                "is_within_limit": is_within_limit,
+                "cluster_count": cluster_count,
+                "cluster_split_required": cluster_split_required,
+                "constraint": constraint,
+                "hosts_by_cpu": hosts_by_cpu,
+                "hosts_by_memory": hosts_by_memory,
+                "hosts_by_storage": hosts_by_storage,
+                "host_monthly_cost": host_monthly_cost,
+                "storage_monthly_cost": storage_monthly_cost,
+                "total_monthly_cost": total_monthly_cost,
+                "physical_cores": physical_cores,
+                "vmware_license_monthly_cost": vmware_license_monthly_cost,
+                "vmware_license_yearly_cost": vmware_license_yearly_cost,
+                "selection_monthly_cost": selection_monthly_cost,
+                "ocpus_per_host": ocpus,
+                "memory_gb_per_host": memory_gb,
+                "raw_storage_tb_per_host": nvme_tb,
+                "usable_storage_gb_per_host": int(round(dense_usable_storage_gb_per_host)),
+                "cpu_utilization_pct": min(999.0, (total_vcpus / total_cpu_capacity) * 100.0),
+                "memory_utilization_pct": min(999.0, (total_memory_gb / total_memory_capacity) * 100.0),
+                "storage_utilization_pct": min(999.0, (total_storage_gb / total_storage_capacity) * 100.0),
+                "pricing_available": host_monthly_cost > 0,
+                "standard_storage_vpu": standard_storage_vpu,
+            }
+        )
+
+    viable_results = [
+        item
+        for item in profile_results
+        if item["host_count"] == 0 or item["pricing_available"] or item["total_monthly_cost"] > 0
+    ]
+    if selected_profile == "best_fit":
+        selected = min(viable_results, key=lambda item: item["selection_monthly_cost"]) if viable_results else profile_results[0]
+    else:
+        selected = next((item for item in profile_results if item["shape"] == selected_profile), profile_results[0])
+
+    return {
+        "selected": selected,
+        "profiles": profile_results,
+        "selected_profile": selected_profile,
+        "totals": {
+            "vcpus": total_vcpus,
+            "memory_gb": total_memory_gb,
+            "storage_gb": total_storage_gb,
+        },
+        "policy": policy,
+        "dr_node_count": dr_node_count,
+    }
+
+
+def summarize_native_price(vm_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_cpu_ram_monthly_cost = sum(float(r["cpu_ram_monthly_cost"]) for r in vm_rows)
+    total_storage_monthly_cost = sum(float(r["storage_monthly_cost"]) for r in vm_rows)
+    total_os_license_monthly_cost = sum(float(r["os_license_monthly_cost"]) for r in vm_rows)
+    total_monthly_cost = (
+        total_cpu_ram_monthly_cost
+        + total_storage_monthly_cost
+        + total_os_license_monthly_cost
+    )
+    return {
+        "vm_count": len(vm_rows),
+        "total_cpus": sum(int(r["cpus"]) for r in vm_rows),
+        "total_memory_mb": sum(int(r["memory_mb"]) for r in vm_rows),
+        "total_memory_gb": sum(int(r["memory_gb"]) for r in vm_rows),
+        "total_provisioned_mib": sum(int(r["provisioned_mib"]) for r in vm_rows),
+        "total_provisioned_gb": sum(int(r["provisioned_gb"]) for r in vm_rows),
+        "total_vpus": sum(int(r["vpu"]) for r in vm_rows),
+        "total_license_included_vms": sum(1 for r in vm_rows if str(r.get("os_license", "")) == "Lic Include"),
+        "total_cpu_monthly_cost": sum(float(r["cpu_monthly_cost"]) for r in vm_rows),
+        "total_ram_monthly_cost": sum(float(r["ram_monthly_cost"]) for r in vm_rows),
+        "total_storage_capacity_monthly_cost": sum(float(r["storage_capacity_monthly_cost"]) for r in vm_rows),
+        "total_storage_performance_monthly_cost": sum(float(r["storage_performance_monthly_cost"]) for r in vm_rows),
+        "total_cpu_ram_monthly_cost": total_cpu_ram_monthly_cost,
+        "total_storage_monthly_cost": total_storage_monthly_cost,
+        "total_os_license_monthly_cost": total_os_license_monthly_cost,
+        "total_monthly_cost": total_monthly_cost,
+    }
+
+
+def build_native_shape_strategy_rows(vm_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize selected VMs by OS for the lightweight native default-shape modal."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in vm_rows:
+        os_name = str(row.get("os_name") or "").strip() or "Unknown / Empty"
+        bucket = grouped.setdefault(
+            os_name,
+            {
+                "os_name": os_name,
+                "vm_count": 0,
+                "shape": str(row.get("oci_shape") or "").strip(),
+                "burst": normalize_burst_value(row.get("burst")),
+            },
+        )
+        bucket["vm_count"] = int(bucket.get("vm_count", 0) or 0) + 1
+
+    return sorted(grouped.values(), key=lambda item: str(item.get("os_name", "")).lower())
+
+
+def build_workload_summary(
+    vm_rows: list[dict[str, Any]],
+    supported_native_rows: list[dict[str, Any]],
+    unsupported_ocvs_rows: list[dict[str, Any]],
+    supported_os_source_available: bool,
+) -> dict[str, Any]:
+    def pct(part: int, total: int) -> float:
+        return (float(part) / float(total) * 100.0) if total else 0.0
+
+    def is_powered_on(row: dict[str, Any]) -> bool:
+        state = str(row.get("power_state", "")).strip().lower().replace(" ", "")
+        return state in {"on", "poweredon", "running"}
+
+    def is_powered_off(row: dict[str, Any]) -> bool:
+        state = str(row.get("power_state", "")).strip().lower().replace(" ", "")
+        return state in {"off", "poweredoff", "stopped"}
+
+    powered_on_count = sum(1 for row in vm_rows if is_powered_on(row))
+    powered_off_count = sum(1 for row in vm_rows if is_powered_off(row))
+    unknown_power_count = max(0, len(vm_rows) - powered_on_count - powered_off_count)
+    supported_count = len(supported_native_rows)
+    unsupported_count = len(unsupported_ocvs_rows)
+    vm_count = len(vm_rows)
+    total_vcpus = sum(int(row.get("cpus", 0) or 0) for row in vm_rows)
+    total_memory_gb = sum(int(row.get("memory_gb", 0) or 0) for row in vm_rows)
+    total_storage_gb = sum(int(row.get("provisioned_gb", 0) or 0) for row in vm_rows)
+    top_os_rows, other_os_count = _top_os_distribution(vm_rows, 5)
+
+    return {
+        "vm_count": vm_count,
+        "total_vcpus": total_vcpus,
+        "total_memory_gb": total_memory_gb,
+        "total_storage_gb": total_storage_gb,
+        "powered_on_count": powered_on_count,
+        "powered_off_count": powered_off_count,
+        "unknown_power_count": unknown_power_count,
+        "oci_supported_count": supported_count,
+        "oci_not_supported_count": unsupported_count,
+        "support_source_available": bool(supported_os_source_available),
+        "top_os": _top_os_counts(vm_rows, 3) if vm_rows else "No selected VMs",
+        "top_os_rows": top_os_rows,
+        "other_os_count": other_os_count,
+        "other_os_pct": pct(other_os_count, vm_count),
+        "powered_on_pct": pct(powered_on_count, vm_count),
+        "powered_off_pct": pct(powered_off_count, vm_count),
+        "unknown_power_pct": pct(unknown_power_count, vm_count),
+        "oci_supported_pct": pct(supported_count, vm_count),
+        "oci_not_supported_pct": pct(unsupported_count, vm_count),
+        "avg_vcpu_per_vm": (float(total_vcpus) / float(vm_count)) if vm_count else 0.0,
+        "avg_memory_gb_per_vm": (float(total_memory_gb) / float(vm_count)) if vm_count else 0.0,
+        "avg_storage_gb_per_vm": (float(total_storage_gb) / float(vm_count)) if vm_count else 0.0,
+    }
+
+
+def _top_os_counts(vm_rows: list[dict[str, Any]], limit: int = 4) -> str:
+    counts: dict[str, int] = {}
+    for row in vm_rows:
+        os_name = str(row.get("os_name", "Unknown / Empty") or "Unknown / Empty")
+        counts[os_name] = counts.get(os_name, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+    return ", ".join(f"{name} ({count})" for name, count in ranked[:limit])
+
+
+def _top_os_distribution(vm_rows: list[dict[str, Any]], limit: int = 5) -> tuple[list[dict[str, Any]], int]:
+    counts: dict[str, int] = {}
+    total = len(vm_rows)
+    for row in vm_rows:
+        os_name = str(row.get("os_name", "Unknown / Empty") or "Unknown / Empty").strip() or "Unknown / Empty"
+        counts[os_name] = counts.get(os_name, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+    top_items = ranked[:limit]
+    rows = [
+        {
+            "os_name": name,
+            "count": count,
+            "pct": (float(count) / float(total) * 100.0) if total else 0.0,
+        }
+        for name, count in top_items
+    ]
+    other_count = max(0, total - sum(count for _, count in top_items))
+    return rows, other_count
+
+
+def build_fit_warnings(
+    vm_rows: list[dict[str, Any]],
+    unsupported_ocvs_rows: list[dict[str, Any]],
+    scenario_comparison: dict[str, Any],
+    overall: dict[str, Any],
+    ocvs_price: dict[str, Any],
+    hybrid_ocvs_price: dict[str, Any],
+    source_pricelist_file: str,
+    price_lookup: dict[str, float],
+    block_storage_unit_price: float,
+    block_perf_unit_price: float,
+    windows_os_unit_price: float,
+    vmware_license_summary: dict[str, Any],
+) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+
+    def add(severity: str, title: str, detail: str) -> None:
+        warnings.append({"severity": severity, "title": title, "detail": detail})
+
+    def add_vcf_license_note(label: str, summary: dict[str, Any]) -> None:
+        selected = summary["selected"]
+        host_count = int(selected.get("host_count", 0) or 0)
+        cores_per_host = int(selected.get("ocpus_per_host", 0) or 0)
+        if host_count <= 0 or cores_per_host <= 0:
+            return
+
+        total_cores = host_count * cores_per_host
+        raw_vsan_tb = float(selected.get("raw_storage_tb_per_host", 0.0) or 0.0) * host_count
+        vsan_note = (
+            f" VCF also includes 1 TiB of vSAN entitlement per licensed core; modeled raw dense storage is {raw_vsan_tb:,.1f} TB."
+            if raw_vsan_tb > 0
+            else ""
+        )
+        add(
+            "info",
+            f"{label} VCF license coverage",
+            (
+                f"Plan Broadcom VCF BYOL coverage for {total_cores:,} physical core/OCPU(s) "
+                f"({host_count:,} node(s) x {cores_per_host:,}). VCF is licensed per physical core "
+                "with a 16-core-per-processor minimum, and every server core must be covered."
+                f"{vsan_note} Validate license portability, add-ons, and compliance with Broadcom and Oracle."
+            ),
+        )
+
+    if not source_pricelist_file or not price_lookup:
+        add("critical", "Missing active price list", "Costs can show as zero until an OCI price list is selected or downloaded.")
+
+    missing_native_shapes = sorted(
+        {
+            str(row.get("oci_shape", ""))
+            for row in vm_rows
+            if float(row.get("ocpu_unit_price", 0.0)) <= 0.0 or float(row.get("memory_unit_price", 0.0)) <= 0.0
+        }
+    )
+    if missing_native_shapes:
+        add(
+            "warning",
+            "Native compute pricing incomplete",
+            f"Missing CPU or RAM pricing for: {', '.join(missing_native_shapes[:4])}.",
+        )
+
+    if block_storage_unit_price <= 0.0 or block_perf_unit_price <= 0.0:
+        add("warning", "Block Volume pricing incomplete", "Storage capacity or VPU pricing is missing from the active price list.")
+
+    vmware_full = vmware_license_summary.get("ocvs", {})
+    vmware_hybrid = vmware_license_summary.get("hybrid", {})
+    vmware_cores = max(
+        int(vmware_full.get("physical_cores", 0) or 0),
+        int(vmware_hybrid.get("physical_cores", 0) or 0),
+    )
+    if vmware_cores > 0 and not bool(vmware_license_summary.get("is_priced", False)):
+        add(
+            "warning",
+            "VCF license price not set",
+            "OCVS and Hybrid costs exclude VCF license cost until a list price per physical core is entered.",
+        )
+    elif bool(vmware_license_summary.get("is_priced", False)):
+        add(
+            "info",
+            "VCF license cost included",
+            (
+                f"Full OCVS license exposure covers {int(vmware_full.get('physical_cores', 0) or 0):,} physical core(s) "
+                f"at {float(vmware_license_summary.get('price_per_core_yearly', 0.0) or 0.0):,.2f} list per core/year."
+            ),
+        )
+
+    selected_ocvs = ocvs_price["selected"]
+    hybrid_selected = hybrid_ocvs_price["selected"]
+    if int(selected_ocvs.get("host_count", 0)) > 0 and not bool(selected_ocvs.get("pricing_available", False)):
+        add("warning", "OCVS host pricing incomplete", f"Pricing was not found for {selected_ocvs.get('shape', 'the selected OCVS shape')}.")
+    if int(hybrid_selected.get("host_count", 0)) > 0 and not bool(hybrid_selected.get("pricing_available", False)):
+        add("warning", "Hybrid OCVS pricing incomplete", f"Pricing was not found for {hybrid_selected.get('shape', 'the hybrid OCVS shape')}.")
+
+    vsan_mirroring_note_added = False
+    for label, summary in (("OCVS", ocvs_price), ("Hybrid OCVS subset", hybrid_ocvs_price)):
+        selected = summary["selected"]
+        host_count = int(selected.get("host_count", 0) or 0)
+        max_hosts = int(selected.get("max_hosts", 0) or 0)
+        if max_hosts and host_count > max_hosts:
+            add(
+                "info",
+                f"{label} multi-cluster planning",
+                (
+                    f"{selected.get('shape')} needs {host_count} node(s). Plan as a multi-cluster OCVS design "
+                    "when the node count exceeds the cluster size limit."
+                ),
+            )
+
+        constraint = str(selected.get("constraint", ""))
+        if selected.get("host_type") == "Dense" and constraint == "storage":
+            add(
+                "warning",
+                f"{label} is storage-driven",
+                f"Storage requires {selected.get('hosts_by_storage')} node(s), more than CPU/RAM for {selected.get('shape')}.",
+            )
+        if selected.get("host_type") == "Dense" and host_count > 0:
+            policy = summary.get("policy", {})
+            add(
+                "info",
+                f"{label} vSAN mirroring assumption",
+                (
+                    f"Dense OCVS vSAN is modeled at {float(policy.get('dense_vsan_usable_pct', 50.0)):.0f}% usable "
+                    "capacity to reflect FTT=1 RAID-1 mirroring before storage headroom is applied."
+                ),
+            )
+            vsan_mirroring_note_added = True
+        if selected.get("host_type") == "Standard" and host_count > 0:
+            add(
+                "info",
+                f"{label} uses Block Volume storage",
+                f"Standard OCVS storage is modeled separately at {selected.get('standard_storage_vpu')} VPU/GB.",
+            )
+
+    if not vsan_mirroring_note_added and any(
+        str(item.get("host_type", "")) == "Dense" and int(item.get("host_count", 0) or 0) > 0
+        for item in ocvs_price.get("profiles", [])
+    ):
+        policy = ocvs_price.get("policy", {})
+        add(
+            "info",
+            "Dense OCVS vSAN mirroring assumption",
+            (
+                f"Dense shape comparisons use {float(policy.get('dense_vsan_usable_pct', 50.0)):.0f}% usable vSAN "
+                "to reflect FTT=1 RAID-1 mirroring before storage headroom is applied."
+            ),
+        )
+
+    if not bool(scenario_comparison.get("supported_os_source_available")):
+        add("warning", "Hybrid OS support check unavailable", "OCI-SupportedOS.txt could not be loaded, so review the Hybrid placement planner before using the split.")
+    elif unsupported_ocvs_rows:
+        add(
+            "info",
+            "Hybrid OCVS placement scope",
+            f"{len(unsupported_ocvs_rows):,} selected VM(s) are routed to OCVS in the Hybrid path. Top OS examples: {_top_os_counts(unsupported_ocvs_rows)}.",
+        )
+
+    windows_server_rows = [row for row in vm_rows if bool(row.get("is_windows_server"))]
+    license_included_rows = [row for row in windows_server_rows if str(row.get("os_license", "")) == "Lic Include"]
+    windows_license_monthly = float(overall.get("total_os_license_monthly_cost", 0.0))
+    if license_included_rows and windows_os_unit_price <= 0.0:
+        add("warning", "Windows license pricing missing", "Some Windows Server VMs use license-included pricing, but the Windows OS price was not found.")
+    elif windows_license_monthly > 0.0:
+        add(
+            "info",
+            "Windows license impact included",
+            f"{len(license_included_rows):,} Windows Server VM(s) add OS license cost to the OCI Native path.",
+        )
+    elif windows_server_rows:
+        add(
+            "info",
+            "Windows Server modeled as BYOL",
+            f"{len(windows_server_rows):,} Windows Server VM(s) are currently using BYOL in the Native estimate.",
+        )
+
+    add_vcf_license_note("OCVS", ocvs_price)
+    add_vcf_license_note("Hybrid OCVS subset", hybrid_ocvs_price)
+
+    return warnings
+
+
+def build_executive_summary(
+    scenario_comparison: dict[str, Any],
+    ocvs_price: dict[str, Any],
+    hybrid_ocvs_price: dict[str, Any],
+    fit_warnings: list[dict[str, str]],
+) -> dict[str, Any]:
+    best = scenario_comparison["best"]
+    best_id = str(best.get("id", ""))
+    delta = float(best.get("monthly_delta", 0.0))
+    critical_count = sum(1 for item in fit_warnings if item.get("severity") == "critical")
+    warning_count = sum(1 for item in fit_warnings if item.get("severity") == "warning")
+
+    if best_id == "native":
+        selected_ocvs = ocvs_price["selected"]
+        driver = (
+            "Native is currently lowest; the full OCVS path is "
+            f"{selected_ocvs.get('host_count')} node(s), driven by {selected_ocvs.get('constraint')}."
+        )
+    elif best_id == "ocvs":
+        selected_ocvs = ocvs_price["selected"]
+        driver = (
+            f"All selected VMs fit on {selected_ocvs.get('host_count')} x {selected_ocvs.get('shape')}, "
+            f"driven by {selected_ocvs.get('constraint')}."
+        )
+    else:
+        selected_ocvs = hybrid_ocvs_price["selected"]
+        driver = (
+            f"{best.get('native_vm_count')} VM(s) move to OCI Native and {best.get('ocvs_vm_count')} VM(s) remain on "
+            f"{selected_ocvs.get('host_count')} x {selected_ocvs.get('shape')}."
+        )
+
+    if critical_count:
+        confidence = f"Needs review: {critical_count} critical fit issue(s)"
+    elif warning_count:
+        confidence = f"Review recommended: {warning_count} warning(s)"
+    else:
+        confidence = "No blocking fit issues detected"
+
+    return {
+        "recommended_path": best.get("label", ""),
+        "decision_label": "Lowest monthly cost path",
+        "decision_note": (
+            "Cost-ranked result only; validate migration waves, app dependencies, downtime, "
+            "licensing, and support constraints before positioning it as the target path."
+        ),
+        "monthly_cost": float(best.get("monthly_cost", 0.0)),
+        "yearly_cost": float(best.get("yearly_cost", 0.0)),
+        "monthly_delta": delta,
+        "yearly_delta": delta * 12.0,
+        "driver": driver,
+        "confidence": confidence,
+        "critical_count": critical_count,
+        "warning_count": warning_count,
+        "info_count": sum(1 for item in fit_warnings if item.get("severity") == "info"),
+    }
+
+
+def _format_display_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return raw
+
+
+def build_migration_waves(
+    *,
+    vm_rows: list[dict[str, Any]],
+    supported_native_rows: list[dict[str, Any]],
+    unsupported_ocvs_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    supported_names = {str(row.get("vm_name", "")) for row in supported_native_rows}
+    unsupported_names = {str(row.get("vm_name", "")) for row in unsupported_ocvs_rows}
+
+    def is_powered_off(row: dict[str, Any]) -> bool:
+        state = str(row.get("power_state", "")).strip().lower()
+        return state in {"off", "powered off", "poweredoff"} or "off" in state
+
+    def needs_native_review(row: dict[str, Any]) -> bool:
+        return (
+            bool(row.get("is_windows_server"))
+            or int(row.get("cpus", 0) or 0) >= 16
+            or int(row.get("memory_gb", 0) or 0) >= 256
+            or int(row.get("provisioned_gb", 0) or 0) >= 2048
+        )
+
+    powered_off_rows = [row for row in vm_rows if is_powered_off(row)]
+    active_rows = [row for row in vm_rows if not is_powered_off(row)]
+    native_active = [row for row in active_rows if str(row.get("vm_name", "")) in supported_names]
+    native_review_rows = [row for row in native_active if needs_native_review(row)]
+    native_review_names = {str(row.get("vm_name", "")) for row in native_review_rows}
+    native_quick_rows = [row for row in native_active if str(row.get("vm_name", "")) not in native_review_names]
+    ocvs_rows = [row for row in active_rows if str(row.get("vm_name", "")) in unsupported_names]
+
+    def summarize(rows: list[dict[str, Any]], wave: int, title: str, target: str, action: str) -> dict[str, Any]:
+        sorted_rows = sorted(rows, key=lambda row: str(row.get("vm_name", "")).lower())
+        return {
+            "wave": wave,
+            "title": title,
+            "target": target,
+            "action": action,
+            "vm_count": len(rows),
+            "vcpus": int(sum(int(row.get("cpus", 0) or 0) for row in rows)),
+            "memory_gb": int(sum(int(row.get("memory_gb", 0) or 0) for row in rows)),
+            "storage_gb": int(sum(int(row.get("provisioned_gb", 0) or 0) for row in rows)),
+            "top_os": _top_os_counts(rows, limit=3) if rows else "No VMs in this wave",
+            "sample_vms": ", ".join(str(row.get("vm_name", "")) for row in sorted_rows[:5]) if rows else "",
+        }
+
+    waves = [
+        summarize(
+            native_quick_rows,
+            1,
+            "Native quick candidates",
+            "OCI Native",
+            "Validate app owner, backup, monitoring, and target shape; good first migration wave.",
+        ),
+        summarize(
+            native_review_rows,
+            2,
+            "Native validation candidates",
+            "OCI Native review",
+            "Check Windows licensing, large resource profiles, dependencies, and performance before migration.",
+        ),
+        summarize(
+            ocvs_rows,
+            3,
+            "OCVS landing-zone candidates",
+            "OCVS",
+            "Keep VMware compatibility or plan OS/app remediation before moving native.",
+        ),
+        summarize(
+            powered_off_rows,
+            4,
+            "Defer, archive, or retire",
+            "Governance",
+            "Confirm ownership and business need before including these VMs in the migration scope.",
+        ),
+    ]
+    max_count = max((int(wave["vm_count"]) for wave in waves), default=0)
+    for wave in waves:
+        wave["bar_pct"] = _pct_of_max(float(wave["vm_count"]), float(max_count), minimum=4.0) if max_count else 0.0
+
+    return {
+        "waves": waves,
+        "total_vms": len(vm_rows),
+        "native_candidate_count": len(native_quick_rows) + len(native_review_rows),
+        "ocvs_candidate_count": len(ocvs_rows),
+        "powered_off_count": len(powered_off_rows),
+    }
+
+
+def _pct_of_max(value: float, maximum: float, minimum: float = 2.0) -> float:
+    if maximum <= 0:
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return max(minimum, min(100.0, (value / maximum) * 100.0))
+
+
+def build_ocvs_shape_comparison(ocvs_price: dict[str, Any]) -> dict[str, Any]:
+    profiles = list(ocvs_price.get("profiles", []))
+    selected_shape = str(ocvs_price.get("selected", {}).get("shape", ""))
+    max_monthly = max((float(item.get("selection_monthly_cost", item.get("total_monthly_cost", 0.0)) or 0.0) for item in profiles), default=0.0)
+    viable_profiles = [
+        item
+        for item in profiles
+        if int(item.get("host_count", 0) or 0) == 0
+        or bool(item.get("pricing_available", False))
+        or float(item.get("total_monthly_cost", 0.0) or 0.0) > 0.0
+    ]
+    best_fit_shape = ""
+    if viable_profiles:
+        best_fit_shape = str(
+            min(
+                viable_profiles,
+                key=lambda item: float(item.get("selection_monthly_cost", item.get("total_monthly_cost", 0.0)) or 0.0),
+            ).get("shape", "")
+        )
+    rows: list[dict[str, Any]] = []
+
+    for item in profiles:
+        host_count = int(item.get("host_count", 0) or 0)
+        base_host_count = int(item.get("base_host_count", host_count) or 0)
+        dr_node_count = int(item.get("dr_node_count", 0) or 0)
+        host_monthly_cost = float(item.get("host_monthly_cost", 0.0) or 0.0)
+        host_total_monthly_cost = host_count * host_monthly_cost
+        storage_monthly_cost = float(item.get("storage_monthly_cost", 0.0) or 0.0)
+        total_monthly_cost = float(item.get("total_monthly_cost", 0.0) or 0.0)
+        vmware_license_monthly_cost = float(item.get("vmware_license_monthly_cost", 0.0) or 0.0)
+        selection_monthly_cost = float(item.get("selection_monthly_cost", total_monthly_cost) or 0.0)
+        host_type = str(item.get("host_type", ""))
+        storage_model = "vSAN local NVMe" if host_type == "Dense" else f"OCI Block Volume at {item.get('standard_storage_vpu', 10)} VPU/GB"
+
+        rows.append(
+            {
+                "shape": item.get("shape", ""),
+                "label": item.get("label", ""),
+                "host_type": host_type,
+                "host_count": host_count,
+                "base_host_count": base_host_count,
+                "dr_node_count": dr_node_count,
+                "max_hosts": int(item.get("max_hosts", 0) or 0),
+                "cluster_count": int(item.get("cluster_count", 0) or 0),
+                "cluster_split_required": bool(item.get("cluster_split_required", False)),
+                "host_monthly_cost": host_monthly_cost,
+                "host_total_monthly_cost": host_total_monthly_cost,
+                "storage_monthly_cost": storage_monthly_cost,
+                "total_monthly_cost": total_monthly_cost,
+                "vmware_license_monthly_cost": vmware_license_monthly_cost,
+                "vmware_license_yearly_cost": float(item.get("vmware_license_yearly_cost", 0.0) or 0.0),
+                "selection_monthly_cost": selection_monthly_cost,
+                "selection_yearly_cost": selection_monthly_cost * 12.0,
+                "physical_cores": int(item.get("physical_cores", 0) or 0),
+                "monthly_bar_pct": _pct_of_max(selection_monthly_cost, max_monthly),
+                "constraint": item.get("constraint", ""),
+                "pricing_available": bool(item.get("pricing_available", False)),
+                "is_within_limit": bool(item.get("is_within_limit", False)),
+                "is_selected": str(item.get("shape", "")) == selected_shape,
+                "is_best_fit": str(item.get("shape", "")) == best_fit_shape,
+                "storage_model": storage_model,
+                "ocpus_per_host": int(item.get("ocpus_per_host", 0) or 0),
+                "memory_gb_per_host": int(item.get("memory_gb_per_host", 0) or 0),
+                "usable_storage_gb_per_host": int(item.get("usable_storage_gb_per_host", 0) or 0),
+            }
+        )
+
+    return {"rows": rows, "max_monthly_cost": max_monthly, "best_fit_shape": best_fit_shape}
+
+
+def build_vmware_license_summary(
+    ocvs_price: dict[str, Any],
+    hybrid_ocvs_price: dict[str, Any],
+    price_per_core_yearly: float,
+) -> dict[str, Any]:
+    price_per_core_yearly = max(0.0, float(price_per_core_yearly or 0.0))
+
+    def build_item(label: str, summary: dict[str, Any]) -> dict[str, Any]:
+        selected = summary.get("selected", {})
+        host_count = int(selected.get("host_count", 0) or 0)
+        base_host_count = int(selected.get("base_host_count", host_count) or 0)
+        dr_node_count = int(selected.get("dr_node_count", 0) or 0)
+        cores_per_host = int(selected.get("ocpus_per_host", 0) or 0)
+        physical_cores = host_count * cores_per_host
+        yearly_cost = physical_cores * price_per_core_yearly
+        monthly_cost = yearly_cost / 12.0
+        return {
+            "label": label,
+            "host_count": host_count,
+            "base_host_count": base_host_count,
+            "dr_node_count": dr_node_count,
+            "cores_per_host": cores_per_host,
+            "physical_cores": physical_cores,
+            "price_per_core_yearly": price_per_core_yearly,
+            "yearly_cost": yearly_cost,
+            "monthly_cost": monthly_cost,
+        }
+
+    ocvs = build_item("OCVS", ocvs_price)
+    hybrid = build_item("Hybrid OCVS subset", hybrid_ocvs_price)
+    return {
+        "price_per_core_yearly": price_per_core_yearly,
+        "is_priced": price_per_core_yearly > 0.0,
+        "ocvs": ocvs,
+        "hybrid": hybrid,
+        "rows": [ocvs, hybrid],
+    }
+
+
+def build_scenario_chart_rows(scenario_comparison: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = list(scenario_comparison.get("rows", []))
+    max_monthly = max((float(item.get("monthly_cost", 0.0) or 0.0) for item in rows), default=0.0)
+    max_three_year = max((float(item.get("yearly_cost", 0.0) or 0.0) * 3.0 for item in rows), default=0.0)
+    chart_rows: list[dict[str, Any]] = []
+    for item in rows:
+        row = dict(item)
+        monthly_cost = float(item.get("monthly_cost", 0.0) or 0.0)
+        yearly_cost = float(item.get("yearly_cost", 0.0) or 0.0)
+        three_year_cost = yearly_cost * 3.0
+        native_vm_count = int(item.get("native_vm_count", 0) or 0)
+        ocvs_vm_count = int(item.get("ocvs_vm_count", 0) or 0)
+        total_vm_count = max(0, native_vm_count + ocvs_vm_count)
+        row["bar_pct"] = _pct_of_max(monthly_cost, max_monthly)
+        row["three_year_cost"] = three_year_cost
+        row["three_year_bar_pct"] = _pct_of_max(three_year_cost, max_three_year)
+        row["native_vm_pct"] = (native_vm_count / total_vm_count * 100.0) if total_vm_count else 0.0
+        row["ocvs_vm_pct"] = (ocvs_vm_count / total_vm_count * 100.0) if total_vm_count else 0.0
+        row["cost_per_vm"] = (monthly_cost / total_vm_count) if total_vm_count else 0.0
+        chart_rows.append(row)
+    return chart_rows
+
+
+def _build_breakdown_segments(components: list[dict[str, Any]]) -> tuple[float, list[dict[str, Any]]]:
+    total = sum(float(item.get("value", 0.0) or 0.0) for item in components)
+    segments: list[dict[str, Any]] = []
+    for item in components:
+        value = float(item.get("value", 0.0) or 0.0)
+        segments.append({**item, "pct": (value / total * 100.0) if total > 0 else 0.0})
+    return total, segments
+
+
+def build_cost_breakdown_rows(
+    overall: dict[str, Any],
+    supported_native_summary: dict[str, Any],
+    ocvs_price: dict[str, Any],
+    hybrid_ocvs_price: dict[str, Any],
+    vmware_license_summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ocvs_selected = ocvs_price["selected"]
+    hybrid_selected = hybrid_ocvs_price["selected"]
+    vmware_ocvs = vmware_license_summary.get("ocvs", {})
+    vmware_hybrid = vmware_license_summary.get("hybrid", {})
+    rows_seed = [
+        {
+            "label": "OCI Native",
+            "components": [
+                {"label": "Compute", "value": float(overall.get("total_cpu_ram_monthly_cost", 0.0)), "class": "seg-compute"},
+                {"label": "Storage", "value": float(overall.get("total_storage_monthly_cost", 0.0)), "class": "seg-storage"},
+                {"label": "OS license", "value": float(overall.get("total_os_license_monthly_cost", 0.0)), "class": "seg-license"},
+            ],
+        },
+        {
+            "label": "OCVS",
+            "components": [
+                {
+                    "label": "OCVS nodes",
+                    "value": int(ocvs_selected.get("host_count", 0) or 0) * float(ocvs_selected.get("host_monthly_cost", 0.0) or 0.0),
+                    "class": "seg-hosts",
+                },
+                {"label": "Datastore", "value": float(ocvs_selected.get("storage_monthly_cost", 0.0) or 0.0), "class": "seg-ocvs-storage"},
+                {"label": "VCF license", "value": float(vmware_ocvs.get("monthly_cost", 0.0) or 0.0), "class": "seg-vmware-license"},
+            ],
+        },
+        {
+            "label": "Hybrid",
+            "components": [
+                {"label": "Native compute", "value": float(supported_native_summary.get("total_cpu_ram_monthly_cost", 0.0)), "class": "seg-compute"},
+                {"label": "Native storage", "value": float(supported_native_summary.get("total_storage_monthly_cost", 0.0)), "class": "seg-storage"},
+                {"label": "OS license", "value": float(supported_native_summary.get("total_os_license_monthly_cost", 0.0)), "class": "seg-license"},
+                {
+                    "label": "OCVS nodes",
+                    "value": int(hybrid_selected.get("host_count", 0) or 0) * float(hybrid_selected.get("host_monthly_cost", 0.0) or 0.0),
+                    "class": "seg-hosts",
+                },
+                {"label": "OCVS datastore", "value": float(hybrid_selected.get("storage_monthly_cost", 0.0) or 0.0), "class": "seg-ocvs-storage"},
+                {"label": "VCF license", "value": float(vmware_hybrid.get("monthly_cost", 0.0) or 0.0), "class": "seg-vmware-license"},
+            ],
+        },
+    ]
+    totals_and_segments = [_build_breakdown_segments(row["components"]) for row in rows_seed]
+    max_total = max((total for total, _segments in totals_and_segments), default=0.0)
+    rows: list[dict[str, Any]] = []
+    for row, (total, segments) in zip(rows_seed, totals_and_segments):
+        rows.append({**row, "total": total, "segments": segments, "bar_pct": _pct_of_max(total, max_total)})
+    return rows
+
+
+def build_executive_insights(
+    scenario_comparison: dict[str, Any],
+    executive_summary: dict[str, Any],
+    ocvs_price: dict[str, Any],
+    hybrid_ocvs_price: dict[str, Any],
+    fit_warnings: list[dict[str, str]],
+    vmware_license_summary: dict[str, Any],
+) -> list[dict[str, str]]:
+    best = scenario_comparison.get("best", {})
+    ocvs_selected = ocvs_price["selected"]
+    hybrid_selected = hybrid_ocvs_price["selected"]
+    insights: list[dict[str, str]] = [
+        {
+            "title": "Lowest-cost path",
+            "detail": (
+                f"{executive_summary.get('driver', '')} Treat this as a cost ranking until dependencies, "
+                "migration waves, downtime, and commercial terms are validated."
+            ),
+        },
+        {
+            "title": "Hybrid split",
+            "detail": (
+                f"{scenario_comparison.get('supported_vm_count', 0):,} VM(s) are placed on OCI Native; "
+                f"{scenario_comparison.get('unsupported_vm_count', 0):,} VM(s) are priced on OCVS."
+            ),
+        },
+        {
+            "title": "OCVS sizing driver",
+            "detail": (
+                f"Full OCVS uses {ocvs_selected.get('host_count')} x {ocvs_selected.get('shape')} driven by {ocvs_selected.get('constraint')}; "
+                f"hybrid OCVS uses {hybrid_selected.get('host_count')} x {hybrid_selected.get('shape')}."
+            ),
+        },
+    ]
+
+    if ocvs_selected.get("host_type") == "Dense":
+        policy = ocvs_price.get("policy", {})
+        insights.append(
+            {
+                "title": "vSAN capacity policy",
+                "detail": (
+                    f"Dense OCVS uses {float(policy.get('dense_vsan_usable_pct', 50.0)):.0f}% usable vSAN to reflect "
+                    f"FTT=1 RAID-1 mirroring, then reserves {float(policy.get('storage_headroom_pct', 25.0)):.0f}% storage headroom."
+                ),
+            }
+        )
+
+    if int(ocvs_selected.get("host_count", 0) or 0) > 0:
+        total_cores = int(ocvs_selected.get("host_count", 0) or 0) * int(ocvs_selected.get("ocpus_per_host", 0) or 0)
+        insights.append(
+            {
+                "title": "VCF license coverage",
+                "detail": f"Full OCVS requires planning for {total_cores:,} physical core/OCPU(s), subject to Broadcom VCF per-core terms.",
+            }
+        )
+
+    vmware_full = vmware_license_summary.get("ocvs", {})
+    if int(vmware_full.get("physical_cores", 0) or 0) > 0:
+        if bool(vmware_license_summary.get("is_priced", False)):
+            insights.append(
+                {
+                    "title": "VCF license run-rate",
+                    "detail": (
+                        f"Full OCVS adds {float(vmware_full.get('yearly_cost', 0.0) or 0.0):,.0f} per year "
+                        f"for {int(vmware_full.get('physical_cores', 0) or 0):,} physical core(s)."
+                    ),
+                }
+            )
+        else:
+            insights.append(
+                {
+                    "title": "VCF license assumption",
+                    "detail": "Enter a VCF list price per physical core/year to include license run-rate in OCVS and Hybrid costs.",
+                }
+            )
+
+    if fit_warnings:
+        critical = sum(1 for item in fit_warnings if item.get("severity") == "critical")
+        warnings = sum(1 for item in fit_warnings if item.get("severity") == "warning")
+        insights.append(
+                {
+                    "title": "Review focus",
+                    "detail": f"{critical} critical item(s) and {warnings} warning(s) need review before using this as a final recommendation.",
+                }
+            )
+
+    if str(best.get("id", "")) != "native":
+        delta = float(best.get("monthly_delta", 0.0) or 0.0)
+        direction = "saves" if delta < 0 else "costs"
+        insights.append(
+            {
+                "title": "Run-rate delta",
+                "detail": f"The lowest-cost path {direction} {abs(delta):,.0f} per month against the OCI Native baseline.",
+            }
+        )
+
+    return insights
+
+
+def build_price_analysis_from_rows(
+    vm_rows: list[dict[str, Any]],
+    price_lookup: dict[str, float],
+    block_storage_unit_price: float,
+    block_perf_unit_price: float,
+    windows_os_unit_price: float,
+    iaas_discount_pct: float,
+    ocvs_policy: dict[str, Any],
+    ocvs_profile_choice: str,
+    source_pricelist_file: str,
+    vmware_license_price_per_core_yearly: float,
+    ocvs_dr_nodes: int,
+    hybrid_placement_selection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    overall = summarize_native_price(vm_rows)
+    ocvs_price = build_ocvs_price_summary(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        iaas_discount_pct=iaas_discount_pct,
+        policy=ocvs_policy,
+        selected_profile=ocvs_profile_choice,
+        dr_node_count=ocvs_dr_nodes,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+    )
+    ocvs_selected = ocvs_price["selected"]
+    supported_signatures = load_supported_os_signatures()
+    oci_supported_rows = [
+        row
+        for row in vm_rows
+        if supported_signatures and is_oci_supported_os(str(row.get("os_name", "")), supported_signatures)
+    ]
+    oci_supported_names = {str(row.get("vm_name", "")) for row in oci_supported_rows}
+    oci_unsupported_rows = [row for row in vm_rows if str(row.get("vm_name", "")) not in oci_supported_names]
+
+    hybrid_placement_plan = build_hybrid_placement_plan(
+        vm_rows=vm_rows,
+        hybrid_placement_selection=hybrid_placement_selection,
+        supported_signatures=supported_signatures,
+    )
+    supported_native_rows = list(hybrid_placement_plan["native_rows"])
+    unsupported_ocvs_rows = list(hybrid_placement_plan["ocvs_rows"])
+    hybrid_review_rows = list(hybrid_placement_plan["review_rows"])
+    supported_native_summary = summarize_native_price(supported_native_rows)
+    hybrid_ocvs_price = build_ocvs_price_summary(
+        vm_rows=unsupported_ocvs_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        iaas_discount_pct=iaas_discount_pct,
+        policy=ocvs_policy,
+        selected_profile=ocvs_profile_choice,
+        dr_node_count=ocvs_dr_nodes,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+    )
+    hybrid_ocvs_selected = hybrid_ocvs_price["selected"]
+    vmware_license_summary = build_vmware_license_summary(
+        ocvs_price=ocvs_price,
+        hybrid_ocvs_price=hybrid_ocvs_price,
+        price_per_core_yearly=vmware_license_price_per_core_yearly,
+    )
+
+    baseline_monthly = float(overall["total_monthly_cost"])
+    ocvs_monthly = float(ocvs_selected.get("total_monthly_cost", 0.0)) + float(
+        vmware_license_summary["ocvs"].get("monthly_cost", 0.0)
+    )
+    hybrid_monthly = float(supported_native_summary["total_monthly_cost"]) + float(
+        hybrid_ocvs_selected.get("total_monthly_cost", 0.0)
+    ) + float(
+        vmware_license_summary["hybrid"].get("monthly_cost", 0.0)
+    )
+    ocvs_host_count = int(ocvs_selected.get("host_count", 0) or 0)
+    hybrid_ocvs_host_count = int(hybrid_ocvs_selected.get("host_count", 0) or 0)
+    native_viable = bool(not vm_rows or baseline_monthly > 0.0)
+    ocvs_viable = bool(ocvs_host_count == 0 or bool(ocvs_selected.get("pricing_available", False)))
+    hybrid_viable = bool(hybrid_ocvs_host_count == 0 or bool(hybrid_ocvs_selected.get("pricing_available", False)))
+
+    scenario_rows = [
+        {
+            "id": "native",
+            "label": "OCI Native",
+            "monthly_cost": baseline_monthly,
+            "yearly_cost": baseline_monthly * 12.0,
+            "monthly_delta": 0.0,
+            "native_vm_count": len(vm_rows),
+            "ocvs_vm_count": 0,
+            "sizing_basis": f"{len(vm_rows):,} selected VMs sized to flexible OCI compute and block volume storage",
+            "detail": "Baseline",
+            "is_viable": native_viable,
+        },
+        {
+            "id": "ocvs",
+            "label": "OCVS",
+            "monthly_cost": ocvs_monthly,
+            "yearly_cost": ocvs_monthly * 12.0,
+            "monthly_delta": ocvs_monthly - baseline_monthly,
+            "native_vm_count": 0,
+            "ocvs_vm_count": len(vm_rows),
+            "sizing_basis": f"{ocvs_selected['host_count']} x {ocvs_selected['shape']} ({ocvs_selected['label']}), driven by {ocvs_selected['constraint']}",
+            "detail": (
+                f"All selected VMs remain on VMware; VCF license {vmware_license_summary['ocvs']['physical_cores']:,} cores"
+            ),
+            "is_viable": ocvs_viable,
+        },
+        {
+            "id": "hybrid",
+            "label": "Hybrid",
+            "monthly_cost": hybrid_monthly,
+            "yearly_cost": hybrid_monthly * 12.0,
+            "monthly_delta": hybrid_monthly - baseline_monthly,
+            "native_vm_count": len(supported_native_rows),
+            "ocvs_vm_count": len(unsupported_ocvs_rows),
+            "sizing_basis": (
+                f"{len(supported_native_rows):,} VM(s) to Native; "
+                f"{len(unsupported_ocvs_rows):,} VM(s) priced on OCVS"
+            ),
+            "detail": (
+                f"OCVS subset: {hybrid_ocvs_selected['host_count']} x {hybrid_ocvs_selected['shape']}; "
+                f"VCF license {vmware_license_summary['hybrid']['physical_cores']:,} cores"
+                if unsupported_ocvs_rows
+                else "No VMs currently priced on OCVS in the Hybrid placement planner"
+            ),
+            "is_viable": hybrid_viable,
+        },
+    ]
+    viable_scenarios = [scenario for scenario in scenario_rows if bool(scenario.get("is_viable", False))]
+    best_scenario = min(viable_scenarios or scenario_rows, key=lambda item: float(item["monthly_cost"]))
+    scenario_cost_pool = viable_scenarios or scenario_rows
+    monthly_cost_values = [float(item.get("monthly_cost", 0.0) or 0.0) for item in scenario_cost_pool]
+    lowest_monthly_cost = min(monthly_cost_values, default=0.0)
+    highest_monthly_cost = max(monthly_cost_values, default=0.0)
+    scenario_comparison = {
+        "rows": scenario_rows,
+        "best": best_scenario,
+        "supported_vm_count": len(supported_native_rows),
+        "unsupported_vm_count": len(unsupported_ocvs_rows),
+        "review_vm_count": len(hybrid_review_rows),
+        "manual_override_count": int(hybrid_placement_plan.get("manual_override_count", 0) or 0),
+        "supported_os_source_available": bool(supported_signatures),
+        "monthly_spread": max(0.0, highest_monthly_cost - lowest_monthly_cost),
+        "three_year_spread": max(0.0, (highest_monthly_cost - lowest_monthly_cost) * 36.0),
+    }
+    workload_summary = build_workload_summary(
+        vm_rows=vm_rows,
+        supported_native_rows=oci_supported_rows,
+        unsupported_ocvs_rows=oci_unsupported_rows,
+        supported_os_source_available=bool(supported_signatures),
+    )
+    price_comparison = {
+        "native_monthly_cost": baseline_monthly,
+        "native_yearly_cost": baseline_monthly * 12.0,
+        "ocvs_monthly_cost": ocvs_monthly,
+        "ocvs_yearly_cost": ocvs_monthly * 12.0,
+        "hybrid_monthly_cost": hybrid_monthly,
+        "hybrid_yearly_cost": hybrid_monthly * 12.0,
+        "monthly_delta": ocvs_monthly - baseline_monthly,
+        "yearly_delta": (ocvs_monthly - baseline_monthly) * 12.0,
+        "vmware_license_monthly_cost": float(vmware_license_summary["ocvs"].get("monthly_cost", 0.0)),
+        "vmware_license_yearly_cost": float(vmware_license_summary["ocvs"].get("yearly_cost", 0.0)),
+    }
+    fit_warnings = build_fit_warnings(
+        vm_rows=vm_rows,
+        unsupported_ocvs_rows=unsupported_ocvs_rows,
+        scenario_comparison=scenario_comparison,
+        overall=overall,
+        ocvs_price=ocvs_price,
+        hybrid_ocvs_price=hybrid_ocvs_price,
+        source_pricelist_file=source_pricelist_file,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        windows_os_unit_price=windows_os_unit_price,
+        vmware_license_summary=vmware_license_summary,
+    )
+    executive_summary = build_executive_summary(
+        scenario_comparison=scenario_comparison,
+        ocvs_price=ocvs_price,
+        hybrid_ocvs_price=hybrid_ocvs_price,
+        fit_warnings=fit_warnings,
+    )
+
+    return {
+        "overall": overall,
+        "ocvs_price": ocvs_price,
+        "hybrid_ocvs_price": hybrid_ocvs_price,
+        "supported_native_summary": supported_native_summary,
+        "supported_native_rows": supported_native_rows,
+        "unsupported_ocvs_rows": unsupported_ocvs_rows,
+        "oci_supported_rows": oci_supported_rows,
+        "oci_unsupported_rows": oci_unsupported_rows,
+        "hybrid_placement_plan": hybrid_placement_plan,
+        "workload_summary": workload_summary,
+        "scenario_comparison": scenario_comparison,
+        "price_comparison": price_comparison,
+        "fit_warnings": fit_warnings,
+        "executive_summary": executive_summary,
+        "ocvs_shape_comparison": build_ocvs_shape_comparison(ocvs_price),
+        "vmware_license_summary": vmware_license_summary,
+        "scenario_chart_rows": build_scenario_chart_rows(scenario_comparison),
+        "cost_breakdown_rows": build_cost_breakdown_rows(
+            overall=overall,
+            supported_native_summary=supported_native_summary,
+            ocvs_price=ocvs_price,
+            hybrid_ocvs_price=hybrid_ocvs_price,
+            vmware_license_summary=vmware_license_summary,
+        ),
+        "executive_insights": build_executive_insights(
+            scenario_comparison=scenario_comparison,
+            executive_summary=executive_summary,
+            ocvs_price=ocvs_price,
+            hybrid_ocvs_price=hybrid_ocvs_price,
+            fit_warnings=fit_warnings,
+            vmware_license_summary=vmware_license_summary,
+        ),
+    }
+
+
+def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
+    selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
+    customer_name = normalize_customer_name(session.get("customer_name", ""))
+    if not selected_rvtools_file:
+        flash("Select a VM inventory export in Step 1 to continue.", "rvtools_info")
+        return None, "index"
+
+    try:
+        all_vms, source_vinfo_csv = load_vms_from_vinfo(selected_rvtools_file)
+    except Exception as exc:
+        flash(f"Could not load VM inventory data: {exc}", "rvtools_error")
+        return None, "index"
+
+    vm_index = {vm["name"]: vm for vm in all_vms}
+    app_state = load_app_state()
+    selected_vm_names = app_state.get("selected_vm_names", [])
+    if not isinstance(selected_vm_names, list):
+        selected_vm_names = []
+    selected_vm_names = [n for n in selected_vm_names if n in vm_index]
+    selected_vms = [vm_index[name] for name in selected_vm_names if name in vm_index]
+    if not selected_vms:
+        flash("No VMs selected yet. Please select VMs in Step 2 first.", "error")
+        return None, "step3"
+
+    shape_options = load_oci_target_shapes()
+    shape_pricing_map = load_oci_price_mapping_details()
+    if shape_pricing_map:
+        shape_options = [s for s in shape_options if s in shape_pricing_map] or list(shape_pricing_map.keys())
+
+    selected_pricelist_file = str(session.get("selected_pricelist_file", "")).strip().replace("\\", "/")
+    price_lookup, pricing_currency, source_pricelist_file = load_price_lookup(selected_pricelist_file or None)
+    pricing_unit_prices = resolve_pricing_unit_prices(price_lookup)
+    block_storage_unit_price = pricing_unit_prices["block_storage_unit_price"]
+    block_perf_unit_price = pricing_unit_prices["block_perf_unit_price"]
+    windows_os_unit_price = pricing_unit_prices["windows_os_unit_price"]
+
+    valid_shape_values = set(shape_options)
+    valid_vpu_values = set(VPU_OPTIONS)
+    vm_shape_selection = app_state.get("step4_vm_shapes", {})
+    if not isinstance(vm_shape_selection, dict):
+        vm_shape_selection = {}
+    vm_ocpu_selection = app_state.get("step4_vm_ocpus", {})
+    if not isinstance(vm_ocpu_selection, dict):
+        vm_ocpu_selection = {}
+    vm_burst_selection = app_state.get("step4_vm_bursts", {})
+    if not isinstance(vm_burst_selection, dict):
+        vm_burst_selection = {}
+    vm_vpu_selection = app_state.get("step4_vm_vpus", {})
+    if not isinstance(vm_vpu_selection, dict):
+        vm_vpu_selection = {}
+    vm_os_license_selection = app_state.get("step4_vm_os_license", {})
+    if not isinstance(vm_os_license_selection, dict):
+        vm_os_license_selection = {}
+    hybrid_placement_selection = app_state.get("step4_hybrid_placements", {})
+    if not isinstance(hybrid_placement_selection, dict):
+        hybrid_placement_selection = {}
+    try:
+        iaas_discount_pct = float(app_state.get("step4_iaas_discount_pct", 0.0))
+    except (TypeError, ValueError):
+        iaas_discount_pct = 0.0
+    iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
+    ocvs_profile_choice = normalize_ocvs_profile(app_state.get("step4_ocvs_profile", "best_fit"))
+    ocvs_policy = normalize_ocvs_policy(app_state.get("step4_ocvs_policy", {}))
+    vmware_license_price_per_core_yearly = _bounded_float(
+        app_state.get("step4_vmware_license_price_per_core_yearly"),
+        0.0,
+        0.0,
+        1_000_000.0,
+    )
+    ocvs_dr_nodes = normalize_ocvs_dr_nodes(app_state.get("step4_ocvs_dr_nodes", 0))
+    step4_last_updated_at = str(app_state.get("step4_last_updated_at", "") or "")
+    snapshot = load_step4_snapshot()
+    if (
+        not step4_last_updated_at
+        and str(snapshot.get("source_vinfo_csv", "")) == source_vinfo_csv
+        and snapshot.get("saved_at")
+    ):
+        step4_last_updated_at = str(snapshot.get("saved_at"))
+
+    vm_rows = build_vm_cost_rows(
+        selected_vms,
+        shape_options=shape_options,
+        shape_pricing_map=shape_pricing_map,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        windows_os_unit_price=windows_os_unit_price,
+        iaas_discount_pct=iaas_discount_pct,
+        vm_shape_selection=vm_shape_selection,
+        vm_ocpu_selection=vm_ocpu_selection,
+        vm_burst_selection=vm_burst_selection,
+        vm_vpu_selection=vm_vpu_selection,
+        vm_os_license_selection=vm_os_license_selection,
+        valid_shape_values=valid_shape_values,
+        valid_vpu_values=valid_vpu_values,
+    )
+    vm_rows.sort(key=lambda r: str(r["vm_name"]).lower())
+    analysis = build_price_analysis_from_rows(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        windows_os_unit_price=windows_os_unit_price,
+        iaas_discount_pct=iaas_discount_pct,
+        ocvs_policy=ocvs_policy,
+        ocvs_profile_choice=ocvs_profile_choice,
+        source_pricelist_file=source_pricelist_file,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+        hybrid_placement_selection=hybrid_placement_selection,
+    )
+    migration_waves = build_migration_waves(
+        vm_rows=vm_rows,
+        supported_native_rows=analysis["supported_native_rows"],
+        unsupported_ocvs_rows=analysis["unsupported_ocvs_rows"],
+    )
+
+    return {
+        "selected_rvtools_file": selected_rvtools_file,
+        "source_vinfo_csv": source_vinfo_csv,
+        "pricing_currency": pricing_currency,
+        "source_pricelist_file": source_pricelist_file,
+        "iaas_discount_pct": iaas_discount_pct,
+        "vm_rows": vm_rows,
+        "ocvs_profile_choice": ocvs_profile_choice,
+        "ocvs_policy": ocvs_policy,
+        "ocvs_dr_nodes": ocvs_dr_nodes,
+        "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
+        "step4_last_updated_at": step4_last_updated_at,
+        "step4_last_updated_display": _format_display_timestamp(step4_last_updated_at),
+        "migration_waves": migration_waves,
+        "last_export_file": session.get("last_export_file", ""),
+        "customer_name": customer_name,
+        **analysis,
+    }, ""
+
+
+def build_scenario_view(scenario_id: str, context: dict[str, Any]) -> dict[str, Any]:
+    scenario_rows = list(context["scenario_comparison"]["rows"])
+    scenario = next((row for row in scenario_rows if str(row.get("id", "")) == scenario_id), scenario_rows[0])
+    chart_rows = list(context.get("scenario_chart_rows", []))
+    chart_scenario = next((row for row in chart_rows if str(row.get("id", "")) == scenario_id), {})
+    scenario = {**scenario, **chart_scenario}
+    composition_label = {
+        "native": "OCI Native",
+        "ocvs": "OCVS",
+        "hybrid": "Hybrid",
+    }.get(scenario_id, "OCI Native")
+    composition = next(
+        (row for row in context.get("cost_breakdown_rows", []) if row.get("label") == composition_label),
+        {"label": composition_label, "total": 0.0, "segments": [], "bar_pct": 0.0},
+    )
+
+    def money(value: Any) -> float:
+        return float(value or 0.0)
+
+    overall = context["overall"]
+    ocvs_selected = context["ocvs_price"]["selected"]
+    hybrid_selected = context["hybrid_ocvs_price"]["selected"]
+    vmware_summary = context["vmware_license_summary"]
+    supported_native = context["supported_native_summary"]
+
+    def ocvs_driver_name(value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        return {
+            "cpu": "CPU",
+            "memory": "RAM",
+            "storage": "Storage",
+            "minimum": "Minimum nodes",
+        }.get(normalized, normalized.capitalize() or "Unknown")
+
+    if scenario_id == "native":
+        title = "OCI Native"
+        intro = "Modernize selected VMs onto OCI Compute and Block Volume using the active sizing, VPU, discount, and licensing assumptions."
+        cards = [
+            {"label": "Monthly cost", "value": money(scenario.get("monthly_cost")), "kind": "money"},
+            {"label": "Annual cost", "value": money(scenario.get("yearly_cost")), "kind": "money"},
+            {"label": "Cost / VM / month", "value": money(scenario.get("cost_per_vm")), "kind": "money"},
+            {"label": "Modeled VMs", "value": int(overall.get("vm_count", 0) or 0), "kind": "number"},
+            {"label": "License-included VMs", "value": int(overall.get("total_license_included_vms", 0) or 0), "kind": "number"},
+        ]
+        detail_rows = [
+            {"label": "Compute + RAM / month", "value": money(overall.get("total_cpu_ram_monthly_cost")), "kind": "money"},
+            {"label": "Block Volume / month", "value": money(overall.get("total_storage_monthly_cost")), "kind": "money"},
+            {"label": "License-included Windows VMs", "value": f"{int(overall['total_license_included_vms']):,}"},
+            {"label": "Windows license / month", "value": money(overall.get("total_os_license_monthly_cost")), "kind": "money"},
+            {"label": "Total storage VPUs", "value": f"{int(overall['total_vpus']):,}"},
+            {"label": "IaaS discount", "value": f"{float(context['iaas_discount_pct']):.2f}%"},
+        ]
+        assumptions = []
+    elif scenario_id == "ocvs":
+        title = "OCVS"
+        intro = "Lift and shift selected VMware workloads to OCVS while preserving the VMware operating model and compatibility assumptions."
+        vmware_full = vmware_summary["ocvs"]
+        cards = [
+            {"label": "Monthly cost", "value": money(scenario.get("monthly_cost")), "kind": "money"},
+            {"label": "Annual cost", "value": money(scenario.get("yearly_cost")), "kind": "money"},
+            {"label": "Cost / VM / month", "value": money(scenario.get("cost_per_vm")), "kind": "money"},
+            {"label": "Total OCVS nodes", "value": int(ocvs_selected.get("host_count", 0) or 0), "kind": "number"},
+            {"label": "Capacity driver", "value": ocvs_driver_name(ocvs_selected.get("constraint")), "kind": "text"},
+        ]
+        detail_rows = [
+            {"label": "Selected shape", "value": str(ocvs_selected.get("shape", ""))},
+            {"label": "Sizing driver", "value": ocvs_driver_name(ocvs_selected.get("constraint"))},
+            {"label": "Workload nodes", "value": f"{int(ocvs_selected.get('base_host_count', 0) or 0):,}"},
+            {"label": "Spare nodes", "value": f"+{int(ocvs_selected.get('dr_node_count', 0) or 0):,}"},
+            {"label": "Total OCVS nodes", "value": f"{int(ocvs_selected.get('host_count', 0) or 0):,}"},
+            {
+                "label": "Cluster plan",
+                "value": (
+                    "Multi-cluster"
+                    if bool(ocvs_selected.get("cluster_split_required", False))
+                    else "Single cluster"
+                ),
+            },
+            {"label": "Physical cores", "value": f"{int(vmware_full.get('physical_cores', 0) or 0):,}"},
+            {"label": "VCF license / month", "value": money(vmware_full.get("monthly_cost")), "kind": "money"},
+        ]
+        assumptions = []
+    else:
+        title = "Hybrid"
+        intro = "Blend OCI Native and OCVS by placing each VM on the target platform that best fits readiness, dependencies, and risk."
+        vmware_hybrid = vmware_summary["hybrid"]
+        cards = [
+            {"label": "Monthly cost", "value": money(scenario.get("monthly_cost")), "kind": "money"},
+            {"label": "Annual cost", "value": money(scenario.get("yearly_cost")), "kind": "money"},
+            {"label": "Cost / VM / month", "value": money(scenario.get("cost_per_vm")), "kind": "money"},
+            {"label": "OCI Native VMs", "value": int(scenario.get("native_vm_count", 0) or 0), "kind": "number"},
+            {"label": "OCVS VMs", "value": int(scenario.get("ocvs_vm_count", 0) or 0), "kind": "number"},
+        ]
+        detail_rows = [
+            {"label": "Native VM count", "value": f"{int(scenario.get('native_vm_count', 0) or 0):,}"},
+            {"label": "OCVS VM count", "value": f"{int(scenario.get('ocvs_vm_count', 0) or 0):,}"},
+            {"label": "Native monthly run-rate", "value": money(supported_native.get("total_monthly_cost")), "kind": "money"},
+            {"label": "OCVS subset shape", "value": str(hybrid_selected.get("shape", ""))},
+            {"label": "OCVS subset nodes", "value": f"{int(hybrid_selected.get('host_count', 0) or 0):,}"},
+            {
+                "label": "OCVS cluster plan",
+                "value": (
+                    "Multi-cluster"
+                    if bool(hybrid_selected.get("cluster_split_required", False))
+                    else "Single cluster"
+                ),
+            },
+            {"label": "Hybrid VCF cores", "value": f"{int(vmware_hybrid.get('physical_cores', 0) or 0):,}"},
+            {"label": "Hybrid VCF / month", "value": money(vmware_hybrid.get("monthly_cost")), "kind": "money"},
+        ]
+        assumptions = []
+
+    return {
+        "id": scenario_id,
+        "title": title,
+        "intro": intro,
+        "scenario": scenario,
+        "cards": cards,
+        "composition": composition,
+        "detail_rows": detail_rows,
+        "assumptions": assumptions,
+    }
+
+
+def _xlsx_currency_format_code(currency_code: str) -> str:
+    currency_format_map = {
+        "EUR": "€#,##0.00",
+        "USD": "$#,##0.00",
+        "GBP": "£#,##0.00",
+        "JPY": "¥#,##0.00",
+        "CHF": '"CHF "#,##0.00',
+        "AUD": '"A$"#,##0.00',
+        "CAD": '"C$"#,##0.00',
+        "SGD": '"S$"#,##0.00',
+        "SEK": '"kr "#,##0.00',
+        "NOK": '"kr "#,##0.00',
+        "DKK": '"kr "#,##0.00',
+    }
+    code = str(currency_code or "USD").upper()
+    return currency_format_map.get(code, f'"{code} "#,##0.00')
+
+
+def _xlsx_col_ref(col_idx: int) -> str:
+    col_idx += 1
+    letters = ""
+    while col_idx:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _xlsx_clean_text(value: Any) -> str:
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(value))
+
+
+def _xlsx_cell_xml(value: Any, row_idx: int, col_idx: int, style_idx: int | None = None) -> str:
+    ref = f"{_xlsx_col_ref(col_idx)}{row_idx}"
+    style_attr = f' s="{style_idx}"' if style_idx is not None else ""
+    if value is None:
+        return f'<c r="{ref}"{style_attr}/>'
+    if isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{str(value)}</t></is></c>'
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            value = 0
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+
+    text = _xlsx_clean_text(value)
+    if text.startswith("="):
+        return f'<c r="{ref}"{style_attr}><f>{xml_escape(text[1:])}</f></c>'
+    safe = xml_escape(text)
+    return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
+
+
+def _xlsx_styles_xml(currency_fmt_code: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<numFmts count="4">'
+        f'<numFmt numFmtId="164" formatCode="{xml_escape(currency_fmt_code)}"/>'
+        '<numFmt numFmtId="165" formatCode="0.0%"/>'
+        '<numFmt numFmtId="166" formatCode="#,##0"/>'
+        '<numFmt numFmtId="167" formatCode="0.000000"/>'
+        '</numFmts>'
+        '<fonts count="9">'
+        '<font><sz val="11"/><color rgb="FF121417"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FF121417"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="14"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FF0F62FE"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><i/><sz val="10"/><color rgb="FF525C6A"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="12"/><color rgb="FF0F62FE"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="12"/><color rgb="FF00796B"/><name val="Calibri"/><family val="2"/></font>'
+        '<font><b/><sz val="12"/><color rgb="FF6D28D9"/><name val="Calibri"/><family val="2"/></font>'
+        '</fonts>'
+        '<fills count="12">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF0F62FE"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFEFF6FF"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFF2F4F8"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF8E6"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFEFF6FF"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFE7FFF8"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFF6F0FF"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF2563EB"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF009688"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF8B5CF6"/><bgColor indexed="64"/></patternFill></fill>'
+        '</fills>'
+        '<borders count="2">'
+        '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        '<border>'
+        '<left style="thin"><color rgb="FFD9DDE3"/></left>'
+        '<right style="thin"><color rgb="FFD9DDE3"/></right>'
+        '<top style="thin"><color rgb="FFD9DDE3"/></top>'
+        '<bottom style="thin"><color rgb="FFD9DDE3"/></bottom>'
+        '<diagonal/>'
+        '</border>'
+        '</borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="20">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="1" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="166" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="4" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="167" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="7" borderId="1" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="8" borderId="1" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="9" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="10" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="11" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="6" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="7" fillId="7" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="8" fillId="8" borderId="1" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+
+
+def _xlsx_row_height(row: list[Any], row_style: int | None) -> float:
+    if not any(str(value or "").strip() for value in row):
+        return 6.0
+    if row_style == 3:
+        return 20.0
+    if row_style in {4, 5, 8}:
+        return 18.0
+    if row_style in {9, 11, 12, 13}:
+        max_text_len = max((len(str(value or "")) for value in row), default=0)
+        if max_text_len >= 180:
+            return 78.0
+        if max_text_len >= 100:
+            return 56.0
+        return 36.0
+    return 18.0
+
+
+def _xlsx_sheet_xml_for_rows(
+    rows: list[list[Any]],
+    *,
+    row_styles: dict[int, int] | None = None,
+    cell_styles: dict[tuple[int, int], int] | None = None,
+    column_widths: list[float] | None = None,
+    freeze_row: int | None = None,
+) -> str:
+    row_styles = row_styles or {}
+    cell_styles = cell_styles or {}
+    max_cols = max((len(row) for row in rows), default=1)
+    max_rows = max(len(rows), 1)
+    dimension = f"A1:{_xlsx_col_ref(max_cols - 1)}{max_rows}"
+    cols_xml = ""
+    if column_widths:
+        col_defs = []
+        for idx, width in enumerate(column_widths, start=1):
+            col_defs.append(f'<col min="{idx}" max="{idx}" width="{width:.2f}" customWidth="1"/>')
+        cols_xml = f"<cols>{''.join(col_defs)}</cols>"
+
+    sheet_views_xml = '<sheetViews><sheetView workbookViewId="0" showGridLines="0"/></sheetViews>'
+    if freeze_row and freeze_row > 0:
+        top_left = f"A{freeze_row + 1}"
+        sheet_views_xml = (
+            '<sheetViews><sheetView workbookViewId="0" showGridLines="0">'
+            f'<pane ySplit="{freeze_row}" topLeftCell="{top_left}" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews>'
+        )
+
+    sheet_rows_xml: list[str] = []
+    merge_refs: list[str] = []
+    for row_idx, row in enumerate(rows, start=1):
+        row_cells: list[str] = []
+        has_content = any(str(value or "").strip() for value in row)
+        row_style = row_styles.get(row_idx)
+        row_height = _xlsx_row_height(row, row_style)
+        if row_style in {3, 4, 8} and max_cols > 1:
+            merge_refs.append(f"A{row_idx}:{_xlsx_col_ref(max_cols - 1)}{row_idx}")
+        for col_idx in range(max_cols):
+            value = row[col_idx] if col_idx < len(row) else None
+            style_idx = cell_styles.get((row_idx, col_idx + 1), row_style)
+            if style_idx is None and has_content:
+                style_idx = 7
+            row_cells.append(_xlsx_cell_xml(value, row_idx, col_idx, style_idx=style_idx))
+        sheet_rows_xml.append(
+            f'<row r="{row_idx}" ht="{row_height:.1f}" customHeight="1">{"".join(row_cells)}</row>'
+        )
+
+    merges_xml = ""
+    if merge_refs:
+        merge_cells = "".join(f'<mergeCell ref="{ref}"/>' for ref in merge_refs)
+        merges_xml = f'<mergeCells count="{len(merge_refs)}">{merge_cells}</mergeCells>'
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="{dimension}"/>'
+        f"{sheet_views_xml}"
+        '<sheetFormatPr defaultRowHeight="18"/>'
+        f"{cols_xml}"
+        f"<sheetData>{''.join(sheet_rows_xml)}</sheetData>"
+        f"{merges_xml}"
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '</worksheet>'
+    )
+
+
+def _build_xlsx_workbook_bytes(
+    sheets: list[dict[str, Any]],
+    *,
+    currency_fmt_code: str,
+) -> bytes:
+    workbook_sheet_xml = []
+    workbook_rels_xml = []
+    content_type_overrides = []
+    for idx, sheet in enumerate(sheets, start=1):
+        name = xml_escape(str(sheet["name"])[:31])
+        workbook_sheet_xml.append(f'<sheet name="{name}" sheetId="{idx}" r:id="rId{idx}"/>')
+        workbook_rels_xml.append(
+            f'<Relationship Id="rId{idx}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{idx}.xml"/>'
+        )
+        content_type_overrides.append(
+            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+
+    styles_rel_id = f"rId{len(sheets) + 1}"
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>'
+        f"{''.join(workbook_sheet_xml)}"
+        '</sheets>'
+        '</workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{''.join(workbook_rels_xml)}"
+        f'<Relationship Id="{styles_rel_id}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        '</Relationships>'
+    )
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        f"{''.join(content_type_overrides)}"
+        '<Override PartName="/xl/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '</Types>'
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", root_rels_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", _xlsx_styles_xml(currency_fmt_code))
+        for idx, sheet in enumerate(sheets, start=1):
+            sheet_xml = _xlsx_sheet_xml_for_rows(
+                sheet["rows"],
+                row_styles=sheet.get("row_styles"),
+                cell_styles=sheet.get("cell_styles"),
+                column_widths=sheet.get("column_widths"),
+                freeze_row=sheet.get("freeze_row"),
+            )
+            zf.writestr(f"xl/worksheets/sheet{idx}.xml", sheet_xml)
+    return buffer.getvalue()
+
+
+def build_migration_price_workbook_xlsx(
+    *,
+    customer_name: str,
+    pricing_currency: str,
+    source_pricelist_file: str,
+    source_vinfo_csv: str,
+    export_path_display: str,
+    generated_at: str,
+    step4_last_updated_at: str,
+    vm_rows: list[dict[str, Any]],
+    non_selected_vm_rows: list[dict[str, Any]],
+    analysis: dict[str, Any],
+    migration_waves: dict[str, Any],
+    shape_price_rates: dict[str, dict[str, float]],
+    iaas_discount_pct: float,
+    ocvs_profile_choice: str,
+    ocvs_policy: dict[str, Any],
+    ocvs_dr_nodes: int,
+    vmware_license_price_per_core_yearly: float,
+    block_storage_unit_price: float,
+    block_perf_unit_price: float,
+    windows_os_unit_price: float,
+) -> bytes:
+    STYLE_CURRENCY = 1
+    STYLE_PERCENT = 2
+    STYLE_TITLE = 3
+    STYLE_SECTION = 4
+    STYLE_HEADER = 5
+    STYLE_INTEGER = 6
+    STYLE_NOTE = 8
+    STYLE_CENTER = 9
+    STYLE_UNIT_PRICE = 10
+    STYLE_PATH_NATIVE = 11
+    STYLE_PATH_OCVS = 12
+    STYLE_PATH_HYBRID = 13
+    STYLE_PATH_NATIVE_LABEL = 14
+    STYLE_PATH_OCVS_LABEL = 15
+    STYLE_PATH_HYBRID_LABEL = 16
+    STYLE_PATH_NATIVE_TITLE = 17
+    STYLE_PATH_OCVS_TITLE = 18
+    STYLE_PATH_HYBRID_TITLE = 19
+
+    workload_summary = analysis["workload_summary"]
+    scenario_comparison = analysis["scenario_comparison"]
+    scenario_chart_rows = analysis["scenario_chart_rows"]
+    cost_breakdown_rows = analysis["cost_breakdown_rows"]
+    fit_warnings = analysis["fit_warnings"]
+    executive_summary = analysis["executive_summary"]
+    overall = analysis["overall"]
+    supported_native_summary = analysis["supported_native_summary"]
+    supported_native_rows = analysis["supported_native_rows"]
+    unsupported_ocvs_rows = analysis["unsupported_ocvs_rows"]
+    ocvs_price = analysis["ocvs_price"]
+    hybrid_ocvs_price = analysis["hybrid_ocvs_price"]
+    ocvs_shape_comparison = analysis["ocvs_shape_comparison"]
+    vmware_license_summary = analysis["vmware_license_summary"]
+    hybrid_placement_plan = analysis.get("hybrid_placement_plan", {})
+    hybrid_placement_rows = list(hybrid_placement_plan.get("rows", []))
+
+    def money(value: Any) -> float:
+        return float(value or 0.0)
+
+    def integer(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def scenario_by_id(scenario_id: str) -> dict[str, Any]:
+        rows = list(scenario_comparison.get("rows", []))
+        return next((row for row in rows if str(row.get("id", "")) == scenario_id), {})
+
+    def chart_by_id(scenario_id: str) -> dict[str, Any]:
+        return next((row for row in scenario_chart_rows if str(row.get("id", "")) == scenario_id), {})
+
+    def vm_monthly(row: dict[str, Any]) -> float:
+        return (
+            money(row.get("cpu_ram_monthly_cost"))
+            + money(row.get("storage_monthly_cost"))
+            + money(row.get("os_license_monthly_cost"))
+        )
+
+    def burst_factor_for_export(row: dict[str, Any]) -> float:
+        return float(BURST_FACTOR_MAP.get(normalize_burst_value(row.get("burst", "100%")), 1.0))
+
+    def vm_costing_detail_rows(rows_to_export: list[dict[str, Any]]) -> list[list[Any]]:
+        detail_rows: list[list[Any]] = []
+        for row in rows_to_export:
+            detail_rows.append(
+                [
+                    row.get("vm_name", ""),
+                    row.get("os_name", ""),
+                    row.get("os_license", ""),
+                    integer(row.get("cpus")),
+                    integer(row.get("ocpu")),
+                    burst_factor_for_export(row),
+                    integer(row.get("memory_mb")),
+                    integer(row.get("provisioned_gb")),
+                    integer(row.get("vpu")),
+                    row.get("oci_shape", ""),
+                    money(row.get("cpu_monthly_cost")),
+                    money(row.get("ram_monthly_cost")),
+                    money(row.get("cpu_ram_monthly_cost")),
+                    money(row.get("storage_capacity_monthly_cost")),
+                    money(row.get("storage_performance_monthly_cost")),
+                    money(row.get("storage_monthly_cost")),
+                    money(row.get("os_license_monthly_cost")),
+                    vm_monthly(row),
+                ]
+            )
+        return detail_rows
+
+    def price_list_rows() -> list[list[Any]]:
+        shape_rows = [
+            [
+                shape_name,
+                money(rate.get("ocpu_unit_price")),
+                money(rate.get("memory_unit_price")),
+                pricing_currency or "USD",
+            ]
+            for shape_name, rate in shape_price_rates.items()
+        ]
+        parameter_rows = [
+            ["Block Storage Unit Price", money(block_storage_unit_price), pricing_currency or "USD"],
+            ["Block Performance Unit Price", money(block_perf_unit_price), pricing_currency or "USD"],
+            ["Windows OS Unit Price", money(windows_os_unit_price), pricing_currency or "USD"],
+            ["IaaS Discount Factor", max(0.0, min(1.0, 1.0 - (float(iaas_discount_pct or 0.0) / 100.0))), ""],
+            ["IaaS Discount %", float(iaas_discount_pct or 0.0) / 100.0, ""],
+            ["VCF List Price / Core / Year", money(vmware_license_price_per_core_yearly), pricing_currency or "USD"],
+        ]
+        row_count = max(len(shape_rows), len(parameter_rows))
+        combined: list[list[Any]] = []
+        for idx in range(row_count):
+            shape_part = shape_rows[idx] if idx < len(shape_rows) else ["", "", "", ""]
+            parameter_part = parameter_rows[idx] if idx < len(parameter_rows) else ["", "", ""]
+            combined.append(shape_part + parameter_part)
+        return combined
+
+    def new_sheet() -> tuple[list[list[Any]], dict[int, int], dict[tuple[int, int], int]]:
+        return [], {}, {}
+
+    def add_row(
+        rows: list[list[Any]],
+        row_styles: dict[int, int],
+        row: list[Any],
+        *,
+        style: int | None = None,
+    ) -> int:
+        rows.append(row)
+        row_idx = len(rows)
+        if style is not None:
+            row_styles[row_idx] = style
+        return row_idx
+
+    def add_title(rows: list[list[Any]], row_styles: dict[int, int], title: str) -> None:
+        add_row(rows, row_styles, [title], style=STYLE_TITLE)
+
+    def add_section(rows: list[list[Any]], row_styles: dict[int, int], title: str) -> None:
+        add_row(rows, row_styles, [title], style=STYLE_SECTION)
+
+    def add_note(rows: list[list[Any]], row_styles: dict[int, int], text: str) -> None:
+        add_row(rows, row_styles, [text], style=STYLE_NOTE)
+        add_row(rows, row_styles, [])
+
+    def add_table(
+        rows: list[list[Any]],
+        row_styles: dict[int, int],
+        cell_styles: dict[tuple[int, int], int],
+        headers: list[str],
+        data_rows: list[list[Any]],
+        *,
+        currency_cols: set[int] | None = None,
+        percent_cols: set[int] | None = None,
+        integer_cols: set[int] | None = None,
+    ) -> int:
+        currency_cols = currency_cols or set()
+        percent_cols = percent_cols or set()
+        integer_cols = integer_cols or set()
+        add_row(rows, row_styles, headers, style=STYLE_HEADER)
+        first_data_row = len(rows) + 1
+        for data_row in data_rows:
+            row_idx = add_row(rows, row_styles, data_row)
+            for col_idx in currency_cols:
+                cell_styles[(row_idx, col_idx)] = STYLE_CURRENCY
+            for col_idx in percent_cols:
+                cell_styles[(row_idx, col_idx)] = STYLE_PERCENT
+            for col_idx in integer_cols:
+                cell_styles[(row_idx, col_idx)] = STYLE_INTEGER
+        add_row(rows, row_styles, [])
+        return first_data_row
+
+    def add_key_values(
+        rows: list[list[Any]],
+        row_styles: dict[int, int],
+        cell_styles: dict[tuple[int, int], int],
+        data_rows: list[list[Any]],
+        *,
+        currency_rows: set[int] | None = None,
+        percent_rows: set[int] | None = None,
+        integer_rows: set[int] | None = None,
+    ) -> None:
+        currency_rows = currency_rows or set()
+        percent_rows = percent_rows or set()
+        integer_rows = integer_rows or set()
+        first_data_row = add_table(
+            rows,
+            row_styles,
+            cell_styles,
+            ["Metric", "Value", "Notes"],
+            data_rows,
+            currency_cols=set(),
+        )
+        for offset in currency_rows:
+            cell_styles[(first_data_row + offset - 1, 2)] = STYLE_CURRENCY
+        for offset in percent_rows:
+            cell_styles[(first_data_row + offset - 1, 2)] = STYLE_PERCENT
+        for offset in integer_rows:
+            cell_styles[(first_data_row + offset - 1, 2)] = STYLE_INTEGER
+        styled_value_rows = currency_rows | percent_rows | integer_rows
+        for offset in range(1, len(data_rows) + 1):
+            if offset not in styled_value_rows:
+                cell_styles[(first_data_row + offset - 1, 2)] = STYLE_CENTER
+
+    def add_migration_path_cards(
+        rows: list[list[Any]],
+        row_styles: dict[int, int],
+        cell_styles: dict[tuple[int, int], int],
+    ) -> None:
+        specs = migration_path_option_specs()
+
+        def add_card_row(values: list[Any], styles: list[int], *, height_style: int = STYLE_CENTER) -> int:
+            row_idx = add_row(rows, row_styles, values, style=height_style)
+            for col_idx, style in enumerate(styles, start=1):
+                cell_styles[(row_idx, col_idx)] = style
+            return row_idx
+
+        label_styles = [int(spec["label_style"]) for spec in specs]
+        title_styles = [int(spec["title_style"]) for spec in specs]
+        card_styles = [int(spec["card_style"]) for spec in specs]
+
+        add_card_row([spec["label"] for spec in specs], label_styles)
+        add_card_row([spec["title"] for spec in specs], title_styles)
+        add_card_row([spec["description"] for spec in specs], card_styles)
+        add_card_row(["Best suited for", "Best suited for", "Best suited for"], title_styles)
+        add_card_row([bullet_text(spec["best_suited_for"]) for spec in specs], card_styles)
+        add_card_row(["Benefits", "Benefits", "Benefits"], title_styles)
+        add_card_row([bullet_text(spec["benefits"]) for spec in specs], card_styles)
+        add_card_row(["Migration tool options", "Migration tool options", "Migration tool options"], title_styles)
+        add_card_row([bullet_text(spec["tools"]) for spec in specs], card_styles)
+        add_row(rows, row_styles, [])
+
+    def scenario_cost_rows() -> list[list[Any]]:
+        native_monthly = money(scenario_by_id("native").get("monthly_cost"))
+
+        def row_for(scenario_id: str, role: str) -> list[Any]:
+            scenario = scenario_by_id(scenario_id)
+            monthly = money(scenario.get("monthly_cost"))
+            return [
+                scenario.get("label", scenario_id),
+                monthly,
+                monthly * 12.0,
+                monthly * 36.0,
+                monthly / total_vm_count if total_vm_count else 0.0,
+                monthly - native_monthly,
+                role,
+            ]
+
+        return [
+            row_for("native", "Modernization baseline"),
+            row_for("ocvs", "VMware lift and shift"),
+            row_for("hybrid", "Balanced placement"),
+        ]
+
+    def migration_path_option_specs() -> list[dict[str, Any]]:
+        return [
+            {
+                "label": "Modernize and Optimize",
+                "title": "OCI Native",
+                "description": (
+                    "Migrate suitable VMware workloads to OCI Compute and Block Volume, reducing dependency on "
+                    "virtualization platforms while building a foundation for long-term cloud optimization and "
+                    "application modernization."
+                ),
+                "best_suited_for": [
+                    "Workloads fully supported on OCI.",
+                    "Organizations pursuing cloud transformation and platform modernization.",
+                    "Environments seeking to reduce VMware licensing and operational overhead.",
+                ],
+                "benefits": [
+                    "Maximum cloud adoption and modernization potential.",
+                    "Reduced infrastructure complexity.",
+                    "Access to OCI-native services, automation, and cost optimization.",
+                ],
+                "tools": [
+                    "OCI Cloud Migrations for discovery, replication, and migration planning.",
+                    "OCI Database Migration and Zero Downtime Migration for database workloads.",
+                    "Terraform and OCI Resource Manager for repeatable target deployment.",
+                ],
+                "card_style": STYLE_PATH_NATIVE,
+                "label_style": STYLE_PATH_NATIVE_LABEL,
+                "title_style": STYLE_PATH_NATIVE_TITLE,
+            },
+            {
+                "label": "Lift & Shift",
+                "title": "Oracle Cloud VMware Solution (OCVS)",
+                "description": (
+                    "Lift and shift VMware workloads to OCVS, moving them to OCI while reusing existing VMware "
+                    "investments, tools, skills, and operating processes with minimal business disruption."
+                ),
+                "best_suited_for": [
+                    "Business-critical applications requiring VMware compatibility.",
+                    "Complex dependencies, legacy operating systems, or VMware-specific tooling.",
+                    "Organizations prioritizing migration speed and operational continuity.",
+                ],
+                "benefits": [
+                    "Minimal application changes.",
+                    "Retain VMware skills, processes, and tooling.",
+                    "Reduced migration complexity and accelerated cloud adoption.",
+                ],
+                "tools": [
+                    "VMware HCX for large-scale migration and workload mobility.",
+                    "Existing VMware backup and replication tools for recovery-based migration.",
+                ],
+                "card_style": STYLE_PATH_OCVS,
+                "label_style": STYLE_PATH_OCVS_LABEL,
+                "title_style": STYLE_PATH_OCVS_TITLE,
+            },
+            {
+                "label": "Balance Modernization and Risk",
+                "title": "Hybrid",
+                "description": (
+                    "Adopt a phased strategy by moving OCI-compatible workloads to OCI Native while retaining complex, "
+                    "unsupported, or higher-risk workloads on OCVS to balance modernization with stability."
+                ),
+                "best_suited_for": [
+                    "Large and diverse application estates.",
+                    "Organizations seeking gradual VMware reduction.",
+                    "Customers requiring phased migration waves and dependency validation.",
+                ],
+                "benefits": [
+                    "Balanced risk and modernization approach.",
+                    "Incremental cloud transformation with reduced remediation effort.",
+                    "Flexibility to modernize workloads over time.",
+                ],
+                "tools": [
+                    "OCI Cloud Migrations for OCI Native candidates.",
+                    "VMware HCX for OCVS migration waves.",
+                ],
+                "card_style": STYLE_PATH_HYBRID,
+                "label_style": STYLE_PATH_HYBRID_LABEL,
+                "title_style": STYLE_PATH_HYBRID_TITLE,
+            },
+        ]
+
+    def bullet_text(items: list[str]) -> str:
+        return "\n".join(f"- {item}" for item in items)
+
+    def count_shape_distribution(rows_to_count: list[dict[str, Any]]) -> list[list[Any]]:
+        counts: dict[str, int] = {}
+        for row in rows_to_count:
+            shape = str(row.get("oci_shape", "") or "Unassigned")
+            counts[shape] = counts.get(shape, 0) + 1
+        return [[shape, count] for shape, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+
+    def os_family(row: dict[str, Any]) -> str:
+        os_value = str(row.get("os_name", "") or "").lower()
+        if "windows" in os_value:
+            return "Windows"
+        linux_terms = ("linux", "ubuntu", "red hat", "rhel", "oracle linux", "centos", "debian", "suse", "rocky", "alma")
+        if any(term in os_value for term in linux_terms):
+            return "Linux"
+        return "Other / Unknown"
+
+    def count_os_family(rows_to_count: list[dict[str, Any]], family: str) -> int:
+        return sum(1 for row in rows_to_count if os_family(row) == family)
+
+    def is_legacy_os(row: dict[str, Any]) -> bool:
+        os_value = str(row.get("os_name", "") or "").lower()
+        legacy_terms = (
+            "windows server 2003",
+            "windows server 2008",
+            "windows server 2012",
+            "windows xp",
+            "windows 7",
+            "centos 6",
+            "red hat enterprise linux 6",
+            "rhel 6",
+            "oracle linux 6",
+            "suse linux enterprise server 11",
+        )
+        return any(term in os_value for term in legacy_terms)
+
+    def placement_reason_rows() -> list[list[Any]]:
+        supported_count = sum(1 for row in hybrid_placement_rows if bool(row.get("hybrid_is_oci_supported")))
+        unsupported_count = sum(
+            1
+            for row in hybrid_placement_rows
+            if not bool(row.get("hybrid_is_oci_supported")) and bool(hybrid_placement_plan.get("support_source_available"))
+        )
+        legacy_count = sum(1 for row in hybrid_placement_rows if is_legacy_os(row))
+        manual_count = integer(hybrid_placement_plan.get("manual_override_count"))
+        return [
+            ["Supported OS", supported_count],
+            ["Unsupported OS", unsupported_count],
+            ["Legacy OS", legacy_count],
+            ["Manual Placement", manual_count],
+        ]
+
+    def percent(part: int, total: int) -> float:
+        return (float(part) / float(total)) if total else 0.0
+
+    total_vm_count = integer(workload_summary.get("vm_count"))
+    hybrid_native_count = integer(hybrid_placement_plan.get("native_count"))
+    hybrid_ocvs_priced_count = integer(hybrid_placement_plan.get("ocvs_priced_count"))
+    hybrid_review_count = integer(hybrid_placement_plan.get("review_count"))
+    native_compat_pct = percent(hybrid_native_count, total_vm_count)
+    ocvs_required_pct = percent(hybrid_ocvs_priced_count, total_vm_count)
+    best_cost_scenario = scenario_comparison.get("best", {})
+
+    if native_compat_pct >= 0.85 and str(best_cost_scenario.get("id")) == "native":
+        recommended_path = "OCI Native"
+        recommendation_reasons = [
+            "Lowest monthly OCI infrastructure cost",
+            "High OCI compatibility across the selected workload",
+            "Maximum modernization potential and reduced VMware dependency",
+        ]
+    elif ocvs_required_pct >= 0.60:
+        recommended_path = "OCVS"
+        recommendation_reasons = [
+            "Large portion of the estate requires VMware compatibility",
+            "Lowest migration complexity and minimal platform change",
+            "Useful when speed and operational continuity are primary drivers",
+        ]
+    elif hybrid_ocvs_priced_count > 0:
+        recommended_path = "Hybrid"
+        recommendation_reasons = [
+            f"{native_compat_pct:.0%} of workloads are placed on OCI Native",
+            f"{hybrid_ocvs_priced_count:,} workload(s) require OCVS placement",
+            "Balanced modernization, cost, and migration risk profile",
+        ]
+    else:
+        recommended_path = str(best_cost_scenario.get("label") or "OCI Native")
+        recommendation_reasons = [
+            "Lowest monthly OCI infrastructure cost",
+            "Current workload placement does not require an OCVS subset",
+            "Validate application dependencies before finalizing the path",
+        ]
+
+    recommendation_reason_text = "; ".join(recommendation_reasons)
+    scenario_costs = scenario_cost_rows()
+    monthly_values = [row[1] for row in scenario_costs]
+    lowest_monthly = min(monthly_values, default=0.0)
+    highest_monthly = max(monthly_values, default=0.0)
+
+    ocvs_selected = ocvs_price["selected"]
+    ocvs_totals = ocvs_price["totals"]
+    hybrid_selected = hybrid_ocvs_price["selected"]
+    hybrid_totals = hybrid_ocvs_price["totals"]
+    vmware_full = vmware_license_summary["ocvs"]
+    vmware_hybrid = vmware_license_summary["hybrid"]
+
+    # Executive Summary
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "Executive Summary")
+    add_section(rows, row_styles, "Assessment Context")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Customer", customer_name or "Not provided", ""],
+            ["Currency", pricing_currency or "USD", ""],
+            ["Selected VM Count", total_vm_count, ""],
+            ["Selected vCPU", integer(workload_summary.get("total_vcpus")), ""],
+            ["Selected RAM GB", integer(workload_summary.get("total_memory_gb")), ""],
+            ["Selected Storage GB", integer(workload_summary.get("total_storage_gb")), ""],
+            ["Generated At", generated_at, ""],
+        ],
+        integer_rows={3, 4, 5, 6},
+    )
+    add_section(rows, row_styles, "Migration Path Price Comparison")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Migration Path", "Monthly Cost", "Annual Cost", "3-Year Cost", "Cost / VM / Month", "Delta vs Native / Month", "Assessment Role"],
+        scenario_costs,
+        currency_cols={2, 3, 4, 5, 6},
+    )
+    add_section(rows, row_styles, "Decision Readout")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Lowest Cost Option", str(best_cost_scenario.get("label", "")), ""],
+            ["Lowest Monthly Cost", lowest_monthly, ""],
+            ["Cost Difference Between Options", highest_monthly - lowest_monthly, "Monthly gap between lowest and highest modeled path."],
+            ["Recommended Migration Path", recommended_path, ""],
+            ["Reason", recommendation_reason_text, ""],
+        ],
+        currency_rows={2, 3},
+    )
+    add_note(
+        rows,
+        row_styles,
+        "Recommendation is indicative and should be validated with application dependencies, migration waves, commercial terms, and the official Oracle pricing tools before customer sign-off.",
+    )
+    add_section(rows, row_styles, "Migration Path Options")
+    add_note(
+        rows,
+        row_styles,
+        "Use these migration path options as the executive discussion guide. Open each path in the application to tune sizing and assumptions before relying on the final price comparison.",
+    )
+    add_migration_path_cards(rows, row_styles, cell_styles)
+
+    add_section(rows, row_styles, "Report Scope")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Included", "Excluded from This Report"],
+        [
+            ["Estimated OCI infrastructure and licensing run-rate by migration path", "Professional services, project labor, training, downtime, application remediation"],
+            ["Monthly, annual, and 3-year price exposure based on active assumptions", "Support uplift, contractual discounts outside the entered assumptions, and commercial quote adjustments"],
+            ["Workload placement decisions and technical implications", "Backup retention, DR architecture, operational staffing, and full business case calculations"],
+            ["Recommended migration approach based on cost and placement fit", "Final commercial quotation or binding OCI Cost Estimator import"],
+        ],
+    )
+    executive_sheet = {
+        "name": "Executive Summary",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [52, 52, 52, 28, 28, 30, 34],
+        "freeze_row": 1,
+    }
+
+    # Price Comparison
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "Price Comparison")
+    add_section(rows, row_styles, "Price Signal")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Lowest Cost Path", str(best_cost_scenario.get("label", "")), ""],
+            ["Lowest Monthly Cost", lowest_monthly, ""],
+            ["Monthly Spread", highest_monthly - lowest_monthly, "Gap between lowest and highest modeled path."],
+            ["3-Year Spread", (highest_monthly - lowest_monthly) * 36.0, "Straight 36-month infrastructure and licensing exposure gap."],
+            ["Recommended Path", recommended_path, recommendation_reason_text],
+        ],
+        currency_rows={2, 3, 4},
+    )
+    ranked_rows = []
+    for rank, row in enumerate(sorted(scenario_costs, key=lambda item: float(item[1] or 0.0)), start=1):
+        scenario = scenario_by_id(str(row[0]).lower().replace("oci native", "native"))
+        if not scenario:
+            scenario = next((item for item in scenario_comparison.get("rows", []) if item.get("label") == row[0]), {})
+        ranked_rows.append(
+            [
+                rank,
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                scenario.get("sizing_basis", ""),
+            ]
+        )
+    add_section(rows, row_styles, "Ranked Migration Path Price Comparison")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Rank", "Migration Path", "Monthly Cost", "Annual Cost", "3-Year Cost", "Cost / VM / Month", "Delta vs Native / Month", "Sizing Basis"],
+        ranked_rows,
+        integer_cols={1},
+        currency_cols={3, 4, 5, 6, 7},
+    )
+    add_section(rows, row_styles, "Interpretation")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Question", "What to Check"],
+        [
+            ["Is the lowest-cost path also the right migration path?", "Validate application dependencies, operational readiness, migration waves, and VMware feature dependency."],
+            ["Why does a path cost more?", "Review compute shape assumptions, OCVS node count, datastore sizing, Windows licensing, and VCF price per core."],
+            ["Can this be used as a quote?", "No. Use this as an assessment report, then validate final pricing with Oracle commercial tools."],
+        ],
+    )
+    price_comparison_sheet = {
+        "name": "Price Comparison",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [34, 38, 30, 30, 30, 28, 30, 118],
+        "freeze_row": 1,
+    }
+
+    # OCI Native Analysis
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "OCI Native Analysis")
+    add_section(rows, row_styles, "Path Readout")
+    native_scenario = scenario_by_id("native")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Monthly Cost", money(native_scenario.get("monthly_cost")), ""],
+            ["Annual Cost", money(native_scenario.get("monthly_cost")) * 12.0, ""],
+            ["3-Year Cost", money(native_scenario.get("monthly_cost")) * 36.0, "Straight 36-month price exposure."],
+            ["Assessment Role", "Modernization baseline", ""],
+        ],
+        currency_rows={1, 2, 3},
+    )
+    add_note(
+        rows,
+        row_styles,
+        "OCI Native sizing is indicative. Validate final shape, OS, licensing, storage, and performance assumptions with the official OCI pricing and architecture tools.",
+    )
+    add_section(rows, row_styles, "Resource Summary")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["VM Count", integer(overall["vm_count"]), ""],
+            ["vCPU Count", integer(overall["total_cpus"]), ""],
+            ["Memory GB", integer(overall["total_memory_gb"]), ""],
+            ["Storage GB", integer(overall["total_provisioned_gb"]), ""],
+        ],
+        integer_rows={1, 2, 3, 4},
+    )
+    add_section(rows, row_styles, "Shape Distribution")
+    add_table(rows, row_styles, cell_styles, ["Shape", "VM Count"], count_shape_distribution(vm_rows), integer_cols={2})
+    add_section(rows, row_styles, "Operating System Analysis")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Metric", "Count"],
+        [
+            ["Windows", count_os_family(vm_rows, "Windows")],
+            ["Linux", count_os_family(vm_rows, "Linux")],
+            ["Other / Unknown", count_os_family(vm_rows, "Other / Unknown")],
+            ["OCI Supported", integer(workload_summary["oci_supported_count"])],
+            ["OCI Unsupported", integer(workload_summary["oci_not_supported_count"])],
+        ],
+        integer_cols={2},
+    )
+    add_section(rows, row_styles, "Cost Breakdown")
+    native_total = money(overall["total_monthly_cost"])
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Component", "Monthly Cost", "Annual Cost", "3-Year Cost", "Share of Monthly", "Notes"],
+        [
+            [
+                "Compute + RAM",
+                money(overall["total_cpu_ram_monthly_cost"]),
+                money(overall["total_cpu_ram_monthly_cost"]) * 12.0,
+                money(overall["total_cpu_ram_monthly_cost"]) * 36.0,
+                percent(money(overall["total_cpu_ram_monthly_cost"]), native_total),
+                "Flexible compute shape assumptions from Migration Paths.",
+            ],
+            [
+                "Block Volume",
+                money(overall["total_storage_monthly_cost"]),
+                money(overall["total_storage_monthly_cost"]) * 12.0,
+                money(overall["total_storage_monthly_cost"]) * 36.0,
+                percent(money(overall["total_storage_monthly_cost"]), native_total),
+                f"{integer(overall.get('total_vpus')):,} total VPUs modeled.",
+            ],
+            [
+                "Windows Licensing",
+                money(overall["total_os_license_monthly_cost"]),
+                money(overall["total_os_license_monthly_cost"]) * 12.0,
+                money(overall["total_os_license_monthly_cost"]) * 36.0,
+                percent(money(overall["total_os_license_monthly_cost"]), native_total),
+                f"{integer(overall.get('total_license_included_vms')):,} license-included Windows VM(s).",
+            ],
+            ["Total", native_total, native_total * 12.0, native_total * 36.0, 1.0 if native_total else 0.0, ""],
+        ],
+        currency_cols={2, 3, 4},
+        percent_cols={5},
+    )
+    native_sheet = {
+        "name": "OCI Native Analysis",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [34, 26, 26, 26, 22, 96],
+        "freeze_row": 1,
+    }
+
+    # OCVS Analysis
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "OCVS Analysis")
+    add_section(rows, row_styles, "Path Readout")
+    ocvs_scenario = scenario_by_id("ocvs")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Monthly Cost", money(ocvs_scenario.get("monthly_cost")), ""],
+            ["Annual Cost", money(ocvs_scenario.get("monthly_cost")) * 12.0, ""],
+            ["3-Year Cost", money(ocvs_scenario.get("monthly_cost")) * 36.0, "Straight 36-month price exposure."],
+            ["Assessment Role", "VMware lift and shift", ""],
+        ],
+        currency_rows={1, 2, 3},
+    )
+    add_note(
+        rows,
+        row_styles,
+        "OCVS sizing is indicative. Validate node count, cluster design, storage policy, VMware licensing, and final commercial pricing with Oracle and VMware/Broadcom guidance.",
+    )
+    add_section(rows, row_styles, "Workload Capacity Requirements")
+    dense_usable_capacity = (
+        integer(ocvs_selected.get("host_count")) * integer(ocvs_selected.get("usable_storage_gb_per_host"))
+        if str(ocvs_selected.get("host_type", "")).lower() == "dense"
+        else 0
+    )
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["VM Count", total_vm_count, ""],
+            ["vCPU Requirement", integer(ocvs_totals.get("vcpus")), "Inventory vCPU"],
+            ["RAM Requirement GB", integer(ocvs_totals.get("memory_gb")), ""],
+            ["Storage Requirement GB", integer(ocvs_totals.get("storage_gb")), ""],
+            [
+                "Dense Usable Capacity GB",
+                dense_usable_capacity if dense_usable_capacity else "Not applicable",
+                "Shown only for dense shapes with local vSAN capacity.",
+            ],
+        ],
+        integer_rows={1, 2, 3, 4},
+    )
+    add_section(rows, row_styles, "OCVS Sizing Decision")
+    selected_shape_reason = (
+        f"{ocvs_selected.get('shape')} is selected by the active profile. "
+        f"The capacity driver is {str(ocvs_selected.get('constraint', 'cost')).lower()}."
+    )
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Selected Shape", ocvs_selected.get("shape", ""), ocvs_selected.get("label", "")],
+            ["Host Type", ocvs_selected.get("host_type", ""), ""],
+            ["Required Nodes Before Spare", integer(ocvs_selected.get("base_host_count")), ""],
+            ["Spare Nodes", integer(ocvs_selected.get("dr_node_count")), ""],
+            ["Total Nodes Including Spare", integer(ocvs_selected.get("host_count")), selected_shape_reason],
+            ["Cluster Planning Note", "Multi-cluster planning required" if ocvs_selected.get("cluster_split_required") else "Single cluster", ""],
+            ["OCPUs / Node", integer(ocvs_selected.get("ocpus_per_host")), ""],
+            ["RAM GB / Node", integer(ocvs_selected.get("memory_gb_per_host")), ""],
+        ],
+        integer_rows={3, 4, 5, 7, 8},
+    )
+    add_section(rows, row_styles, "Capacity Drivers")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Driver", "Inventory Requirement", "Required Nodes", "Utilization", "Notes"],
+        [
+            [
+                "CPU",
+                f"{integer(ocvs_totals.get('vcpus')):,} vCPU",
+                integer(ocvs_selected.get("hosts_by_cpu")),
+                float(ocvs_selected.get("cpu_utilization_pct", 0.0) or 0.0) / 100.0,
+                f"{float(ocvs_policy.get('vcpu_per_ocpu', 0.0) or 0.0):.1f}:1 vCPU/OCPU, {float(ocvs_policy.get('cpu_headroom_pct', 0.0) or 0.0):.0f}% CPU headroom.",
+            ],
+            [
+                "RAM",
+                f"{integer(ocvs_totals.get('memory_gb')):,} GB",
+                integer(ocvs_selected.get("hosts_by_memory")),
+                float(ocvs_selected.get("memory_utilization_pct", 0.0) or 0.0) / 100.0,
+                f"{float(ocvs_policy.get('memory_headroom_pct', 0.0) or 0.0):.0f}% RAM headroom.",
+            ],
+            [
+                "Storage",
+                f"{integer(ocvs_totals.get('storage_gb')):,} GB",
+                "Block Volume" if str(ocvs_selected.get("host_type", "")).lower() == "standard" else integer(ocvs_selected.get("hosts_by_storage")),
+                float(ocvs_selected.get("storage_utilization_pct", 0.0) or 0.0) / 100.0,
+                "Standard shapes use Block Volume datastore; dense shapes use local vSAN usable capacity.",
+            ],
+        ],
+        percent_cols={4},
+    )
+    add_section(rows, row_styles, "Cost Breakdown")
+    ocvs_total = money(ocvs_scenario.get("monthly_cost"))
+    ocvs_host_total = integer(ocvs_selected.get("host_count")) * money(ocvs_selected.get("host_monthly_cost"))
+    ocvs_storage_total = money(ocvs_selected.get("storage_monthly_cost"))
+    ocvs_vcf_total = money(vmware_full.get("monthly_cost"))
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Component", "Monthly Cost", "Annual Cost", "3-Year Cost", "Share of Monthly", "Notes"],
+        [
+            ["BM.Compute", ocvs_host_total, ocvs_host_total * 12.0, ocvs_host_total * 36.0, percent(ocvs_host_total, ocvs_total), f"{integer(ocvs_selected.get('host_count')):,} x {ocvs_selected.get('shape')}"],
+            ["Datastore", ocvs_storage_total, ocvs_storage_total * 12.0, ocvs_storage_total * 36.0, percent(ocvs_storage_total, ocvs_total), "Block Volume datastore for Standard shapes; included in dense local vSAN model when zero."],
+            ["VCF License", ocvs_vcf_total, ocvs_vcf_total * 12.0, ocvs_vcf_total * 36.0, percent(ocvs_vcf_total, ocvs_total), "User-entered VMware/Broadcom list price per physical core/year."],
+            ["Total", ocvs_total, ocvs_total * 12.0, ocvs_total * 36.0, 1.0 if ocvs_total else 0.0, ""],
+        ],
+        currency_cols={2, 3, 4},
+        percent_cols={5},
+    )
+    ocvs_sheet = {
+        "name": "OCVS Analysis",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [34, 26, 26, 26, 22, 104],
+        "freeze_row": 1,
+    }
+
+    # Hybrid Analysis
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "Hybrid Analysis")
+    add_section(rows, row_styles, "Path Readout")
+    hybrid_scenario = scenario_by_id("hybrid")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Monthly Cost", money(hybrid_scenario.get("monthly_cost")), ""],
+            ["Annual Cost", money(hybrid_scenario.get("monthly_cost")) * 12.0, ""],
+            ["3-Year Cost", money(hybrid_scenario.get("monthly_cost")) * 36.0, "Straight 36-month price exposure."],
+            ["Assessment Role", "Balanced placement", ""],
+        ],
+        currency_rows={1, 2, 3},
+    )
+    add_note(
+        rows,
+        row_styles,
+        "Hybrid placement is indicative. Keep dependency groups together, validate manual placement decisions, and confirm both OCI Native and OCVS sizing in the official pricing tools.",
+    )
+    add_section(rows, row_styles, "Placement Summary")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Target", "VM Count", "Share", "Meaning"],
+        [
+            ["OCI Native", hybrid_native_count, percent(hybrid_native_count, total_vm_count), "Workloads priced on OCI Compute and Block Volume."],
+            ["OCVS", integer(hybrid_placement_plan.get("ocvs_count")), percent(integer(hybrid_placement_plan.get("ocvs_count")), total_vm_count), "Workloads priced on Oracle Cloud VMware Solution."],
+        ],
+        integer_cols={2},
+        percent_cols={3},
+    )
+    add_section(rows, row_styles, "Placement Reasoning")
+    add_table(rows, row_styles, cell_styles, ["Reason", "VM Count"], placement_reason_rows(), integer_cols={2})
+    add_section(rows, row_styles, "Cost Breakdown")
+    hybrid_total = money(hybrid_scenario.get("monthly_cost"))
+    hybrid_native_total = money(supported_native_summary["total_monthly_cost"])
+    hybrid_ocvs_total = money(hybrid_selected.get("total_monthly_cost")) + money(vmware_hybrid.get("monthly_cost"))
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Component", "Monthly Cost", "Annual Cost", "3-Year Cost", "Share of Monthly", "Notes"],
+        [
+            ["OCI Native Portion", hybrid_native_total, hybrid_native_total * 12.0, hybrid_native_total * 36.0, percent(hybrid_native_total, hybrid_total), f"{hybrid_native_count:,} VM(s) placed on OCI Native."],
+            ["OCVS Portion", hybrid_ocvs_total, hybrid_ocvs_total * 12.0, hybrid_ocvs_total * 36.0, percent(hybrid_ocvs_total, hybrid_total), f"{hybrid_ocvs_priced_count:,} VM(s) placed on OCVS."],
+            ["Total", hybrid_total, hybrid_total * 12.0, hybrid_total * 36.0, 1.0 if hybrid_total else 0.0, ""],
+        ],
+        currency_cols={2, 3, 4},
+        percent_cols={5},
+    )
+    add_section(rows, row_styles, "OCI Native Portion")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Native VM Count", hybrid_native_count, ""],
+            ["Native vCPU", integer(supported_native_summary.get("total_cpus")), ""],
+            ["Native RAM GB", integer(supported_native_summary.get("total_memory_gb")), ""],
+            ["Native Storage GB", integer(supported_native_summary.get("total_provisioned_gb")), ""],
+            ["Native Monthly Cost", hybrid_native_total, ""],
+        ],
+        integer_rows={1, 2, 3, 4},
+        currency_rows={5},
+    )
+    add_section(rows, row_styles, "OCVS Portion")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["OCVS VM Count", integer(hybrid_ocvs_priced_count), ""],
+            ["OCVS vCPU", integer(hybrid_totals.get("vcpus")), ""],
+            ["OCVS RAM GB", integer(hybrid_totals.get("memory_gb")), ""],
+            ["OCVS Storage GB", integer(hybrid_totals.get("storage_gb")), ""],
+            ["Selected OCVS Shape", hybrid_selected.get("shape", ""), hybrid_selected.get("label", "")],
+            ["Required Nodes Before Spare", integer(hybrid_selected.get("base_host_count")), ""],
+            ["Spare Nodes", integer(hybrid_selected.get("dr_node_count")), ""],
+            ["Total Nodes Including Spare", integer(hybrid_selected.get("host_count")), ""],
+            ["Sizing Driver", str(hybrid_selected.get("constraint", "")).capitalize(), ""],
+            ["Cluster Planning Note", "Multi-cluster planning required" if hybrid_selected.get("cluster_split_required") else "Single cluster", ""],
+        ],
+        integer_rows={1, 2, 3, 4, 6, 7, 8},
+    )
+    hybrid_sheet = {
+        "name": "Hybrid Analysis",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [34, 26, 26, 26, 22, 104],
+        "freeze_row": 1,
+    }
+
+    # Hybrid Placement Detail
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "Hybrid Placement Detail")
+    add_note(
+        rows,
+        row_styles,
+        "Hybrid migration path VM-level view for architecture review. Use this sheet to validate OS support, manual Hybrid placement, and Native sizing assumptions before customer sign-off.",
+    )
+    support_source_available = bool(hybrid_placement_plan.get("support_source_available"))
+    placement_detail_rows: list[list[Any]] = []
+    for row in sorted(hybrid_placement_rows or vm_rows, key=lambda item: str(item.get("vm_name", "")).lower()):
+        if support_source_available:
+            oci_supported = "Yes" if bool(row.get("hybrid_is_oci_supported")) else "No"
+        else:
+            oci_supported = "Unknown"
+        placement_detail_rows.append(
+            [
+                row.get("vm_name", ""),
+                row.get("os_name", ""),
+                row.get("power_state", ""),
+                integer(row.get("cpus")),
+                integer(row.get("memory_gb")),
+                integer(row.get("provisioned_gb")),
+                oci_supported,
+                row.get("hybrid_recommended_label", ""),
+                row.get("hybrid_placement_label", ""),
+                "Yes" if row.get("hybrid_manual_override") else "",
+                row.get("oci_shape", ""),
+                integer(row.get("ocpu")),
+                integer(row.get("vpu")),
+                vm_monthly(row),
+                row.get("hybrid_reason", ""),
+            ]
+        )
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            "VM Name",
+            "OS",
+            "Power State",
+            "vCPU",
+            "RAM GB",
+            "Storage GB",
+            "OCI Supported",
+            "Recommended Target",
+            "Hybrid Target",
+            "Manual Override",
+            "OCI Shape",
+            "OCPUs",
+            "VPU",
+            "Native Monthly Cost",
+            "Placement Reason",
+        ],
+        placement_detail_rows,
+        integer_cols={4, 5, 6, 12, 13},
+        currency_cols={14},
+    )
+    placement_sheet = {
+        "name": "Hybrid Placement",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [32, 56, 18, 12, 14, 16, 18, 24, 20, 20, 26, 12, 12, 22, 82],
+        "freeze_row": 4,
+    }
+
+    # Selected VMs
+    vm_cost_headers = [
+        "VM Name",
+        "OS (Full version)",
+        "OS License",
+        "CPUs",
+        "OCPU",
+        "Burst",
+        "Memory (MB)",
+        "Storage (GB)",
+        "VPU",
+        "OCI Target Shape",
+        "CPU Monthly Cost",
+        "RAM Monthly Cost",
+        "CPU/RAM Monthly Cost",
+        "Storage Capacity Monthly Cost",
+        "VPU Monthly Cost",
+        "Storage Monthly Cost",
+        "OS License Monthly Cost",
+        "Total Monthly Cost",
+    ]
+    rows, row_styles, cell_styles = new_sheet()
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        vm_cost_headers,
+        vm_costing_detail_rows(vm_rows),
+        integer_cols={4, 5, 7, 8, 9},
+        currency_cols={11, 12, 13, 14, 15, 16, 17, 18},
+    )
+    selected_vms_sheet = {
+        "name": "Selected VMs",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [32, 56, 18, 12, 12, 12, 16, 16, 12, 24, 20, 20, 24, 28, 20, 24, 26, 24],
+        "freeze_row": 1,
+    }
+
+    # Non-Selected VMs
+    rows, row_styles, cell_styles = new_sheet()
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        vm_cost_headers,
+        vm_costing_detail_rows(non_selected_vm_rows),
+        integer_cols={4, 5, 7, 8, 9},
+        currency_cols={11, 12, 13, 14, 15, 16, 17, 18},
+    )
+    non_selected_vms_sheet = {
+        "name": "Non-Selected VMs",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [32, 56, 18, 12, 12, 12, 16, 16, 12, 24, 20, 20, 24, 28, 20, 24, 26, 24],
+        "freeze_row": 1,
+    }
+
+    # Price List
+    rows, row_styles, cell_styles = new_sheet()
+    first_price_row = add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["OCI Target Shape", "OCPU Unit Price", "Memory Unit Price", "Currency", "Parameter", "Value", "Currency"],
+        price_list_rows(),
+    )
+    for offset, price_row in enumerate(price_list_rows(), start=0):
+        parameter = str(price_row[4] if len(price_row) > 4 else "")
+        row_idx = first_price_row + offset
+        if str(price_row[0] if len(price_row) > 0 else ""):
+            cell_styles[(row_idx, 2)] = STYLE_UNIT_PRICE
+            cell_styles[(row_idx, 3)] = STYLE_UNIT_PRICE
+        if parameter in {
+            "Block Storage Unit Price",
+            "Block Performance Unit Price",
+            "Windows OS Unit Price",
+        }:
+            cell_styles[(row_idx, 6)] = STYLE_UNIT_PRICE
+        elif parameter in {
+            "VCF List Price / Core / Year",
+        }:
+            cell_styles[(row_idx, 6)] = STYLE_CURRENCY
+        elif parameter == "IaaS Discount %":
+            cell_styles[(row_idx, 6)] = STYLE_PERCENT
+    price_list_sheet = {
+        "name": "Price List",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [26, 22, 22, 14, 44, 22, 14],
+        "freeze_row": 1,
+    }
+
+    # Technical Details
+    rows, row_styles, cell_styles = new_sheet()
+    add_title(rows, row_styles, "Technical Details")
+    add_section(rows, row_styles, "Export Metadata")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["Customer", customer_name or "Not provided", ""],
+            ["Generated at", generated_at, ""],
+            ["Export file", export_path_display, ""],
+            ["Currency", pricing_currency or "USD", ""],
+            ["Source price list", source_pricelist_file or "No price list loaded", ""],
+            ["VM inventory source", source_vinfo_csv or "No VM inventory source loaded", ""],
+            ["Last saved settings", step4_last_updated_at or "Not saved", ""],
+        ],
+    )
+    add_section(rows, row_styles, "Pricing Assumptions")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["IaaS discount", float(iaas_discount_pct) / 100.0, "Applied to OCI compute/storage run-rate where modeled."],
+            ["Block Volume capacity unit price", money(block_storage_unit_price), pricing_currency or "USD"],
+            ["Block Volume performance unit price", money(block_perf_unit_price), pricing_currency or "USD"],
+            ["Windows OS unit price", money(windows_os_unit_price), pricing_currency or "USD"],
+            ["VCF list price / core / year", money(vmware_license_price_per_core_yearly), pricing_currency or "USD"],
+        ],
+        percent_rows={1},
+        currency_rows={2, 3, 4, 5},
+    )
+    add_section(rows, row_styles, "OCVS Profile Assumptions")
+    add_key_values(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            ["OCVS profile", "Lowest cost" if ocvs_profile_choice == "best_fit" else ocvs_profile_choice, ""],
+            ["vCPU per OCPU", float(ocvs_policy["vcpu_per_ocpu"]), ""],
+            ["CPU headroom", float(ocvs_policy["cpu_headroom_pct"]) / 100.0, ""],
+            ["RAM headroom", float(ocvs_policy["memory_headroom_pct"]) / 100.0, ""],
+            ["Storage headroom", float(ocvs_policy["storage_headroom_pct"]) / 100.0, ""],
+            ["Dense vSAN usable", float(ocvs_policy["dense_vsan_usable_pct"]) / 100.0, ""],
+            ["Standard datastore VPU", integer(ocvs_policy["standard_storage_vpu"]), "VPU/GB"],
+            ["Spare nodes", integer(ocvs_dr_nodes), ""],
+        ],
+        percent_rows={3, 4, 5, 6},
+        integer_rows={7, 8},
+    )
+    add_section(rows, row_styles, "Shape Mapping and Pricing")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        [
+            "Shape",
+            "Label",
+            "Type",
+            "OCPUs / Host",
+            "RAM GB / Host",
+            "Max Hosts",
+            "Selected Full OCVS",
+            "Selected Hybrid OCVS",
+            "Host Monthly",
+            "Datastore Monthly",
+            "VCF Monthly",
+            "Total Monthly",
+        ],
+        [
+            [
+                row.get("shape", ""),
+                row.get("label", ""),
+                row.get("host_type", ""),
+                integer(row.get("ocpus_per_host")),
+                integer(row.get("memory_gb_per_host")),
+                integer(row.get("max_hosts")),
+                "Yes" if row.get("is_selected") else "",
+                "Yes" if row.get("shape") == hybrid_selected.get("shape") else "",
+                money(row.get("host_total_monthly_cost")),
+                money(row.get("storage_monthly_cost")),
+                money(row.get("vmware_license_monthly_cost")),
+                money(row.get("selection_monthly_cost")),
+            ]
+            for row in ocvs_shape_comparison.get("rows", [])
+        ],
+        integer_cols={4, 5, 6},
+        currency_cols={9, 10, 11, 12},
+    )
+    add_section(rows, row_styles, "Placement Rules")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Rule", "Treatment"],
+        [
+            ["OCI-supported OS", "Recommended for OCI Native placement."],
+            ["Unsupported OS", "Recommended for OCVS placement."],
+            ["Manual placement", "Overrides the recommendation and is preserved in the Hybrid planner."],
+        ],
+    )
+    add_section(rows, row_styles, "Sizing Summary Notes")
+    sizing_note_rows = (
+        [[note["title"], note["detail"]] for note in fit_warnings]
+        if fit_warnings
+        else [["Sizing summary", "No sizing notes were generated for the current assumptions."]]
+    )
+    add_table(rows, row_styles, cell_styles, ["Topic", "Detail"], sizing_note_rows)
+    technical_sheet = {
+        "name": "Technical Details",
+        "rows": rows,
+        "row_styles": row_styles,
+        "cell_styles": cell_styles,
+        "column_widths": [38, 38, 30, 18, 18, 16, 20, 22, 20, 20, 20, 20],
+        "freeze_row": 1,
+    }
+
+    sheets = [
+        executive_sheet,
+        price_comparison_sheet,
+        native_sheet,
+        ocvs_sheet,
+        hybrid_sheet,
+        placement_sheet,
+        selected_vms_sheet,
+        non_selected_vms_sheet,
+        price_list_sheet,
+        technical_sheet,
+    ]
+    return _build_xlsx_workbook_bytes(
+        sheets,
+        currency_fmt_code=_xlsx_currency_format_code(pricing_currency),
+    )
+
+
 @app.route("/", methods=["GET", "POST"])
 def index() -> str:
     _cleanup_legacy_session_keys()
@@ -671,17 +4739,29 @@ def index() -> str:
     download_info: dict[str, Any] | None = None
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
     rvtools_file_info: dict[str, Any] | None = session.get("rvtools_file_info")
-    selected_currency = "USD"
+    rvtools_import_summary: dict[str, Any] | None = session.get("rvtools_import_summary")
+    rvtools_rejected_info: dict[str, Any] | None = session.get("rvtools_rejected_info")
+    selected_currency = str(session.get("selected_currency", "")).upper().strip()
     rvtools_files = list_rvtools_export_files()
     downloaded_price_lists = list_downloaded_price_lists()
     selected_pricelist_file = str(session.get("selected_pricelist_file", "")).strip().replace("\\", "/")
+    customer_name = normalize_customer_name(session.get("customer_name", ""))
+
+    if not selected_pricelist_file:
+        preferences = load_preferences()
+        last_price_file = str(preferences.get("last_selected_pricelist_file", "")).strip().replace("\\", "/")
+        if last_price_file and last_price_file in downloaded_price_lists:
+            selected_pricelist_file = last_price_file
+            session["selected_pricelist_file"] = selected_pricelist_file
+            selected_currency = str(preferences.get("last_selected_currency", selected_currency)).upper().strip()
+            if selected_currency:
+                session["selected_currency"] = selected_currency
 
     if selected_pricelist_file and selected_pricelist_file not in downloaded_price_lists:
         selected_pricelist_file = ""
         session.pop("selected_pricelist_file", None)
-    if not selected_pricelist_file and downloaded_price_lists:
-        selected_pricelist_file = downloaded_price_lists[0]
-        session["selected_pricelist_file"] = selected_pricelist_file
+
+    price_list_options = downloaded_price_lists[:MAX_VISIBLE_PRICE_LISTS]
 
     selected_pricelist_info: dict[str, Any] | None = None
     if selected_pricelist_file:
@@ -694,31 +4774,112 @@ def index() -> str:
             }
 
     if request.method == "POST":
-        action = request.form.get("action", "download_pricing")
+        action = request.form.get("action", "")
 
-        if action == "download_pricing":
+        def clear_selected_inventory() -> None:
+            nonlocal selected_rvtools_file, rvtools_file_info, rvtools_import_summary
+            selected_rvtools_file = ""
+            rvtools_file_info = None
+            rvtools_import_summary = None
+            session.pop("selected_rvtools_file", None)
+            session.pop("rvtools_file_info", None)
+            session.pop("rvtools_import_summary", None)
+            save_app_state(_default_app_state())
+            clear_step4_snapshot()
+
+        def clear_rejected_inventory() -> None:
+            nonlocal rvtools_rejected_info
+            rvtools_rejected_info = None
+            session.pop("rvtools_rejected_info", None)
+
+        def persist_rejected_inventory(file_info: dict[str, Any], reason: str) -> None:
+            nonlocal rvtools_rejected_info
+            clear_selected_inventory()
+            rvtools_rejected_info = build_rejected_inventory_info(file_info, reason)
+            session["rvtools_rejected_info"] = rvtools_rejected_info
+            flash(f"Input not accepted for sizing: {rvtools_rejected_info['category']}. Review details below.", "rvtools_error")
+
+        def validate_and_select_inventory(path_text: str, file_info: dict[str, Any], success_message: str) -> None:
+            nonlocal selected_rvtools_file, rvtools_file_info, rvtools_import_summary
+            try:
+                vm_rows, source = load_vms_from_vinfo(path_text)
+            except Exception as exc:
+                persist_rejected_inventory(file_info, str(exc))
+                return
+
+            clear_rejected_inventory()
+            rvtools_import_summary = build_inventory_import_summary(vm_rows, source)
+            selected_rvtools_file = path_text
+            rvtools_file_info = file_info
+            session["selected_rvtools_file"] = selected_rvtools_file
+            session["rvtools_file_info"] = rvtools_file_info
+            session["rvtools_import_summary"] = rvtools_import_summary
+            save_app_state(_default_app_state())
+            clear_step4_snapshot()
+            flash(success_message, "rvtools_success")
+
+        if action == "save_customer_name":
+            customer_name = normalize_customer_name(request.form.get("customer_name", ""))
+            if customer_name:
+                session["customer_name"] = customer_name
+                flash("Customer name saved.", "customer_success")
+            else:
+                session.pop("customer_name", None)
+                flash("Customer name cleared.", "customer_success")
+
+        elif action == "download_pricing":
             selected_currency = request.form.get("currency_code", "USD").upper().strip()
 
             if selected_currency not in SUPPORTED_CURRENCIES:
-                flash("Please select a supported currency.", "error")
+                flash("Please select a supported currency.", "pricing_error")
                 return render_template(
                     "index.html",
                     currencies=SUPPORTED_CURRENCIES,
                     selected_currency=selected_currency,
                     download_info=download_info,
                     downloaded_price_lists=downloaded_price_lists,
+                    price_list_options=price_list_options,
                     selected_pricelist_file=selected_pricelist_file,
                     selected_pricelist_info=selected_pricelist_info,
                     rvtools_files=rvtools_files,
                     selected_rvtools_file=selected_rvtools_file,
                     rvtools_file_info=rvtools_file_info,
+                    rvtools_import_summary=rvtools_import_summary,
+                    rvtools_rejected_info=rvtools_rejected_info,
+                    customer_name=customer_name,
                 )
 
-            try:
-                payload = fetch_oci_price_list(selected_currency)
+            def use_local_price_list_fallback(reason: str) -> bool:
+                nonlocal selected_pricelist_file, selected_pricelist_info
+                fallback_file = find_downloaded_price_list_for_currency(selected_currency)
+                if not fallback_file:
+                    return False
+
+                price_lookup_preview, fallback_currency, source_file = load_price_lookup(fallback_file)
+                if not source_file:
+                    return False
+
+                selected_pricelist_file = source_file
+                session["selected_pricelist_file"] = source_file
+                remember_price_list_selection(source_file, fallback_currency or selected_currency)
+                selected_pricelist_info = {
+                    "file_path": source_file,
+                    "currency": fallback_currency or selected_currency,
+                    "item_count": len(price_lookup_preview),
+                }
+                flash(
+                    f"Live {selected_currency} price-list download did not complete ({reason}). "
+                    f"Using existing local {selected_currency} price list: {source_file}.",
+                    "pricing_info",
+                )
+                return True
+
+            def persist_downloaded_price_list(payload: dict[str, Any], message: str, category: str) -> None:
+                nonlocal download_info, selected_pricelist_file, selected_pricelist_info
                 payload = filter_compute_vm_items(payload)
                 saved_file = save_price_list(selected_currency, payload)
                 item_count = len(payload.get("items", []))
+                selected_pricelist_file = str(saved_file).replace("\\", "/")
 
                 download_info = {
                     "currency": selected_currency,
@@ -726,29 +4887,52 @@ def index() -> str:
                     "last_updated": payload.get("lastUpdated", "Unknown"),
                     "item_count": item_count,
                 }
-                session["selected_pricelist_file"] = str(saved_file).replace("\\", "/")
-                flash("OCI price list downloaded successfully.", "success")
+                selected_pricelist_info = {
+                    "file_path": selected_pricelist_file,
+                    "currency": selected_currency,
+                    "item_count": item_count,
+                }
+                session["selected_pricelist_file"] = selected_pricelist_file
+                remember_price_list_selection(selected_pricelist_file, selected_currency)
+                flash(message, category)
+
+            try:
+                session["selected_currency"] = selected_currency
+                payload = fetch_oci_price_list(selected_currency)
+                persist_downloaded_price_list(payload, "OCI price list downloaded successfully.", "pricing_success")
             except HTTPError as exc:
-                flash(
-                    f"Oracle API returned an HTTP error ({exc.code}). Please try again.",
-                    "error",
-                )
+                if not use_local_price_list_fallback(f"HTTP {exc.code}"):
+                    flash(
+                        f"Oracle API returned an HTTP error ({exc.code}). No local {selected_currency} price list was found.",
+                        "pricing_error",
+                    )
             except URLError as exc:
                 reason = getattr(exc, "reason", None)
                 detail = f" ({reason})" if reason else ""
                 guidance = ""
                 if reason and "CERTIFICATE_VERIFY_FAILED" in str(reason):
                     guidance = " Please install/update trusted CA certificates (or certifi)."
-                flash(f"Could not reach Oracle API. Check connectivity and try again{detail}.{guidance}", "error")
+                if not use_local_price_list_fallback(f"API timeout/connectivity issue{detail}"):
+                    flash(
+                        "No price list was downloaded because the Oracle pricing API could not be reached "
+                        f"after several {PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS}-second attempts{detail}. "
+                        f"No local {selected_currency} price list was found. Check internet/proxy access or select another existing local price list."
+                        f"{guidance}",
+                        "pricing_error",
+                    )
             except (TimeoutError, ValueError, json.JSONDecodeError) as exc:
-                flash(f"Could not process OCI pricing response: {exc}", "error")
+                if not use_local_price_list_fallback(str(exc)):
+                    flash(
+                        f"Could not process OCI pricing response: {exc}. No local {selected_currency} price list was found.",
+                        "pricing_error",
+                    )
             except Exception as exc:  # pragma: no cover - fallback guard
-                flash(f"Unexpected error: {exc}", "error")
+                flash(f"Unexpected error: {exc}", "pricing_error")
 
         elif action == "select_rvtools_file":
             selected_rvtools_file = request.form.get("rvtools_file", "").strip().replace("\\", "/")
             if not selected_rvtools_file or selected_rvtools_file not in rvtools_files:
-                flash("Please select a valid RVTools export file.", "error")
+                flash("Please select a valid VM inventory export file.", "rvtools_error")
             else:
                 p = Path(selected_rvtools_file)
                 rvtools_file_info = {
@@ -756,33 +4940,90 @@ def index() -> str:
                     "file_name": p.name,
                     "size_kb": round(p.stat().st_size / 1024, 2),
                 }
-                session["selected_rvtools_file"] = selected_rvtools_file
-                session["rvtools_file_info"] = rvtools_file_info
-                # Reset server-side selection state for a newly selected source file.
-                save_app_state(_default_app_state())
-                clear_step4_snapshot()
-                flash("RVTools export file selected successfully.", "success")
+                validate_and_select_inventory(
+                    selected_rvtools_file,
+                    rvtools_file_info,
+                    "VM inventory export file selected and validated successfully.",
+                )
+
+        elif action == "upload_rvtools_file":
+            upload = request.files.get("rvtools_upload")
+            original_name = secure_filename(upload.filename if upload else "")
+            suffix = Path(original_name).suffix.lower()
+            if not upload or not original_name:
+                flash("Please choose a VM inventory export file to upload.", "rvtools_error")
+            elif original_name.startswith("~$") or original_name.startswith("."):
+                flash("Temporary or hidden workbook files cannot be used as VM inventory input.", "rvtools_error")
+            elif suffix not in SUPPORTED_RVTOOLS_EXTENSIONS:
+                flash("Only .xlsx, .xlsm, and .csv VM inventory files are supported.", "rvtools_error")
+            else:
+                RVTOOLS_DIR.mkdir(parents=True, exist_ok=True)
+                target = RVTOOLS_DIR / original_name
+                reused_existing = False
+                if target.exists():
+                    try:
+                        reused_existing = file_sha256(target) == upload_sha256(upload)
+                    except (OSError, ValueError):
+                        reused_existing = False
+
+                if target.exists() and reused_existing:
+                    selected_rvtools_file = str(target).replace("\\", "/")
+                    rvtools_file_info = {
+                        "file_path": selected_rvtools_file,
+                        "file_name": target.name,
+                        "size_kb": round(target.stat().st_size / 1024, 2),
+                    }
+                    validate_and_select_inventory(
+                        selected_rvtools_file,
+                        rvtools_file_info,
+                        "VM inventory export file already exists in the rvtools catalog and was selected successfully.",
+                    )
+                else:
+                    if target.exists():
+                        try:
+                            upload.stream.seek(0)
+                        except (OSError, ValueError):
+                            pass
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        target = RVTOOLS_DIR / f"{target.stem}_{timestamp}{target.suffix}"
+                    upload.save(target)
+                    selected_rvtools_file = str(target).replace("\\", "/")
+                    rvtools_file_info = {
+                        "file_path": selected_rvtools_file,
+                        "file_name": target.name,
+                        "size_kb": round(target.stat().st_size / 1024, 2),
+                    }
+                    validate_and_select_inventory(
+                        selected_rvtools_file,
+                        rvtools_file_info,
+                        "VM inventory export file uploaded, selected, and validated successfully.",
+                    )
 
         elif action == "select_pricelist":
             chosen_price_file = str(request.form.get("price_list_file", "")).strip().replace("\\", "/")
             if not chosen_price_file:
-                flash("Please select an OCI price list file.", "error")
+                flash("Please select an OCI price list file.", "pricing_error")
             else:
                 refreshed_lists = list_downloaded_price_lists()
                 if chosen_price_file not in refreshed_lists:
-                    flash("Selected OCI price list file is not available anymore.", "error")
+                    flash("Selected OCI price list file is not available anymore.", "pricing_error")
                 else:
                     session["selected_pricelist_file"] = chosen_price_file
-                    flash("OCI price list file selected.", "success")
+                    _, chosen_currency, _ = load_price_lookup(chosen_price_file)
+                    if chosen_currency:
+                        selected_currency = chosen_currency.upper().strip()
+                        session["selected_currency"] = selected_currency
+                    remember_price_list_selection(chosen_price_file, chosen_currency)
+                    flash("OCI price list file selected.", "pricing_success")
 
         downloaded_price_lists = list_downloaded_price_lists()
+        rvtools_files = list_rvtools_export_files()
         selected_pricelist_file = str(session.get("selected_pricelist_file", "")).strip().replace("\\", "/")
         if selected_pricelist_file and selected_pricelist_file not in downloaded_price_lists:
             selected_pricelist_file = ""
             session.pop("selected_pricelist_file", None)
-        if not selected_pricelist_file and downloaded_price_lists:
-            selected_pricelist_file = downloaded_price_lists[0]
-            session["selected_pricelist_file"] = selected_pricelist_file
+
+        price_list_options = downloaded_price_lists[:MAX_VISIBLE_PRICE_LISTS]
 
         selected_pricelist_info = None
         if selected_pricelist_file:
@@ -800,11 +5041,15 @@ def index() -> str:
         selected_currency=selected_currency,
         download_info=download_info,
         downloaded_price_lists=downloaded_price_lists,
+        price_list_options=price_list_options,
         selected_pricelist_file=selected_pricelist_file,
         selected_pricelist_info=selected_pricelist_info,
         rvtools_files=rvtools_files,
         selected_rvtools_file=selected_rvtools_file,
         rvtools_file_info=rvtools_file_info,
+        rvtools_import_summary=rvtools_import_summary,
+        rvtools_rejected_info=rvtools_rejected_info,
+        customer_name=customer_name,
     )
 
 
@@ -814,13 +5059,13 @@ def step3() -> str:
 
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
     if not selected_rvtools_file:
-        flash("Please complete Step 2 and select an RVTools export file first.", "error")
+        flash("Select a VM inventory export in Step 1 to continue.", "rvtools_info")
         return redirect(url_for("index"))
 
     try:
         all_vms, source_vinfo_csv = load_vms_from_vinfo(selected_rvtools_file)
     except Exception as exc:
-        flash(f"Could not load RVTools vInfo data: {exc}", "error")
+        flash(f"Could not load VM inventory data: {exc}", "rvtools_error")
         return redirect(url_for("index"))
 
     vm_index = {vm["name"]: vm for vm in all_vms}
@@ -832,6 +5077,7 @@ def step3() -> str:
 
     if request.method == "POST":
         action = request.form.get("action", "")
+        redirect_to = str(request.form.get("redirect_to", "")).strip()
         chosen_vm_names = request.form.getlist("vm_names")
         single_vm_name = (request.form.get("vm_name") or "").strip()
         if single_vm_name:
@@ -858,9 +5104,37 @@ def step3() -> str:
                 ]
                 removed_count = before_count - len(selected_vm_names)
                 flash(f"Removed {removed_count} non-OCI-supported or 32-bit VM image(s).", "success")
+        elif action == "remove_duplicates":
+            before_count = len(selected_vm_names)
+            selected_set_for_dedupe = set(selected_vm_names)
+            deduped_names: list[str] = []
+            seen_source_names: set[str] = set()
+            for vm in all_vms:
+                vm_name = str(vm.get("name") or "").strip()
+                if vm_name not in selected_set_for_dedupe:
+                    continue
+                source_name = str(vm.get("source_name") or vm_name).strip()
+                if source_name in seen_source_names:
+                    continue
+                seen_source_names.add(source_name)
+                deduped_names.append(vm_name)
+
+            selected_vm_names = deduped_names
+            removed_count = before_count - len(selected_vm_names)
+            if removed_count:
+                flash(
+                    f"Removed {removed_count:,} duplicate VM name row(s) from the selected workload. First occurrence was kept.",
+                    "success",
+                )
+            else:
+                flash("No duplicate VM names were found in the selected workload.", "info")
 
         app_state["selected_vm_names"] = selected_vm_names
         save_app_state(app_state)
+        if redirect_to == "step4":
+            if selected_vm_names:
+                return redirect(step4_tab_redirect("paths"))
+            flash("Select at least one VM before continuing to Migration Paths.", "error")
 
     selected_set = set(selected_vm_names)
     available_vms_all = [vm for vm in all_vms if vm["name"] not in selected_set]
@@ -903,11 +5177,13 @@ def step3() -> str:
         [vm for vm in selected_vms_all if _matches_filters(vm, selected_os_filter, selected_power_filter)]
     )
 
-    def _to_number(value: Any) -> float:
-        try:
-            return float(str(value).strip().replace(",", ""))
-        except (TypeError, ValueError):
-            return 0.0
+    def _duplicate_row_count(vms: list[dict[str, Any]]) -> int:
+        source_name_counts: dict[str, int] = {}
+        for vm in vms:
+            source_name = str(vm.get("source_name") or vm.get("name") or "").strip()
+            if source_name:
+                source_name_counts[source_name] = source_name_counts.get(source_name, 0) + 1
+        return sum(max(0, count - 1) for count in source_name_counts.values())
 
     available_mem_mb = int(sum(_to_number(vm.get("memory_mb")) for vm in available_vms))
     selected_mem_mb = int(sum(_to_number(vm.get("memory_mb")) for vm in selected_vms))
@@ -916,12 +5192,14 @@ def step3() -> str:
         "total_cpus": int(sum(_to_number(vm.get("cpus")) for vm in available_vms)),
         "total_memory_mb": available_mem_mb,
         "total_memory_display": format_total_memory_gb_or_tb(available_mem_mb),
+        "duplicate_row_count": _duplicate_row_count(available_vms),
     }
     selected_summary = {
         "total_vms": len(selected_vms),
         "total_cpus": int(sum(_to_number(vm.get("cpus")) for vm in selected_vms)),
         "total_memory_mb": selected_mem_mb,
         "total_memory_display": format_total_memory_gb_or_tb(selected_mem_mb),
+        "duplicate_row_count": _duplicate_row_count(selected_vms),
     }
 
     return render_template(
@@ -948,14 +5226,15 @@ def step4() -> str:
     _cleanup_legacy_session_keys()
 
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
+    customer_name = normalize_customer_name(session.get("customer_name", ""))
     if not selected_rvtools_file:
-        flash("Please complete Step 2 and select an RVTools export file first.", "error")
+        flash("Select a VM inventory export in Step 1 to continue.", "rvtools_info")
         return redirect(url_for("index"))
 
     try:
         all_vms, source_vinfo_csv = load_vms_from_vinfo(selected_rvtools_file)
     except Exception as exc:
-        flash(f"Could not load RVTools vInfo data: {exc}", "error")
+        flash(f"Could not load VM inventory data: {exc}", "rvtools_error")
         return redirect(url_for("index"))
 
     vm_index = {vm["name"]: vm for vm in all_vms}
@@ -963,6 +5242,7 @@ def step4() -> str:
     selected_vm_names = app_state.get("selected_vm_names", [])
     if not isinstance(selected_vm_names, list):
         selected_vm_names = []
+    selected_vm_names = [n for n in selected_vm_names if n in vm_index]
 
     shape_options = load_oci_target_shapes()
     shape_pricing_map = load_oci_price_mapping_details()
@@ -980,44 +5260,15 @@ def step4() -> str:
             "memory_unit_price": float(price_lookup.get(memory_display, 0.0)),
         }
 
-    block_storage_unit_price = float(
-        price_lookup.get(
-            "Storage - Block Volume - Storage",
-            next(
-                (
-                    float(v)
-                    for k, v in price_lookup.items()
-                    if "block volume" in str(k).lower() and "storage" in str(k).lower() and "free" not in str(k).lower()
-                ),
-                0.0,
-            ),
-        )
-    )
-    block_perf_unit_price = float(
-        price_lookup.get(
-            "Storage - Block Volume - Performance Units",
-            next(
-                (
-                    float(v)
-                    for k, v in price_lookup.items()
-                    if "block volume" in str(k).lower() and "performance units" in str(k).lower()
-                ),
-                0.0,
-            ),
-        )
-    )
-    windows_os_unit_price = float(price_lookup.get("Compute - Windows OS", 0.0))
+    pricing_unit_prices = resolve_pricing_unit_prices(price_lookup)
+    block_storage_unit_price = pricing_unit_prices["block_storage_unit_price"]
+    block_perf_unit_price = pricing_unit_prices["block_perf_unit_price"]
+    windows_os_unit_price = pricing_unit_prices["windows_os_unit_price"]
 
     valid_shape_values = set(shape_options)
-    vpu_options = list(range(10, 121, 10))
+    vpu_options = VPU_OPTIONS
     valid_vpu_values = set(vpu_options)
-    valid_burst_values = {"100%", "50%", "12.5%", "1:1"}
-    burst_factor_map = {
-        "100%": 1.0,
-        "1:1": 1.0,
-        "50%": 0.5,
-        "12.5%": 0.125,
-    }
+    valid_burst_values = VALID_BURST_VALUES
     vm_shape_selection = app_state.get("step4_vm_shapes", {})
     if not isinstance(vm_shape_selection, dict):
         vm_shape_selection = {}
@@ -1033,30 +5284,49 @@ def step4() -> str:
     vm_os_license_selection = app_state.get("step4_vm_os_license", {})
     if not isinstance(vm_os_license_selection, dict):
         vm_os_license_selection = {}
+    hybrid_placement_selection = app_state.get("step4_hybrid_placements", {})
+    if not isinstance(hybrid_placement_selection, dict):
+        hybrid_placement_selection = {}
     try:
         iaas_discount_pct = float(app_state.get("step4_iaas_discount_pct", 0.0))
     except (TypeError, ValueError):
         iaas_discount_pct = 0.0
     iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
+    ocvs_profile_choice = normalize_ocvs_profile(app_state.get("step4_ocvs_profile", "best_fit"))
+    ocvs_policy = normalize_ocvs_policy(app_state.get("step4_ocvs_policy", {}))
+    vmware_license_price_per_core_yearly = _bounded_float(
+        app_state.get("step4_vmware_license_price_per_core_yearly"),
+        0.0,
+        0.0,
+        1_000_000.0,
+    )
+    ocvs_dr_nodes = normalize_ocvs_dr_nodes(app_state.get("step4_ocvs_dr_nodes", 0))
 
-    # Restore last saved Step 4 snapshot (includes selected + non-selected VMs).
+    # Restore last saved Step 4 sizing/costing settings. Step 3 remains the
+    # source of truth for which VMs are selected.
     snapshot = load_step4_snapshot()
     snapshot_source = str(snapshot.get("source_vinfo_csv", ""))
     snapshot_settings = snapshot.get("vm_settings", {}) if isinstance(snapshot.get("vm_settings", {}), dict) else {}
     if snapshot_settings and snapshot_source == source_vinfo_csv:
-        restored_selected: list[str] = []
         restored_shapes = dict(vm_shape_selection)
         restored_ocpus = dict(vm_ocpu_selection)
         restored_bursts = dict(vm_burst_selection)
         restored_vpus = dict(vm_vpu_selection)
         restored_license = dict(vm_os_license_selection)
+        restored_hybrid_placements = dict(hybrid_placement_selection)
+        restored_ocvs_profile = normalize_ocvs_profile(snapshot.get("ocvs_profile", ocvs_profile_choice))
+        restored_ocvs_policy = normalize_ocvs_policy(snapshot.get("ocvs_policy", ocvs_policy))
+        restored_vmware_license_price = _bounded_float(
+            snapshot.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly),
+            vmware_license_price_per_core_yearly,
+            0.0,
+            1_000_000.0,
+        )
+        restored_ocvs_dr_nodes = normalize_ocvs_dr_nodes(snapshot.get("ocvs_dr_nodes", ocvs_dr_nodes))
 
         for vm_name, cfg in snapshot_settings.items():
             if vm_name not in vm_index or not isinstance(cfg, dict):
                 continue
-
-            if bool(cfg.get("selected", False)):
-                restored_selected.append(vm_name)
 
             shape_val = str(cfg.get("oci_shape", "")).strip()
             if shape_val in valid_shape_values:
@@ -1086,48 +5356,98 @@ def step4() -> str:
             if license_val in {"BYOL", "Lic Include"}:
                 restored_license[vm_name] = license_val
 
-        selected_vm_names = [n for n in restored_selected if n in vm_index]
+            placement_val = normalize_hybrid_placement(cfg.get("hybrid_placement"), "")
+            if placement_val:
+                restored_hybrid_placements[vm_name] = placement_val
+
         vm_shape_selection = restored_shapes
         vm_ocpu_selection = restored_ocpus
         vm_burst_selection = restored_bursts
         vm_vpu_selection = restored_vpus
         vm_os_license_selection = restored_license
+        hybrid_placement_selection = restored_hybrid_placements
+        ocvs_profile_choice = restored_ocvs_profile
+        ocvs_policy = restored_ocvs_policy
+        vmware_license_price_per_core_yearly = restored_vmware_license_price
+        ocvs_dr_nodes = restored_ocvs_dr_nodes
 
-        app_state["selected_vm_names"] = selected_vm_names
         app_state["step4_vm_shapes"] = vm_shape_selection
         app_state["step4_vm_ocpus"] = vm_ocpu_selection
         app_state["step4_vm_bursts"] = vm_burst_selection
         app_state["step4_vm_vpus"] = vm_vpu_selection
         app_state["step4_vm_os_license"] = vm_os_license_selection
+        app_state["step4_hybrid_placements"] = hybrid_placement_selection
+        app_state["step4_ocvs_profile"] = ocvs_profile_choice
+        app_state["step4_ocvs_policy"] = ocvs_policy
+        app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
+        app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
+        if snapshot.get("saved_at") and not app_state.get("step4_last_updated_at"):
+            app_state["step4_last_updated_at"] = str(snapshot.get("saved_at"))
         save_app_state(app_state)
 
     selected_vms = [vm_index[name] for name in selected_vm_names if name in vm_index]
     if not selected_vms:
-        flash("No VMs selected yet. Please select VMs in Step 3 first.", "error")
+        flash("No VMs selected yet. Please select VMs in Step 2 first.", "error")
         return redirect(url_for("step3"))
 
-    export_requested = False
+    export_format: str | None = None
+    return_to = "step4"
+    active_scenario = normalize_step4_scenario_tab(request.args.get("tab", "paths"))
 
     if request.method == "POST":
         action = str(request.form.get("action", "save")).strip().lower()
+        return_to = str(request.form.get("return_to", "step4")).strip().lower()
+        active_scenario = normalize_step4_scenario_tab(request.form.get("active_scenario", "paths"))
         vm_names = request.form.getlist("vm_name")
         selected_shapes = request.form.getlist("oci_shape")
         selected_ocpus = request.form.getlist("vm_ocpu")
         selected_bursts = request.form.getlist("vm_burst")
         selected_vpus = request.form.getlist("vm_vpu")
         selected_os_license = request.form.getlist("vm_os_license")
+        hybrid_vm_names = request.form.getlist("hybrid_vm_name")
+        selected_hybrid_placements = request.form.getlist("hybrid_placement")
+        bulk_apply_shape = str(request.form.get("bulk_apply_oci_shape", "")).strip()
+        bulk_apply_burst = str(request.form.get("bulk_apply_burst", "")).strip()
+        bulk_apply_vpu_raw = str(request.form.get("bulk_apply_vpu", "")).strip()
+        bulk_apply_os_license = str(request.form.get("bulk_apply_os_license", "")).strip()
+        native_shape_strategy_enabled = str(request.form.get("native_shape_strategy_enabled", "")).strip() == "1"
+        native_strategy_os = request.form.getlist("native_strategy_os")
+        native_strategy_shapes = request.form.getlist("native_strategy_shape")
+        native_strategy_bursts = request.form.getlist("native_strategy_burst")
         iaas_discount_raw = str(request.form.get("iaas_discount_pct", iaas_discount_pct)).strip()
+        vmware_license_raw = str(
+            request.form.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly)
+        ).strip()
+        ocvs_profile_choice = normalize_ocvs_profile(request.form.get("ocvs_profile", ocvs_profile_choice))
+        ocvs_dr_nodes = normalize_ocvs_dr_nodes(request.form.get("ocvs_dr_nodes", ocvs_dr_nodes))
+        ocvs_policy = normalize_ocvs_policy(
+            {
+                "vcpu_per_ocpu": request.form.get("ocvs_vcpu_per_ocpu", ocvs_policy["vcpu_per_ocpu"]),
+                "cpu_headroom_pct": request.form.get("ocvs_cpu_headroom_pct", ocvs_policy["cpu_headroom_pct"]),
+                "memory_headroom_pct": request.form.get("ocvs_memory_headroom_pct", ocvs_policy["memory_headroom_pct"]),
+                "storage_headroom_pct": request.form.get("ocvs_storage_headroom_pct", ocvs_policy["storage_headroom_pct"]),
+                "dense_vsan_usable_pct": request.form.get("ocvs_dense_vsan_usable_pct", ocvs_policy["dense_vsan_usable_pct"]),
+                "standard_storage_vpu": request.form.get("ocvs_standard_storage_vpu", ocvs_policy["standard_storage_vpu"]),
+            }
+        )
         try:
             iaas_discount_pct = float(iaas_discount_raw)
         except (TypeError, ValueError):
             iaas_discount_pct = 0.0
         iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
+        vmware_license_price_per_core_yearly = _bounded_float(
+            vmware_license_raw,
+            0.0,
+            0.0,
+            1_000_000.0,
+        )
 
         updated_shapes = dict(vm_shape_selection)
         updated_ocpus = dict(vm_ocpu_selection)
         updated_bursts = dict(vm_burst_selection)
         updated_vpus = dict(vm_vpu_selection)
         updated_os_license = dict(vm_os_license_selection)
+        updated_hybrid_placements = dict(hybrid_placement_selection)
         for vm_name, shape in zip(vm_names, selected_shapes):
             clean_vm = str(vm_name).strip()
             clean_shape = str(shape).strip()
@@ -1158,22 +5478,96 @@ def step4() -> str:
             if clean_vm and clean_vm in vm_index and vpu_val in valid_vpu_values:
                 updated_vpus[clean_vm] = vpu_val
 
-        valid_license_values = {"BYOL", "Lic Include"}
         for vm_name, license_raw in zip(vm_names, selected_os_license):
             clean_vm = str(vm_name).strip()
             raw_os = str(vm_index.get(clean_vm, {}).get("raw_os", "")).lower()
             if "windows server" not in raw_os:
                 continue
             license_val = str(license_raw).strip()
-            if clean_vm and clean_vm in vm_index and license_val in valid_license_values:
+            if clean_vm and clean_vm in vm_index and license_val in OS_LICENSE_VALUES:
                 updated_os_license[clean_vm] = license_val
+
+        if native_shape_strategy_enabled:
+            strategy_shape_by_os: dict[str, str] = {}
+            strategy_burst_by_os: dict[str, str] = {}
+            for os_name_raw, shape_raw, burst_raw in zip(
+                native_strategy_os,
+                native_strategy_shapes,
+                native_strategy_bursts,
+            ):
+                os_key = (str(os_name_raw or "").strip() or "Unknown / Empty").lower()
+                shape_val = str(shape_raw or "").strip()
+                burst_val = normalize_burst_value(burst_raw)
+                if os_key and shape_val in valid_shape_values:
+                    strategy_shape_by_os[os_key] = shape_val
+                if os_key and burst_val in valid_burst_values:
+                    strategy_burst_by_os[os_key] = burst_val
+
+            if strategy_shape_by_os or strategy_burst_by_os:
+                for vm in selected_vms:
+                    vm_name = str(vm.get("name") or "").strip()
+                    os_key = (str(vm.get("raw_os") or "").strip() or "Unknown / Empty").lower()
+                    if not vm_name:
+                        continue
+                    if os_key in strategy_shape_by_os:
+                        updated_shapes[vm_name] = strategy_shape_by_os[os_key]
+                    if os_key in strategy_burst_by_os:
+                        updated_bursts[vm_name] = strategy_burst_by_os[os_key]
+
+        if bulk_apply_shape in valid_shape_values:
+            for vm in selected_vms:
+                vm_name = str(vm.get("name") or "").strip()
+                if vm_name:
+                    updated_shapes[vm_name] = bulk_apply_shape
+
+        if bulk_apply_burst in valid_burst_values:
+            for vm in selected_vms:
+                vm_name = str(vm.get("name") or "").strip()
+                if vm_name:
+                    updated_bursts[vm_name] = bulk_apply_burst
+
+        try:
+            bulk_apply_vpu = int(float(bulk_apply_vpu_raw)) if bulk_apply_vpu_raw else None
+        except (TypeError, ValueError):
+            bulk_apply_vpu = None
+        if bulk_apply_vpu in valid_vpu_values:
+            for vm in selected_vms:
+                vm_name = str(vm.get("name") or "").strip()
+                if vm_name:
+                    updated_vpus[vm_name] = int(bulk_apply_vpu)
+
+        if bulk_apply_os_license in OS_LICENSE_VALUES:
+            for vm in selected_vms:
+                vm_name = str(vm.get("name") or "").strip()
+                raw_os = str(vm.get("raw_os") or "").lower()
+                if vm_name and "windows server" in raw_os:
+                    updated_os_license[vm_name] = bulk_apply_os_license
+
+        for vm_name, placement_raw in zip(hybrid_vm_names, selected_hybrid_placements):
+            clean_vm = str(vm_name).strip()
+            placement_val = normalize_hybrid_placement(placement_raw, "")
+            if clean_vm and clean_vm in vm_index and placement_val:
+                updated_hybrid_placements[clean_vm] = placement_val
+
+        updated_hybrid_placements = {
+            str(vm_name): normalize_hybrid_placement(value, "ocvs")
+            for vm_name, value in updated_hybrid_placements.items()
+            if str(vm_name) in vm_index
+        }
 
         app_state["step4_vm_shapes"] = updated_shapes
         app_state["step4_vm_ocpus"] = updated_ocpus
         app_state["step4_vm_bursts"] = updated_bursts
         app_state["step4_vm_vpus"] = updated_vpus
         app_state["step4_vm_os_license"] = updated_os_license
+        app_state["step4_hybrid_placements"] = updated_hybrid_placements
         app_state["step4_iaas_discount_pct"] = iaas_discount_pct
+        app_state["step4_ocvs_profile"] = ocvs_profile_choice
+        app_state["step4_ocvs_policy"] = ocvs_policy
+        app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
+        app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
+        step4_last_updated_at = datetime.now().isoformat(timespec="seconds")
+        app_state["step4_last_updated_at"] = step4_last_updated_at
         save_app_state(app_state)
 
         # Apply latest form selections to in-request variables so export can use them immediately.
@@ -1182,25 +5576,20 @@ def step4() -> str:
         vm_burst_selection = updated_bursts
         vm_vpu_selection = updated_vpus
         vm_os_license_selection = updated_os_license
+        hybrid_placement_selection = updated_hybrid_placements
 
         if action == "export_excel":
-            export_requested = True
-        else:
+            export_format = "excel"
+        elif action == "save":
             # Persist snapshot for all VMs (selected + non-selected) with selected status.
             all_vm_settings: dict[str, dict[str, Any]] = {}
-
-            def _to_number_local(value: Any) -> float:
-                try:
-                    return float(str(value).strip().replace(",", ""))
-                except (TypeError, ValueError):
-                    return 0.0
 
             for vm in all_vms:
                 vm_name = str(vm.get("name") or "").strip()
                 if not vm_name:
                     continue
 
-                cpu_val = int(_to_number_local(vm.get("cpus")))
+                cpu_val = int(_to_number(vm.get("cpus")))
                 default_ocpu = max(1, cpu_val // 2)
 
                 shape_val = str(updated_shapes.get(vm_name, shape_options[0])).strip()
@@ -1240,482 +5629,138 @@ def step4() -> str:
                     "burst": burst_val,
                     "vpu": vpu_val,
                     "os_license": license_val,
+                    "hybrid_placement": normalize_hybrid_placement(updated_hybrid_placements.get(vm_name), ""),
                 }
 
             save_step4_snapshot(
                 {
-                    "saved_at": datetime.now().isoformat(),
+                    "saved_at": step4_last_updated_at,
                     "source_vinfo_csv": source_vinfo_csv,
+                    "ocvs_profile": ocvs_profile_choice,
+                    "ocvs_policy": ocvs_policy,
+                    "ocvs_dr_nodes": ocvs_dr_nodes,
+                    "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
                     "vm_settings": all_vm_settings,
                 }
             )
 
-            flash("Step 4 settings saved for all VMs (selected and non-selected).", "success")
-            return redirect(url_for("step4"))
+            flash("Migration path settings saved.", "success")
+            return redirect(step4_tab_redirect(active_scenario))
 
-    def _to_number(value: Any) -> float:
-        try:
-            return float(str(value).strip().replace(",", ""))
-        except (TypeError, ValueError):
-            return 0.0
+    cost_context = {
+        "shape_options": shape_options,
+        "shape_pricing_map": shape_pricing_map,
+        "price_lookup": price_lookup,
+        "block_storage_unit_price": block_storage_unit_price,
+        "block_perf_unit_price": block_perf_unit_price,
+        "windows_os_unit_price": windows_os_unit_price,
+        "iaas_discount_pct": iaas_discount_pct,
+        "vm_shape_selection": vm_shape_selection,
+        "vm_ocpu_selection": vm_ocpu_selection,
+        "vm_burst_selection": vm_burst_selection,
+        "vm_vpu_selection": vm_vpu_selection,
+        "vm_os_license_selection": vm_os_license_selection,
+        "valid_shape_values": valid_shape_values,
+        "valid_vpu_values": valid_vpu_values,
+    }
 
-    def _build_vm_cost_row(vm: dict[str, Any]) -> dict[str, Any]:
-        vm_name = str(vm.get("name") or "").strip()
-        cpu_val = int(_to_number(vm.get("cpus")))
-        default_ocpu = max(1, cpu_val // 2)
-        saved_ocpu = vm_ocpu_selection.get(vm_name, default_ocpu)
-        try:
-            effective_ocpu = max(1, int(saved_ocpu))
-        except (TypeError, ValueError):
-            effective_ocpu = default_ocpu
-
-        saved_burst = str(vm_burst_selection.get(vm_name, "100%")).strip()
-        if saved_burst == "1:1":
-            saved_burst = "100%"
-        burst = saved_burst if saved_burst in valid_burst_values else "100%"
-        burst_factor = float(burst_factor_map.get(burst, 1.0))
-
-        vpu_value = int(vm_vpu_selection.get(vm_name, 10)) if int(vm_vpu_selection.get(vm_name, 10)) in valid_vpu_values else 10
-        selected_shape = vm_shape_selection.get(vm_name, shape_options[0])
-        raw_os_value = (vm.get("raw_os") or "").strip()
-        is_windows_server = "windows server" in raw_os_value.lower()
-        os_license = ""
-        if is_windows_server:
-            saved_license = str(vm_os_license_selection.get(vm_name, "BYOL")).strip()
-            os_license = saved_license if saved_license in {"BYOL", "Lic Include"} else "BYOL"
-
-        shape_map = shape_pricing_map.get(selected_shape, {})
-        ocpu_display = str(shape_map.get("ocpu_display_name", "")).strip()
-        memory_display = str(shape_map.get("memory_display_name", "")).strip()
-
-        ocpu_unit_price = float(price_lookup.get(ocpu_display, 0.0))
-        memory_unit_price = float(price_lookup.get(memory_display, 0.0))
-        block_storage_unit_price = float(
-            price_lookup.get(
-                "Storage - Block Volume - Storage",
-                next(
-                    (
-                        float(v)
-                        for k, v in price_lookup.items()
-                        if "block volume" in str(k).lower() and "storage" in str(k).lower() and "free" not in str(k).lower()
-                    ),
-                    0.0,
-                ),
-            )
-        )
-        block_perf_unit_price = float(
-            price_lookup.get(
-                "Storage - Block Volume - Performance Units",
-                next(
-                    (
-                        float(v)
-                        for k, v in price_lookup.items()
-                        if "block volume" in str(k).lower() and "performance units" in str(k).lower()
-                    ),
-                    0.0,
-                ),
-            )
-        )
-
-        memory_gb = int(math.ceil(int(_to_number(vm.get("memory_mb"))) / 1024.0))
-        raw_provisioned_gb = int(math.ceil(int(_to_number(vm.get("provisioned_mib"))) / 1024.0))
-        provisioned_gb = max(50, raw_provisioned_gb)
-
-        cpu_monthly_cost = (effective_ocpu * ocpu_unit_price) * 730.0
-        ram_monthly_cost = (memory_gb * memory_unit_price) * 730.0
-        cpu_monthly_cost *= burst_factor
-        cpu_ram_monthly_cost = cpu_monthly_cost + ram_monthly_cost
-        storage_capacity_monthly_cost = provisioned_gb * block_storage_unit_price
-        storage_performance_monthly_cost = provisioned_gb * vpu_value * block_perf_unit_price
-        storage_monthly_cost = storage_capacity_monthly_cost + storage_performance_monthly_cost
-        os_license_monthly_cost = (windows_os_unit_price * effective_ocpu * 730.0 * burst_factor) if os_license == "Lic Include" else 0.0
-        discount_factor = max(0.0, min(1.0, 1.0 - (iaas_discount_pct / 100.0)))
-
-        cpu_monthly_cost *= discount_factor
-        ram_monthly_cost *= discount_factor
-        cpu_ram_monthly_cost *= discount_factor
-        storage_capacity_monthly_cost *= discount_factor
-        storage_performance_monthly_cost *= discount_factor
-        storage_monthly_cost *= discount_factor
-
-        return {
-            "vm_name": vm_name,
-            "os_name": raw_os_value or "Unknown / Empty",
-            "is_windows_server": is_windows_server,
-            "os_license": os_license,
-            "cpus": cpu_val,
-            "ocpu": effective_ocpu,
-            "burst": burst,
-            "memory_mb": int(_to_number(vm.get("memory_mb"))),
-            "provisioned_mib": int(_to_number(vm.get("provisioned_mib"))),
-            "memory_gb": memory_gb,
-            "raw_provisioned_gb": raw_provisioned_gb,
-            "provisioned_gb": provisioned_gb,
-            "vpu": vpu_value,
-            "oci_shape": selected_shape,
-            "ocpu_unit_price": ocpu_unit_price,
-            "memory_unit_price": memory_unit_price,
-            "cpu_ram_monthly_cost": cpu_ram_monthly_cost,
-            "cpu_monthly_cost": cpu_monthly_cost,
-            "ram_monthly_cost": ram_monthly_cost,
-            "storage_capacity_monthly_cost": storage_capacity_monthly_cost,
-            "storage_performance_monthly_cost": storage_performance_monthly_cost,
-            "storage_monthly_cost": storage_monthly_cost,
-            "os_license_monthly_cost": os_license_monthly_cost,
-        }
-
-    vm_rows: list[dict[str, Any]] = [_build_vm_cost_row(vm) for vm in selected_vms]
+    vm_rows: list[dict[str, Any]] = build_vm_cost_rows(selected_vms, **cost_context)
     selected_vm_set = set(selected_vm_names)
     non_selected_vms = [vm for vm in all_vms if str(vm.get("name") or "") not in selected_vm_set]
-    non_selected_vm_rows: list[dict[str, Any]] = [_build_vm_cost_row(vm) for vm in non_selected_vms]
+    non_selected_vm_rows: list[dict[str, Any]] = build_vm_cost_rows(non_selected_vms, **cost_context)
 
     vm_rows.sort(key=lambda r: str(r["vm_name"]).lower())
     non_selected_vm_rows.sort(key=lambda r: str(r["vm_name"]).lower())
+    native_vm_input_rows = vm_rows[:NATIVE_VM_INPUT_ROW_LIMIT]
+    native_shape_strategy_rows = build_native_shape_strategy_rows(vm_rows)
 
-    overall = {
-        "vm_count": len(vm_rows),
-        "total_cpus": sum(int(r["cpus"]) for r in vm_rows),
-        "total_memory_mb": sum(int(r["memory_mb"]) for r in vm_rows),
-        "total_memory_gb": sum(int(r["memory_gb"]) for r in vm_rows),
-        "total_provisioned_mib": sum(int(r["provisioned_mib"]) for r in vm_rows),
-        "total_provisioned_gb": sum(int(r["provisioned_gb"]) for r in vm_rows),
-        "total_vpus": sum(int(r["vpu"]) for r in vm_rows),
-        "total_license_included_vms": sum(1 for r in vm_rows if str(r.get("os_license", "")) == "Lic Include"),
-        "total_cpu_monthly_cost": sum(float(r["cpu_monthly_cost"]) for r in vm_rows),
-        "total_ram_monthly_cost": sum(float(r["ram_monthly_cost"]) for r in vm_rows),
-        "total_storage_capacity_monthly_cost": sum(float(r["storage_capacity_monthly_cost"]) for r in vm_rows),
-        "total_storage_performance_monthly_cost": sum(float(r["storage_performance_monthly_cost"]) for r in vm_rows),
-        "total_cpu_ram_monthly_cost": sum(float(r["cpu_ram_monthly_cost"]) for r in vm_rows),
-        "total_storage_monthly_cost": sum(float(r["storage_monthly_cost"]) for r in vm_rows),
-        "total_os_license_monthly_cost": sum(float(r["os_license_monthly_cost"]) for r in vm_rows),
-    }
-    overall["total_monthly_cost"] = (
-        float(overall["total_cpu_ram_monthly_cost"])
-        + float(overall["total_storage_monthly_cost"])
-        + float(overall["total_os_license_monthly_cost"])
+    analysis = build_price_analysis_from_rows(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=block_storage_unit_price,
+        block_perf_unit_price=block_perf_unit_price,
+        windows_os_unit_price=windows_os_unit_price,
+        iaas_discount_pct=iaas_discount_pct,
+        ocvs_policy=ocvs_policy,
+        ocvs_profile_choice=ocvs_profile_choice,
+        source_pricelist_file=source_pricelist_file,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+        hybrid_placement_selection=hybrid_placement_selection,
+    )
+    overall = analysis["overall"]
+    ocvs_price = analysis["ocvs_price"]
+    hybrid_ocvs_price = analysis["hybrid_ocvs_price"]
+    scenario_comparison = analysis["scenario_comparison"]
+    fit_warnings = analysis["fit_warnings"]
+    executive_summary = analysis["executive_summary"]
+    price_comparison = analysis["price_comparison"]
+    ocvs_shape_comparison = analysis["ocvs_shape_comparison"]
+    vmware_license_summary = analysis["vmware_license_summary"]
+    workload_summary = analysis["workload_summary"]
+    scenario_view_context = {**analysis, "iaas_discount_pct": iaas_discount_pct}
+    scenario_views = [
+        build_scenario_view("native", scenario_view_context),
+        build_scenario_view("ocvs", scenario_view_context),
+        build_scenario_view("hybrid", scenario_view_context),
+    ]
+    step4_last_updated_at = str(app_state.get("step4_last_updated_at", "") or "")
+    if not step4_last_updated_at and snapshot.get("saved_at") and snapshot_source == source_vinfo_csv:
+        step4_last_updated_at = str(snapshot.get("saved_at"))
+    migration_waves = build_migration_waves(
+        vm_rows=vm_rows,
+        supported_native_rows=analysis["supported_native_rows"],
+        unsupported_ocvs_rows=analysis["unsupported_ocvs_rows"],
     )
 
-    if export_requested:
-        headers = [
-            "VM Name",
-            "OS (Full version)",
-            "OS License",
-            "CPUs",
-            "OCPU",
-            "Burst",
-            "Memory (MB)",
-            "Storage (GB)",
-            "VPU",
-            "OCI Target Shape",
-            "CPU Monthly Cost",
-            "RAM Monthly Cost",
-            "CPU/RAM Monthly Cost",
-            "Storage Capacity Monthly Cost",
-            "VPU Monthly Cost",
-            "Storage Monthly Cost",
-            "OS License Monthly Cost",
-            "Total Monthly Cost",
-        ]
-        discount_factor = max(0.0, min(1.0, 1.0 - (iaas_discount_pct / 100.0)))
-        pricelist_rows: list[list[Any]] = [
-            [
-                str(shape_name),
-                float((shape_price_rates.get(shape_name, {}) or {}).get("ocpu_unit_price", 0.0)),
-                float((shape_price_rates.get(shape_name, {}) or {}).get("memory_unit_price", 0.0)),
-            ]
-            for shape_name in shape_options
-        ]
-        shape_lookup_last_row = max(2, 1 + len(pricelist_rows))
-        shape_lookup_range = f"PriceList!$A$2:$C${shape_lookup_last_row}"
-
-        def _burst_to_factor(value: Any) -> float:
-            v = str(value or "").strip()
-            if v in {"100%", "1:1"}:
-                return 1.0
-            if v == "50%":
-                return 0.5
-            if v == "12.5%":
-                return 0.125
-            return 1.0
-
-        currency_format_map = {
-            "EUR": "€#,##0.00",
-            "USD": "$#,##0.00",
-            "GBP": "£#,##0.00",
-            "JPY": "¥#,##0.00",
-            "CHF": '"CHF "#,##0.00',
-            "AUD": '"A$"#,##0.00',
-            "CAD": '"C$"#,##0.00',
-            "SGD": '"S$"#,##0.00',
-            "SEK": '"kr "#,##0.00',
-            "NOK": '"kr "#,##0.00',
-            "DKK": '"kr "#,##0.00',
-        }
-        currency_fmt_code = currency_format_map.get(
-            str(pricing_currency or "USD").upper(),
-            f'"{str(pricing_currency or "USD").upper()} "#,##0.00',
+    if export_format == "excel":
+        generated_at = datetime.now().isoformat(timespec="seconds")
+        filename = build_export_filename(customer_name, "migration_price_comparison", "xlsx")
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        export_path = EXPORTS_DIR / filename
+        export_path_display = str(export_path.resolve())
+        workbook_bytes = build_migration_price_workbook_xlsx(
+            customer_name=customer_name,
+            pricing_currency=pricing_currency,
+            source_pricelist_file=source_pricelist_file,
+            source_vinfo_csv=source_vinfo_csv,
+            export_path_display=export_path_display,
+            generated_at=generated_at,
+            step4_last_updated_at=step4_last_updated_at,
+            vm_rows=vm_rows,
+            non_selected_vm_rows=non_selected_vm_rows,
+            analysis=analysis,
+            migration_waves=migration_waves,
+            shape_price_rates=shape_price_rates,
+            iaas_discount_pct=iaas_discount_pct,
+            ocvs_profile_choice=ocvs_profile_choice,
+            ocvs_policy=ocvs_policy,
+            ocvs_dr_nodes=ocvs_dr_nodes,
+            vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+            block_storage_unit_price=block_storage_unit_price,
+            block_perf_unit_price=block_perf_unit_price,
+            windows_os_unit_price=windows_os_unit_price,
         )
-
-        def _export_line_from_row(r: dict[str, Any], row_idx: int) -> list[Any]:
-            burst_factor = _burst_to_factor(r.get("burst", "100%"))
-            cpu_formula = (
-                f"=E{row_idx}*VLOOKUP(J{row_idx},{shape_lookup_range},2,FALSE)"
-                f"*730*F{row_idx}*PriceList!$F$5"
-            )
-            ram_formula = (
-                f"=ROUNDUP(G{row_idx}/1024,0)*VLOOKUP(J{row_idx},{shape_lookup_range},3,FALSE)"
-                f"*730*PriceList!$F$5"
-            )
-            cpu_ram_formula = f"=K{row_idx}+L{row_idx}"
-            storage_capacity_formula = f"=H{row_idx}*PriceList!$F$2*PriceList!$F$5"
-            vpu_formula = f"=H{row_idx}*I{row_idx}*PriceList!$F$3*PriceList!$F$5"
-            storage_formula = f"=N{row_idx}+O{row_idx}"
-            os_license_formula = (
-                f"=IF(C{row_idx}=\"Lic Include\",E{row_idx}*PriceList!$F$4*730*F{row_idx},0)"
-            )
-            total_formula = f"=M{row_idx}+P{row_idx}+Q{row_idx}"
-
-            return [
-                r.get("vm_name", ""),
-                r.get("os_name", ""),
-                r.get("os_license", ""),
-                r.get("cpus", 0),
-                r.get("ocpu", 0),
-                burst_factor,
-                r.get("memory_mb", 0),
-                r.get("provisioned_gb", 0),
-                r.get("vpu", 0),
-                r.get("oci_shape", ""),
-                cpu_formula,
-                ram_formula,
-                cpu_ram_formula,
-                storage_capacity_formula,
-                vpu_formula,
-                storage_formula,
-                os_license_formula,
-                total_formula,
-            ]
-
-        data_rows_selected: list[list[Any]] = [
-            _export_line_from_row(r, idx) for idx, r in enumerate(vm_rows, start=2)
-        ]
-        data_rows_non_selected: list[list[Any]] = [
-            _export_line_from_row(r, idx) for idx, r in enumerate(non_selected_vm_rows, start=2)
-        ]
-
-        def _col_ref(col_idx: int) -> str:
-            col_idx += 1
-            letters = ""
-            while col_idx:
-                col_idx, rem = divmod(col_idx - 1, 26)
-                letters = chr(65 + rem) + letters
-            return letters
-
-        def _cell_xml(value: Any, row_idx: int, col_idx: int, style_idx: int | None = None) -> str:
-            ref = f"{_col_ref(col_idx)}{row_idx}"
-            style_attr = f' s="{style_idx}"' if style_idx is not None else ""
-            if isinstance(value, (int, float)):
-                return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
-
-            text = str(value)
-            if text.startswith("="):
-                formula = xml_escape(text[1:])
-                return f'<c r="{ref}"{style_attr}><f>{formula}</f></c>'
-            try:
-                numeric_text = text.replace(",", "")
-                if numeric_text and all(ch in "0123456789.-" for ch in numeric_text):
-                    float(numeric_text)
-                    return f'<c r="{ref}"{style_attr}><v>{numeric_text}</v></c>'
-            except Exception:
-                pass
-
-            safe = xml_escape(text)
-            return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
-
-        def _sheet_xml_for_rows(
-            all_rows: list[list[Any]],
-            currency_columns: set[int] | None = None,
-            percent_columns: set[int] | None = None,
-            header_rows: int = 1,
-        ) -> str:
-            sheet_rows_xml: list[str] = []
-            currency_columns = currency_columns or set()
-            percent_columns = percent_columns or set()
-            for i, row in enumerate(all_rows, start=1):
-                row_cells: list[str] = []
-                for c, value in enumerate(row):
-                    style_idx = None
-                    if i > header_rows and c in currency_columns:
-                        style_idx = 1
-                    elif i > header_rows and c in percent_columns:
-                        style_idx = 2
-                    row_cells.append(_cell_xml(value, i, c, style_idx=style_idx))
-                cells = "".join(row_cells)
-                sheet_rows_xml.append(f'<row r="{i}">{cells}</row>')
-            return (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                f"<sheetData>{''.join(sheet_rows_xml)}</sheetData>"
-                '</worksheet>'
-            )
-
-        # Burst column F should display as percentage; cost columns K..R as currency.
-        vm_burst_percent_cols = {5}
-        vm_cost_currency_cols = set(range(10, 18))
-        sheet_selected_xml = _sheet_xml_for_rows(
-            [headers] + data_rows_selected,
-            currency_columns=vm_cost_currency_cols,
-            percent_columns=vm_burst_percent_cols,
-        )
-        sheet_non_selected_xml = _sheet_xml_for_rows(
-            [headers] + data_rows_non_selected,
-            currency_columns=vm_cost_currency_cols,
-            percent_columns=vm_burst_percent_cols,
-        )
-
-        # Third sheet with price list/rates, referenced by formulas in both VM sheets.
-        max_pricelist_rows = max(len(pricelist_rows), 4)
-        pricelist_sheet_rows: list[list[Any]] = [["OCI Target Shape", "OCPU Unit Price", "Memory Unit Price", "Currency", "Parameter", "Value", "Currency"]]
-        for idx in range(max_pricelist_rows):
-            row: list[Any] = ["", "", "", "", "", "", ""]
-            if idx < len(pricelist_rows):
-                row[0] = pricelist_rows[idx][0]
-                row[1] = pricelist_rows[idx][1]
-                row[2] = pricelist_rows[idx][2]
-                row[3] = pricing_currency or "USD"
-
-            # Keep these values anchored to F2..F5 for formula references.
-            if idx == 0:
-                row[4] = "Block Storage Unit Price"
-                row[5] = block_storage_unit_price
-                row[6] = pricing_currency or "USD"
-            elif idx == 1:
-                row[4] = "Block Performance Unit Price"
-                row[5] = block_perf_unit_price
-                row[6] = pricing_currency or "USD"
-            elif idx == 2:
-                row[4] = "Windows OS Unit Price"
-                row[5] = windows_os_unit_price
-                row[6] = pricing_currency or "USD"
-            elif idx == 3:
-                row[4] = "IaaS Discount Factor"
-                row[5] = discount_factor
-
-            pricelist_sheet_rows.append(row)
-
-        sheet_pricelist_xml = _sheet_xml_for_rows(pricelist_sheet_rows)
-
-        styles_xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            '<numFmts count="2">'
-            f'<numFmt numFmtId="164" formatCode="{xml_escape(currency_fmt_code)}"/>'
-            '<numFmt numFmtId="165" formatCode="0.0%"/>'
-            '</numFmts>'
-            '<fonts count="1">'
-            '<font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>'
-            '</fonts>'
-            '<fills count="2">'
-            '<fill><patternFill patternType="none"/></fill>'
-            '<fill><patternFill patternType="gray125"/></fill>'
-            '</fills>'
-            '<borders count="1">'
-            '<border><left/><right/><top/><bottom/><diagonal/></border>'
-            '</borders>'
-            '<cellStyleXfs count="1">'
-            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
-            '</cellStyleXfs>'
-            '<cellXfs count="3">'
-            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-            '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
-            '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
-            '</cellXfs>'
-            '<cellStyles count="1">'
-            '<cellStyle name="Normal" xfId="0" builtinId="0"/>'
-            '</cellStyles>'
-            '</styleSheet>'
-        )
-
-        workbook_xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<sheets>'
-            '<sheet name="Selected VMs" sheetId="1" r:id="rId1"/>'
-            '<sheet name="Non-selected VMs" sheetId="2" r:id="rId2"/>'
-            '<sheet name="PriceList" sheetId="3" r:id="rId3"/>'
-            '</sheets>'
-            '</workbook>'
-        )
-
-        workbook_rels_xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            'Target="worksheets/sheet1.xml"/>'
-            '<Relationship Id="rId2" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            'Target="worksheets/sheet2.xml"/>'
-            '<Relationship Id="rId3" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            'Target="worksheets/sheet3.xml"/>'
-            '<Relationship Id="rId4" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
-            'Target="styles.xml"/>'
-            '</Relationships>'
-        )
-
-        root_rels_xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-            'Target="xl/workbook.xml"/>'
-            '</Relationships>'
-        )
-
-        content_types_xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-            '<Default Extension="xml" ContentType="application/xml"/>'
-            '<Override PartName="/xl/workbook.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet1.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet2.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            '<Override PartName="/xl/worksheets/sheet3.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            '<Override PartName="/xl/styles.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-            '</Types>'
-        )
-
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("[Content_Types].xml", content_types_xml)
-            zf.writestr("_rels/.rels", root_rels_xml)
-            zf.writestr("xl/workbook.xml", workbook_xml)
-            zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
-            zf.writestr("xl/styles.xml", styles_xml)
-            zf.writestr("xl/worksheets/sheet1.xml", sheet_selected_xml)
-            zf.writestr("xl/worksheets/sheet2.xml", sheet_non_selected_xml)
-            zf.writestr("xl/worksheets/sheet3.xml", sheet_pricelist_xml)
-
-        filename = f"step4_vm_costing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        return Response(
-            buffer.getvalue(),
+        export_path.write_bytes(workbook_bytes)
+        session["last_export_file"] = export_path_display
+        return send_file(
+            export_path,
+            as_attachment=True,
+            download_name=filename,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            max_age=0,
         )
+
 
     return render_template(
         "step4.html",
         selected_rvtools_file=selected_rvtools_file,
         source_vinfo_csv=source_vinfo_csv,
         vm_rows=vm_rows,
+        native_vm_input_rows=native_vm_input_rows,
+        native_vm_input_row_limit=NATIVE_VM_INPUT_ROW_LIMIT,
+        native_vm_input_total=len(vm_rows),
+        native_shape_strategy_rows=native_shape_strategy_rows,
         overall=overall,
         shape_options=shape_options,
         vpu_options=vpu_options,
@@ -1726,8 +5771,84 @@ def step4() -> str:
         block_perf_unit_price=block_perf_unit_price,
         windows_os_unit_price=windows_os_unit_price,
         iaas_discount_pct=iaas_discount_pct,
+        ocvs_price=ocvs_price,
+        hybrid_ocvs_price=hybrid_ocvs_price,
+        ocvs_profiles=OCVS_HOST_PROFILES,
+        ocvs_profile_choice=ocvs_profile_choice,
+        ocvs_policy=ocvs_policy,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        scenario_comparison=scenario_comparison,
+        executive_summary=executive_summary,
+        fit_warnings=fit_warnings,
+        price_comparison=price_comparison,
+        ocvs_shape_comparison=ocvs_shape_comparison,
+        vmware_license_summary=vmware_license_summary,
+        workload_summary=workload_summary,
+        supported_native_summary=analysis["supported_native_summary"],
+        scenario_chart_rows=analysis["scenario_chart_rows"],
+        scenario_views=scenario_views,
+        migration_waves=migration_waves,
+        hybrid_placement_plan=analysis["hybrid_placement_plan"],
+        hybrid_placement_options=HYBRID_PLACEMENT_OPTIONS,
+        last_export_file=session.get("last_export_file", ""),
+        customer_name=customer_name,
+        active_scenario=active_scenario,
     )
 
 
+@app.route("/open-last-export", methods=["POST"])
+def open_last_export() -> dict[str, Any] | tuple[dict[str, Any], int]:
+    """Open the most recent Excel export from the local exports directory."""
+    export_value = str(session.get("last_export_file", "") or "").strip()
+    if not export_value:
+        return {"ok": False, "message": "No Excel export is available to open yet."}, 404
+
+    try:
+        export_path = Path(export_value).expanduser().resolve()
+        export_root = EXPORTS_DIR.resolve()
+    except OSError:
+        return {"ok": False, "message": "The export path is not valid."}, 400
+
+    if not export_path.exists() or not export_path.is_file():
+        return {"ok": False, "message": "The exported workbook is no longer available."}, 404
+    if export_root != export_path.parent and export_root not in export_path.parents:
+        return {"ok": False, "message": "Only files created in the local exports folder can be opened."}, 403
+
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(export_path)])
+        elif os.name == "nt":
+            os.startfile(str(export_path))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(export_path)])
+    except OSError as exc:
+        return {"ok": False, "message": f"Could not open the workbook: {exc}"}, 500
+
+    return {"ok": True, "path": str(export_path)}
+
+
+@app.route("/scenario/<scenario_id>", methods=["GET"])
+def scenario_page(scenario_id: str) -> str:
+    _cleanup_legacy_session_keys()
+
+    scenario_id = str(scenario_id or "").strip().lower()
+    if scenario_id not in {"native", "ocvs", "hybrid"}:
+        flash("Please select a valid migration path.", "error")
+        return redirect(step4_tab_redirect("paths"))
+
+    return redirect(f"{url_for('step4')}#scenario-{scenario_id}")
+
+
+@app.route("/step5", methods=["GET"])
+def step5() -> str:
+    _cleanup_legacy_session_keys()
+    return redirect(step4_tab_redirect("price"))
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host=os.environ.get("VMW2OCI_HOST", "127.0.0.1"),
+        port=_env_int("VMW2OCI_PORT", 5000, min_value=1, max_value=65535),
+        debug=_env_bool("VMW2OCI_DEBUG", False),
+    )

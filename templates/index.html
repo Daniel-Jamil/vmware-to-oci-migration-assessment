@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>vmw2oci - Step 1 & 2</title>
+  <title>vmw2oci - Assessment Setup</title>
   <style>
     :root {
       --bg: #f4f5f7;
@@ -43,6 +43,49 @@
     h2 { font-size: 1.2rem; margin: 2rem 0 .6rem; }
     h3 { font-size: 1rem; margin-bottom: .5rem; }
     p { margin: .5rem 0 1rem; color: var(--text); }
+    .wizard-steps {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(150px, 1fr));
+      gap: .45rem;
+      margin: 0 0 1.1rem;
+    }
+    .wizard-step {
+      display: block;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--line-strong);
+      background: #fff;
+      color: var(--muted);
+      padding: .55rem .65rem;
+      text-decoration: none;
+      min-width: 0;
+    }
+    .wizard-step strong {
+      display: block;
+      color: var(--text);
+      font-size: .78rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: .18rem;
+    }
+    .wizard-step span {
+      display: block;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .wizard-step small {
+      display: block;
+      margin-top: .15rem;
+      color: var(--muted);
+      line-height: 1.3;
+    }
+    .wizard-step.is-current {
+      border-left-color: var(--accent);
+      background: #eef4ff;
+      border-color: #bfd1ff;
+    }
+    .wizard-step.is-disabled {
+      opacity: .72;
+    }
     form {
       display: grid;
       grid-template-columns: 170px minmax(260px, 1fr) auto;
@@ -53,13 +96,13 @@
       border-top: 1px solid var(--line);
     }
     label { font-weight: 600; font-size: .92rem; }
-    select, button {
+    select, input[type="text"], input[type="file"], button {
       padding: .62rem .72rem;
       font-size: .92rem;
       border-radius: var(--radius);
       border: 1px solid var(--line-strong);
     }
-    select { background: #fff; color: var(--text); }
+    select, input[type="text"], input[type="file"] { background: #fff; color: var(--text); }
     button {
       cursor: pointer;
       background: var(--accent);
@@ -71,6 +114,37 @@
     .flash { padding: .65rem .75rem; border-radius: var(--radius); margin-bottom: .65rem; border: 1px solid; }
     .flash.success { background: #edf7ef; color: var(--success); border-color: #b8ddbf; }
     .flash.error { background: #fef1f1; color: var(--error); border-color: #efc4c1; }
+    .flash.info { background: #eef4ff; color: #174ea6; border-color: #bfd1ff; }
+    .field-hint { grid-column: 2 / 4; color: var(--muted); font-size: .82rem; margin: -.35rem 0 .15rem; }
+    .inventory-catalog-note {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      background: #eef4ff;
+      border: 1px solid #bfd1ff;
+      border-left: 4px solid var(--accent);
+      border-radius: var(--radius);
+      padding: .7rem .8rem;
+      margin: .7rem 0 .4rem;
+    }
+    .inventory-catalog-note strong {
+      display: block;
+      margin-bottom: .15rem;
+      color: var(--text);
+    }
+    .inventory-catalog-note span {
+      display: block;
+      color: var(--muted);
+      font-size: .86rem;
+      line-height: 1.35;
+    }
+    .inventory-catalog-note code {
+      white-space: nowrap;
+      color: #0b4fc3;
+      background: #fff;
+      border: 1px solid #c9d7fb;
+    }
     .result {
       background: #fff;
       border: 1px solid var(--line);
@@ -100,23 +174,88 @@
     }
     a.btn:hover { border-color: var(--accent); color: var(--accent); }
     code { background: #eff2f5; padding: .1rem .35rem; border-radius: 2px; }
+    @media (max-width: 980px) {
+      .wizard-steps { grid-template-columns: 1fr; }
+      form { grid-template-columns: 1fr; }
+      .field-hint { grid-column: 1; }
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>vmw2oci Wizard</h1>
-    <h2>Step 1 - OCI Price List Downloader</h2>
+    <h1>vmw2oci Assessment Wizard</h1>
+    <nav class="wizard-steps" aria-label="Assessment wizard">
+      <a class="wizard-step is-current" href="#assessment-setup">
+        <strong>Step 1</strong>
+        <span>Setup & Inventory</span>
+        <small>Customer, price list, and VM inventory source.</small>
+      </a>
+      <a class="wizard-step" href="{{ url_for('step3') }}">
+        <strong>Step 2</strong>
+        <span>Workload Scope</span>
+        <small>Select the VMs included in analysis.</small>
+      </a>
+      <span class="wizard-step is-disabled" aria-disabled="true">
+        <strong>Step 3</strong>
+        <span>Migration Paths</span>
+        <small>Configure paths and compare prices.</small>
+      </span>
+    </nav>
+    {% set flash_messages = get_flashed_messages(with_categories=true) %}
+    {% set customer_flash_categories = ["customer_error", "customer_success"] %}
+    {% set pricing_flash_categories = ["pricing_error", "pricing_success", "pricing_info"] %}
+    {% set rvtools_flash_categories = ["rvtools_error", "rvtools_success", "rvtools_info"] %}
+    {% set section_flash_categories = customer_flash_categories + pricing_flash_categories + rvtools_flash_categories %}
+
+    {% for category, message in flash_messages %}
+      {% if category not in section_flash_categories %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endif %}
+    {% endfor %}
+
+    <h2 id="assessment-setup">Step 1 - Setup & Inventory</h2>
+    <p>Set the customer or project name, choose the OCI price list, and load the VM inventory used for sizing and report exports.</p>
+
+    <form method="post">
+      <input type="hidden" name="action" value="save_customer_name" />
+      <label for="customer_name">Customer name:</label>
+      <input
+        id="customer_name"
+        name="customer_name"
+        type="text"
+        maxlength="120"
+        value="{{ customer_name or '' }}"
+        placeholder="Customer or project name"
+      />
+      <button type="submit">Save Customer</button>
+    </form>
+
+    {% for category, message in flash_messages %}
+      {% if category in customer_flash_categories %}
+        <div class="flash {{ 'error' if category == 'customer_error' else 'success' }}">{{ message }}</div>
+      {% endif %}
+    {% endfor %}
+
+    {% if customer_name %}
+      <div class="result">
+        <h3>Active Customer</h3>
+        <p><strong>Name:</strong> {{ customer_name }}</p>
+      </div>
+    {% endif %}
+
+    <h2>OCI Price List</h2>
     <p>
       Select a currency and download the Oracle Cloud public price list from
       <code>/cetools/api/v1/products/</code>.
     </p>
 
-    {% if downloaded_price_lists %}
+    {% if price_list_options %}
       <form method="post">
         <input type="hidden" name="action" value="select_pricelist" />
         <label for="price_list_file"><strong>Existing price list:</strong></label>
         <select id="price_list_file" name="price_list_file" required>
-          {% for f in downloaded_price_lists %}
+          <option value="" {% if not selected_pricelist_file %}selected{% endif %}>-- Select OCI price list --</option>
+          {% for f in price_list_options %}
             <option value="{{ f }}" {% if f == selected_pricelist_file %}selected{% endif %}>{{ f }}</option>
           {% endfor %}
         </select>
@@ -124,23 +263,23 @@
       </form>
     {% endif %}
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, message in messages %}
-          <div class="flash {{ category }}">{{ message }}</div>
-        {% endfor %}
+    {% for category, message in flash_messages %}
+      {% if category in pricing_flash_categories %}
+        <div class="flash {% if category == 'pricing_error' %}error{% elif category == 'pricing_info' %}info{% else %}success{% endif %}">{{ message }}</div>
       {% endif %}
-    {% endwith %}
+    {% endfor %}
 
-    <form method="post">
+    <form method="post" id="download_pricing_form">
       <input type="hidden" name="action" value="download_pricing" />
       <label for="currency_code">Currency:</label>
       <select id="currency_code" name="currency_code" required>
+        <option value="" {% if not selected_currency %}selected{% endif %}>-- Select currency to download --</option>
         {% for c in currencies %}
           <option value="{{ c }}" {% if c == selected_currency %}selected{% endif %}>{{ c }}</option>
         {% endfor %}
       </select>
-      <button type="submit">Download Latest Price List</button>
+      <button type="submit" id="download_pricing_button">Download Latest Price List</button>
+      <div class="field-hint" id="currency_download_status">Select a currency, then click Download Latest Price List.</div>
     </form>
 
     {% if selected_pricelist_info %}
@@ -162,32 +301,111 @@
       </div>
     {% endif %}
 
-    <h2 style="margin-top: 2rem;">Step 2 - Select RVTools Export File</h2>
-    <p>Select one of the discovered RVTools export files from the <code>rvtools/</code> folder.</p>
+    <h2 id="inventory-source" style="margin-top: 2rem;">Inventory Source</h2>
+    <p>Use an RVTools export, VMwareInventory workbook, or VM-level inventory spreadsheet with VM name, vCPU, RAM, storage, and OS columns.</p>
+    <div class="inventory-catalog-note">
+      <div>
+        <strong>Default inventory catalog</strong>
+        <span>Keep source inventory files in <code>rvtools/</code>. If the same file already exists there, it is selected directly; new files are copied into the catalog.</span>
+      </div>
+      <code>rvtools/</code>
+    </div>
 
-    <form method="post">
-      <input type="hidden" name="action" value="select_rvtools_file" />
-      <label for="rvtools_file">RVTools file:</label>
-      <select id="rvtools_file" name="rvtools_file" required>
-        <option value="">-- Select RVTools export --</option>
-        {% for f in rvtools_files %}
-          <option value="{{ f }}" {% if f == selected_rvtools_file %}selected{% endif %}>{{ f }}</option>
-        {% endfor %}
-      </select>
-      <button type="submit">Select File</button>
+    <form method="post" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="upload_rvtools_file" />
+      <label for="rvtools_upload">Inventory file:</label>
+      <input id="rvtools_upload" name="rvtools_upload" type="file" accept=".xlsx,.xlsm,.csv" required />
+      <button type="submit">Upload & Select</button>
+      <div class="field-hint">Choose an inventory export from your local filesystem. Files already present in <code>rvtools/</code> are reused when the content matches.</div>
     </form>
+
+    {% for category, message in flash_messages %}
+      {% if category in rvtools_flash_categories %}
+        <div class="flash {% if category == 'rvtools_error' %}error{% elif category == 'rvtools_info' %}info{% else %}success{% endif %}">{{ message }}</div>
+      {% endif %}
+    {% endfor %}
+
+    {% if rvtools_rejected_info %}
+      <div class="result">
+        <h3>Input Not Accepted for Sizing</h3>
+        <p><strong>File name:</strong> {{ rvtools_rejected_info.file_name }}</p>
+        <p><strong>Path:</strong> <code>{{ rvtools_rejected_info.file_path }}</code></p>
+        <p><strong>Detected type:</strong> {{ rvtools_rejected_info.category }}</p>
+        <p><strong>Reason:</strong> {{ rvtools_rejected_info.reason }}</p>
+        <p><strong>Recommended use:</strong> {{ rvtools_rejected_info.recommended_use }}</p>
+        <div class="flash info">{{ rvtools_rejected_info.required_input }}</div>
+      </div>
+    {% endif %}
 
     {% if rvtools_file_info %}
       <div class="result">
-        <h3>Selected RVTools File</h3>
+        <h3>Selected VM Inventory File</h3>
         <p><strong>File name:</strong> {{ rvtools_file_info.file_name }}</p>
         <p><strong>Path:</strong> <code>{{ rvtools_file_info.file_path }}</code></p>
         <p><strong>Size (KB):</strong> {{ rvtools_file_info.size_kb }}</p>
+        {% if rvtools_import_summary %}
+          <h4>Import Quality Check</h4>
+          <p><strong>Detected source:</strong> <code>{{ rvtools_import_summary.source }}</code></p>
+          <p>
+            <strong>VMs:</strong> {{ "{:,}".format(rvtools_import_summary.vm_count) }}
+            |
+            <strong>vCPU:</strong> {{ "{:,}".format(rvtools_import_summary.total_vcpus) }}
+            |
+            <strong>RAM:</strong> {{ "{:,}".format(rvtools_import_summary.total_memory_gb) }} GB
+            |
+            <strong>Storage:</strong> {{ "{:,}".format(rvtools_import_summary.total_storage_gb) }} GB
+          </p>
+          {% if rvtools_import_summary.warning_messages %}
+            <div class="flash info">
+              <strong>Review before sizing:</strong>
+              <ul style="margin: .35rem 0 0 1.1rem; padding: 0;">
+                {% for warning in rvtools_import_summary.warning_messages %}
+                  <li>{{ warning }}</li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% else %}
+            <div class="flash success">Inventory quality check passed with no data warnings.</div>
+          {% endif %}
+        {% endif %}
         <p style="margin-top: 1rem;">
-          <a class="btn" href="{{ url_for('step3') }}">Go to Step 3 - Select VMs</a>
+          <a class="btn" href="{{ url_for('step3') }}">Go to Step 2 - Workload Scope</a>
         </p>
       </div>
     {% endif %}
   </div>
+  <script>
+    if (/^#scenario-(paths|native|ocvs|hybrid|price)$/.test(String(window.location.hash || ''))) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
+    const downloadPricingForm = document.getElementById('download_pricing_form');
+    const currencySelect = document.getElementById('currency_code');
+    const currencyStatus = document.getElementById('currency_download_status');
+    const downloadPricingButton = document.getElementById('download_pricing_button');
+
+    if (downloadPricingForm && currencySelect) {
+      const showDownloadProgress = () => {
+        if (currencyStatus && currencySelect.value) {
+          currencyStatus.textContent = `Downloading ${currencySelect.value} price list...`;
+        }
+        if (downloadPricingButton && currencySelect.value) {
+          downloadPricingButton.disabled = true;
+          downloadPricingButton.textContent = 'Downloading...';
+        }
+      };
+
+      currencySelect.addEventListener('change', () => {
+        if (currencyStatus) {
+          currencyStatus.textContent = currencySelect.value
+            ? `${currencySelect.value} selected. Click Download Latest Price List to start.`
+            : 'Select a currency, then click Download Latest Price List.';
+        }
+      });
+      downloadPricingForm.addEventListener('submit', () => {
+        showDownloadProgress();
+      });
+    }
+  </script>
 </body>
 </html>
