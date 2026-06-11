@@ -83,13 +83,13 @@ To stop the app, return to Terminal and press `Ctrl + C`.
 If port `5059` is already in use, choose another port:
 
 ```bash
-MIGRATION_ASSESSMENT_PORT=5060 python app.py
+MIGRATION_ASSESSMENT_PORT=5058 python app.py
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:5060/
+http://127.0.0.1:5058/
 ```
 
 ### Windows
@@ -142,14 +142,14 @@ To stop the app, return to PowerShell and press `Ctrl + C`.
 If port `5059` is already in use, choose another port:
 
 ```powershell
-$env:MIGRATION_ASSESSMENT_PORT="5060"
+$env:MIGRATION_ASSESSMENT_PORT="5058"
 python app.py
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:5060/
+http://127.0.0.1:5058/
 ```
 
 ### Run From an Existing Folder
