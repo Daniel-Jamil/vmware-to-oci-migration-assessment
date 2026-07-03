@@ -1,0 +1,86 @@
+<section class="warning-inbox" aria-labelledby="warning-inbox-title">
+  <div class="warning-inbox__heading">
+    <div>
+      <p class="inventory-review__eyebrow">Inventory quality</p>
+      <h2 id="warning-inbox-title">Warning inbox</h2>
+    </div>
+    <div class="warning-inbox__counts" aria-label="Warning counts">
+      <span class="warning-count warning-count--critical">{{ critical_issue_count }} critical</span>
+      <span class="warning-count warning-count--advisory">{{ advisory_issue_count }} advisory</span>
+    </div>
+  </div>
+
+  <div class="warning-inbox__filters" aria-label="Filter inventory by warning">
+    <button type="button" class="warning-filter is-active" data-warning-filter="all" aria-pressed="true">
+      All inventory
+    </button>
+    {% for issue in inventory_issues %}
+      <button
+        type="button"
+        class="warning-filter warning-filter--{{ issue.severity }}"
+        data-warning-filter="{{ issue.id }}"
+        aria-pressed="false"
+      >
+        {{ issue.title }} <span>{{ issue.count }}</span>
+      </button>
+    {% endfor %}
+  </div>
+
+  {% if inventory_issues %}
+    <div class="warning-inbox__items">
+      {% for issue in inventory_issues %}
+        <article class="warning-item warning-item--{{ issue.severity }}" data-warning-item="{{ issue.id }}">
+          <header class="warning-item__header">
+            <div>
+              <span class="warning-item__severity">{{ issue.severity|capitalize }}</span>
+              <h3>{{ issue.title }}</h3>
+              {% if issue.id == "duplicate-vm-name" %}<span class="visually-hidden">Duplicate VM rows:</span>{% endif %}
+            </div>
+            <strong>{{ issue.count }} affected VM{% if issue.count != 1 %}s{% endif %}</strong>
+          </header>
+          <p>{{ issue.detail }}</p>
+          <dl class="warning-item__treatment">
+            <div><dt>Reason</dt><dd>{{ issue.vm_rows[0].reason }}</dd></div>
+            <div><dt>Recommended treatment</dt><dd>{{ issue.vm_rows[0].recommendation }}</dd></div>
+            <div><dt>Action</dt><dd>{{ issue.default_action }}</dd></div>
+          </dl>
+          <details class="warning-item__affected">
+            <summary>Affected VMs and detected values</summary>
+            <ul>
+              {% for row in issue.vm_rows %}
+                <li>
+                  <strong>{{ row.vm_name }}</strong>
+                  <span><b>Detected value:</b> {{ row.detected_value }}</span>
+                  <span><b>Reason:</b> {{ row.reason }}</span>
+                  <span><b>Recommended treatment:</b> {{ row.recommendation }}</span>
+                  <span><b>Action:</b> {{ row.action }}</span>
+                </li>
+              {% endfor %}
+            </ul>
+            {% if issue.hidden_count %}
+              <p>{{ issue.hidden_count }} additional affected VM{% if issue.hidden_count != 1 %}s{% endif %}.</p>
+            {% endif %}
+          </details>
+          {% if issue.severity == "advisory" %}
+            <label class="warning-item__acknowledgment" for="warning-ack-{{ loop.index0 }}">
+              <input
+                id="warning-ack-{{ loop.index0 }}"
+                name="acknowledged_warning_ids"
+                type="checkbox"
+                value="{{ issue.id }}"
+                {% if issue.id in acknowledged_warning_ids %}checked{% endif %}
+              />
+              <span>I reviewed the affected VMs and treatment.</span>
+            </label>
+          {% else %}
+            <a class="warning-item__remediation" href="{{ url_for('index') }}#inventory-source">
+              Correct in Setup or source inventory
+            </a>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="warning-inbox__clear">No inventory warnings detected.</p>
+  {% endif %}
+</section>

@@ -33,6 +33,7 @@ XLSX_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.xlsx"
 XLSM_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.xlsm"
 MOB_ID_INVENTORY = app_module.RVTOOLS_DIR / "mob_id_inventory.xlsx"
 DUPLICATE_INVENTORY = app_module.RVTOOLS_DIR / "duplicate_inventory.csv"
+INVENTORY_REVIEW_INVENTORY = app_module.RVTOOLS_DIR / "inventory_review.csv"
 OFFICE_LOCK_INVENTORY = app_module.RVTOOLS_DIR / "~$regression_inventory.xlsx"
 REJECTED_INPUT = app_module.RVTOOLS_DIR / "not_vm_inventory.csv"
 EXPECTED_VM_COUNT = 4
@@ -237,6 +238,17 @@ def create_regression_fixtures() -> None:
     ]
     DUPLICATE_INVENTORY.write_text(
         "\n".join(",".join(value for value in row) for row in duplicate_rows) + "\n",
+        encoding="utf-8",
+    )
+    inventory_review_rows = [
+        ["VM", "Powerstate", "Template", "OS according to the configuration file", "CPUs", "Memory", "Provisioned MiB"],
+        ["review-supported", "poweredOn", "False", "Microsoft Windows Server 2019 (64-bit)", "4", "8192", "102400"],
+        ["review-unsupported", "poweredOff", "False", "Microsoft Windows Server 2008 (64-bit)", "2", "4096", "51200"],
+        ["review-unknown", "poweredOn", "False", "Unknown", "2", "4096", "20480"],
+        ["review-critical", "poweredOn", "False", "Ubuntu Linux (64-bit)", "2", "4096", "0"],
+    ]
+    INVENTORY_REVIEW_INVENTORY.write_text(
+        "\n".join(",".join(value for value in row) for row in inventory_review_rows) + "\n",
         encoding="utf-8",
     )
     xlsx_bytes = app_module._build_xlsx_workbook_bytes(
@@ -1989,6 +2001,243 @@ def validate_step3_duplicate_removal() -> None:
         )
 
 
+def validate_guided_inventory_review() -> None:
+    rows, _ = app_module.load_vms_from_vinfo(str(INVENTORY_REVIEW_INVENTORY))
+    vm_names = [str(row["name"]) for row in rows]
+    issues = app_module.build_inventory_review_issues(rows)
+    issues_by_id = {str(issue.get("id")): issue for issue in issues}
+    expected_issue_fields = {
+        "id",
+        "title",
+        "detail",
+        "severity",
+        "count",
+        "default_action",
+        "vm_names",
+        "vm_rows",
+        "hidden_count",
+    }
+    check(
+        "inventory review issue contract and severities",
+        all(expected_issue_fields.issubset(issue) for issue in issues)
+        and issues_by_id.get("unsupported-native", {}).get("severity") == "advisory"
+        and issues_by_id.get("unknown-os", {}).get("severity") == "advisory"
+        and issues_by_id.get("missing-storage", {}).get("severity") == "critical",
+        str(issues),
+    )
+
+    state_id = f"guided_inventory_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = ["review-critical"]
+        state["step4_hybrid_placements"] = {
+            "review-critical": "native",
+            "removed-stale-vm": "ocvs",
+        }
+        state["acknowledged_warning_ids"] = ["stale-warning"]
+        app_module.save_app_state(state)
+
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(INVENTORY_REVIEW_INVENTORY)
+
+        response = client.post(
+            "/step3",
+            data=MultiDict(
+                [
+                    ("action", "save_inventory_review"),
+                    ("included_vm_names", "review-unknown"),
+                    ("included_vm_names", "not-in-inventory"),
+                    ("included_vm_names", "review-unsupported"),
+                    ("included_vm_names", "review-supported"),
+                    ("acknowledged_warning_ids", "unknown-os"),
+                    ("acknowledged_warning_ids", "unsupported-native"),
+                    ("acknowledged_warning_ids", "missing-storage"),
+                    ("acknowledged_warning_ids", "stale-warning"),
+                ]
+            ),
+        )
+        state = app_module.load_app_state()
+
+        check(
+            "inventory review replaces selected names in source order",
+            response.status_code == 200
+            and state.get("selected_vm_names")
+            == ["review-supported", "review-unsupported", "review-unknown"],
+            str(state.get("selected_vm_names")),
+        )
+        check(
+            "inventory review placements persist for included names only",
+            set(state.get("step4_hybrid_placements", {}))
+            == {"review-supported", "review-unsupported", "review-unknown"},
+            str(state.get("step4_hybrid_placements")),
+        )
+        check(
+            "inventory review placement defaults follow support state",
+            state.get("step4_hybrid_placements")
+            == {
+                "review-supported": "native",
+                "review-unsupported": "ocvs",
+                "review-unknown": "review",
+            },
+            str(state.get("step4_hybrid_placements")),
+        )
+        check(
+            "inventory review keeps current advisory acknowledgments only",
+            state.get("acknowledged_warning_ids") == ["unsupported-native", "unknown-os"],
+            str(state.get("acknowledged_warning_ids")),
+        )
+        check(
+            "inventory review never acknowledges critical warnings",
+            "missing-storage" not in state.get("acknowledged_warning_ids", []),
+            str(state.get("acknowledged_warning_ids")),
+        )
+
+        html = response.data.decode("utf-8", errors="replace")
+        check(
+            "Stage 2 renders one guided inventory control tree",
+            html.count("<table") == 1
+            and html.count('name="included_vm_names"') == len(rows)
+            and html.count('class="inventory-row-details"') == len(rows)
+            and 'id="inventory-include-0"' in html
+            and 'id="inventory-placement-0"' in html
+            and 'id="inventory-search"' in html
+            and 'id="inventory-support-filter"' in html
+            and 'id="inventory-power-filter"' in html
+            and 'id="inventory-placement-filter"' in html
+            and 'id="inventory-bulk-placement"' in html
+            and 'data-select-all' in html
+            and 'name="included_vm_names" type="checkbox"' in html
+            and 'aria-sort="none"' in html
+            and 'data-warning-filter="unsupported-native"' in html
+            and 'id="inventory-undo"' in html
+            and 'aria-live="polite"' in html,
+        )
+        check(
+            "Stage 2 removes legacy transfer and unsupported-image controls",
+            "Available VMs (Left)" not in html
+            and "Selected VMs (Right)" not in html
+            and "remove_unsupported" not in html
+            and "Remove all non OS supported images" not in html
+            and "removable images" not in html.lower(),
+        )
+        check(
+            "Stage 2 mobile details do not duplicate form controls",
+            html.count('name="included_vm_names"') == len(rows)
+            and len(re.findall(r'name="placement:[^"]+"', html)) == len(rows)
+            and len(re.findall(r'id="inventory-include-[0-9]+"', html)) == len(rows)
+            and len(re.findall(r'id="inventory-placement-[0-9]+"', html)) == len(rows)
+            and all(f'id="{vm_name}"' not in html for vm_name in vm_names),
+        )
+        check(
+            "warning filtering exposes affected VM treatment details",
+            "review-unsupported" in html
+            and "Detected value" in html
+            and "Reason" in html
+            and "Recommended treatment" in html
+            and "Action" in html
+            and "Affected VMs" in html,
+        )
+
+    def inventory_client(inventory_path: Path) -> tuple[object, str]:
+        local_client = app_module.app.test_client()
+        local_state_id = f"guided_continue_{uuid4().hex}"
+        with local_client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = local_state_id
+            sess["selected_rvtools_file"] = str(inventory_path)
+        return local_client, local_state_id
+
+    client, _ = inventory_client(CSV_INVENTORY)
+    response = client.post(
+        "/step3",
+        data={"action": "save_inventory_review", "continue_to_scenarios": "1"},
+    )
+    check(
+        "inventory review continue requires an included VM",
+        response.status_code == 200 and b"Include at least one VM" in response.data,
+        f"status={response.status_code}",
+    )
+
+    client, _ = inventory_client(INVENTORY_REVIEW_INVENTORY)
+    response = client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "save_inventory_review"),
+                ("continue_to_scenarios", "1"),
+                ("included_vm_names", "review-supported"),
+                ("acknowledged_warning_ids", "unsupported-native"),
+                ("acknowledged_warning_ids", "unknown-os"),
+            ]
+        ),
+    )
+    check(
+        "inventory review continue blocks critical issues",
+        response.status_code == 200 and b"Resolve critical inventory issues" in response.data,
+        f"status={response.status_code}",
+    )
+
+    client, _ = inventory_client(CSV_INVENTORY)
+    response = client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "save_inventory_review"),
+                ("continue_to_scenarios", "1"),
+                ("included_vm_names", "vm-app-01"),
+            ]
+        ),
+    )
+    check(
+        "inventory review continue requires advisory acknowledgments",
+        response.status_code == 200 and b"Acknowledge advisory warnings" in response.data,
+        f"status={response.status_code}",
+    )
+
+    client, _ = inventory_client(CSV_INVENTORY)
+    response = client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "save_inventory_review"),
+                ("continue_to_scenarios", "1"),
+                ("included_vm_names", "vm-app-01"),
+                ("acknowledged_warning_ids", "unsupported-native"),
+                ("placement:vm-app-01", "elsewhere"),
+            ]
+        ),
+    )
+    check(
+        "inventory review continue requires valid included placements",
+        response.status_code == 200 and b"Choose a valid placement" in response.data,
+        f"status={response.status_code}",
+    )
+
+    client, _ = inventory_client(CSV_INVENTORY)
+    response = client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "save_inventory_review"),
+                ("continue_to_scenarios", "1"),
+                ("included_vm_names", "vm-app-01"),
+                ("acknowledged_warning_ids", "unsupported-native"),
+                ("placement:vm-app-01", "native"),
+            ]
+        ),
+    )
+    check(
+        "inventory review continue redirects only when ready",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step4?tab=native"),
+        f"status={response.status_code}, location={response.headers.get('Location')}",
+    )
+
+
 def validate_manual_sizing_input() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
@@ -2967,6 +3216,7 @@ def main() -> None:
     validate_app_state_review_inputs()
     validate_saved_assessments()
     validate_step3_duplicate_removal()
+    validate_guided_inventory_review()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)
     validate_workbook(workbook_path)

@@ -1,533 +1,119 @@
 {% extends "base.html" %}
 {% block title %}VMware to OCI Migration Assessment - Inventory Review{% endblock %}
 {% block head %}
-  <style>
-    :root {
-      --bg: #f4f5f7;
-      --panel: #ffffff;
-      --text: #121417;
-      --muted: #5f6672;
-      --line: #d9dde3;
-      --line-strong: #c8cdd6;
-      --accent: #0f62fe;
-      --accent-2: #0043ce;
-      --danger: #b42318;
-    }
-    * { box-sizing: border-box; }
-    body { font-family: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif; margin: 0; background: var(--bg); color: var(--text); letter-spacing: .01em; font-size: 14px; }
-    .container { width: 100%; margin: 0; background: var(--panel); padding: 1rem 1.25rem; min-height: 100vh; }
-    .meta { background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 0; padding: .6rem .75rem; margin-bottom: .75rem; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
-    .grid > .card { border-radius: 0; }
-    h1, h2, h3 { margin-top: 0; }
-    h1 { font-size: 1.55rem; margin-bottom: .75rem; }
-    h3 { font-size: .98rem; }
-    table { width: 100%; border-collapse: collapse; font-size: .92rem; table-layout: fixed; }
-    th, td { border: 1px solid var(--line); padding: .45rem .5rem; text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
-    th { background: #f2f4f8; font-weight: 600; }
-    th.sortable { cursor: pointer; user-select: none; position: relative; padding-right: 1.35rem; }
-    th.sortable::after {
-      content: "⇅";
-      position: absolute;
-      top: .35rem;
-      right: .35rem;
-      font-size: .8em;
-      color: var(--muted);
-      line-height: 1;
-    }
-    th.sort-asc::after { content: "▲"; color: var(--accent); }
-    th.sort-desc::after { content: "▼"; color: var(--accent); }
-    .card { border: 1px solid var(--line); border-radius: 0; padding: .6rem; background: #fff; min-width: 0; overflow: hidden; }
-    .wizard-steps {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(150px, 1fr));
-      gap: .45rem;
-      margin: 0 0 .9rem;
-    }
-    .wizard-step {
-      display: block;
-      border: 1px solid var(--line);
-      border-left: 4px solid var(--line-strong);
-      background: #fff;
-      color: var(--muted);
-      padding: .5rem .6rem;
-      text-decoration: none;
-      min-width: 0;
-    }
-    .wizard-step strong {
-      display: block;
-      color: var(--text);
-      font-size: .76rem;
-      text-transform: uppercase;
-      letter-spacing: .04em;
-      margin-bottom: .16rem;
-    }
-    .wizard-step span {
-      display: block;
-      font-weight: 700;
-      color: var(--text);
-    }
-    .wizard-step small {
-      display: block;
-      color: var(--muted);
-      margin-top: .12rem;
-      line-height: 1.3;
-    }
-    .wizard-step.is-current {
-      border-left-color: var(--accent);
-      background: #eef4ff;
-      border-color: #bfd1ff;
-    }
-    .wizard-step.is-disabled {
-      opacity: .72;
-    }
-    .actions { margin-top: .6rem; display:flex; gap:.5rem; }
-    .inline-form { margin: 0; }
-    .vm-cell { display: flex; align-items: center; gap: .45rem; }
-    .move-btn {
-      width: 28px;
-      height: 28px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      border-radius: 999px;
-      box-shadow: 0 1px 3px rgba(0,0,0,.2);
-    }
-    .move-btn svg { width: 14px; height: 14px; fill: #fff; }
-    .select-col { width: 70px; white-space: nowrap; }
-    .power-col { width: 84px; white-space: nowrap; }
-    .cpu-col { width: 72px; white-space: nowrap; }
-    .mem-col { width: 95px; white-space: nowrap; }
-    .selectable-row { cursor: pointer; }
-    .selectable-row.is-selected { background: #e8f0ff; }
-    .selection-marker { font-weight: bold; color: var(--accent); }
-    button { cursor: pointer; background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 0; padding: .38rem .6rem; font-weight: 600; font-size: .9rem; line-height: 1.2; }
-    button:hover { background: var(--accent-2); border-color: var(--accent-2); }
-    .remove { background: var(--danger); border-color: var(--danger); }
-    .top-actions {
-      margin-bottom: .75rem;
-      display: flex;
-      gap: .75rem;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      border: 1px solid var(--line);
-      border-left: 4px solid var(--accent);
-      background: #fbfcfe;
-      padding: .65rem .75rem;
-    }
-    .wizard-action-copy { min-width: 240px; }
-    .wizard-action-copy strong {
-      display: block;
-      font-size: .78rem;
-      text-transform: uppercase;
-      letter-spacing: .04em;
-      color: var(--accent);
-      margin-bottom: .12rem;
-    }
-    .wizard-action-copy span {
-      display: block;
-      color: var(--muted);
-      font-size: .86rem;
-      line-height: 1.35;
-    }
-    .wizard-action-controls {
-      display: flex;
-      gap: .45rem;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-      margin-left: auto;
-    }
-    a {
-      color: var(--accent);
-      text-decoration: none;
-      border-bottom: 1px solid transparent;
-      transition: border-color .15s ease;
-    }
-    a:hover { border-bottom-color: var(--accent); }
-    a.btn { display:inline-flex; align-items:center; background:#fff; color:var(--text); text-decoration:none; padding:.38rem .6rem; border:1px solid var(--line-strong); border-radius:0; font-weight:600; line-height: 1.2; }
-    a.btn:hover { color: var(--accent); border-color: var(--accent); }
-    .top-actions form { margin: 0; }
-    .top-actions button.primary-action { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .top-actions button.primary-action:hover { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
-    .flash { padding: .55rem .7rem; border-radius: 0; margin-bottom: .7rem; border: 1px solid; }
-    .flash.success { background: #e9f8ef; color: #136b2f; border-color: #acdcb8; }
-    .flash.error { background: #ffefef; color: #912828; border-color: #f1b7b7; }
-    .flash.info { background: #eef4ff; color: #174ea6; border-color: #bfd1ff; }
-    code { background: #eff2f5; padding: 0.1rem 0.35rem; border-radius: 2px; }
-    @media (max-width: 980px) {
-      .wizard-steps { grid-template-columns: 1fr; }
-      .grid { grid-template-columns: 1fr; }
-      .wizard-action-controls { width: 100%; justify-content: stretch; }
-      .wizard-action-controls .btn,
-      .wizard-action-controls form,
-      .wizard-action-controls button { width: 100%; }
-    }
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/inventory-review.css') }}" />
 {% endblock %}
 {% block stage_content %}
-  <div class="container">
-    <div class="top-actions">
-      <div class="wizard-action-controls">
-        <form method="post" id="continue_step4_form">
-          <input type="hidden" name="action" value="add" />
-          <input type="hidden" name="redirect_to" value="step4" />
-          <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-          <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-          <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-          <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-          <button class="primary-action" type="submit">Save & Continue to Step 3 - Migration Paths</button>
-        </form>
+  <section class="inventory-review" aria-labelledby="inventory-review-title">
+    <header class="inventory-review__heading">
+      <div>
+        <p class="inventory-review__eyebrow">Workload scope and initial placement</p>
+        <h1 id="inventory-review-title">Inventory Review</h1>
       </div>
-    </div>
+      <span class="inventory-review__selection-status" data-selection-status>
+        {{ selected_vm_count }} of {{ inventory_summary.vm_count }} included
+      </span>
+    </header>
 
-    <div class="meta">
-      <p><strong>Selected inventory file:</strong> <code>{{ selected_rvtools_file }}</code></p>
-      <p><strong>Inventory source:</strong> <code>{{ source_vinfo_csv }}</code></p>
-    </div>
+    <dl class="inventory-summary" aria-label="Inventory summary">
+      <div><dt>VMs</dt><dd>{{ "{:,}".format(inventory_summary.vm_count) }}</dd></div>
+      <div><dt>vCPU</dt><dd>{{ "{:,}".format(inventory_summary.total_vcpus) }}</dd></div>
+      <div><dt>RAM</dt><dd>{{ inventory_summary.total_memory }}</dd></div>
+      <div><dt>Storage</dt><dd>{{ "{:,}".format(inventory_summary.total_storage_gb) }} GB</dd></div>
+      <div><dt>Powered on</dt><dd>{{ "{:,}".format(inventory_summary.powered_on_count) }}</dd></div>
+      <div><dt>Native-supported</dt><dd>{{ "{:,}".format(inventory_summary.native_supported_count) }}</dd></div>
+      <div><dt>Review</dt><dd>{{ "{:,}".format(inventory_summary.review_count) }}</dd></div>
+    </dl>
 
-    <div class="grid">
-      <div class="card">
-        <h3>Available VMs (Left)</h3>
-        <div class="actions">
-          <form method="post" id="available_selected_form" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            <button type="submit" name="action" value="add">Add selected VMs</button>
-          </form>
-          <form method="post" id="available_bulk_form" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            {% for vm in available_vms %}
-              <input type="hidden" name="vm_names" value="{{ vm.name }}" />
-            {% endfor %}
-            <button type="submit" name="action" value="add">Add all filtered</button>
-          </form>
+    <form method="post" id="continue_step4_form" class="inventory-review__form" novalidate>
+      <input type="hidden" name="action" value="save_inventory_review" />
+
+      {% if inventory_errors %}
+        <div class="inventory-error-summary" id="inventory-errors" role="alert" tabindex="-1">
+          <h2>Review the highlighted inventory items</h2>
+          <ul>
+            {% for error in inventory_errors %}<li>{{ error }}</li>{% endfor %}
+          </ul>
         </div>
-        <p><strong>Total VMs:</strong> {{ available_summary.total_vms }} | <strong>Total CPUs:</strong> {{ available_summary.total_cpus }} | <strong>Total Memory:</strong> {{ available_summary.total_memory_display }}</p>
-        <table class="sortable-table" data-table-name="available">
-          <thead>
-            <tr>
-              <th class="select-col sortable" data-sort-type="text">Select</th>
-              <th class="power-col sortable" data-sort-type="text">
-                <div>Power</div>
-                <form method="get" style="margin-top: .35rem;">
-                  <select id="available_power_filter" name="available_power_filter" onchange="this.form.submit()" style="width: 100%;">
-                    <option value="ALL" {% if available_power_filter == 'ALL' %}selected{% endif %}>All</option>
-                    {% for power_state in available_power_options %}
-                      <option value="{{ power_state }}" {% if available_power_filter == power_state %}selected{% endif %}>{{ power_state }}</option>
-                    {% endfor %}
-                  </select>
-                  <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-                  <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-                  <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-                </form>
-              </th>
-              <th class="sortable" data-sort-type="text">VM Name</th>
-              <th class="sortable" data-sort-type="text">
-                <div>OS (Full version)</div>
-                <form method="get" style="margin-top: .35rem;">
-                  <select id="available_os_filter" name="available_os_filter" onchange="this.form.submit()" style="width: 100%;">
-                    <option value="ALL" {% if available_os_filter == 'ALL' %}selected{% endif %}>All OS</option>
-                    {% for os_name in available_os_options %}
-                      <option value="{{ os_name }}" {% if os_name == available_os_filter %}selected{% endif %}>{{ os_name }}</option>
-                    {% endfor %}
-                  </select>
-                  <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-                  <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-                  <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-                </form>
-              </th>
-              <th class="cpu-col sortable" data-sort-type="number">CPUs</th>
-              <th class="mem-col sortable" data-sort-type="number">Memory (MB)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for vm in available_vms %}
-              <tr class="selectable-row" data-vm-name="{{ vm.name }}" data-row-index="{{ loop.index0 }}" data-table="available">
-                <td class="selection-marker">&nbsp;</td>
-                <td>{{ vm.power_state }}</td>
-                <td>
-                  <div class="vm-cell">
-                    <form method="post" class="inline-form">
-                      <input type="hidden" name="action" value="add" />
-                      <input type="hidden" name="vm_name" value="{{ vm.name }}" />
-                      <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-                      <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-                      <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-                      <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-                      <button class="move-btn" type="submit" title="Move to selected" aria-label="Move to selected">
-                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                          <path d="M9.29 6.71a1 1 0 0 1 1.42 0l4.59 4.59a1 1 0 0 1 0 1.41l-4.59 4.59a1 1 0 0 1-1.42-1.41L13.17 12 9.29 8.12a1 1 0 0 1 0-1.41z"/>
-                        </svg>
-                      </button>
-                    </form>
-                    <span>{{ vm.name }}</span>
-                  </div>
-                </td>
-                <td>{{ vm.raw_os }}</td>
-                <td>{{ vm.cpus }}</td>
-                <td>{{ vm.memory_mb }}</td>
-              </tr>
-            {% else %}
-              <tr><td colspan="6">No available VMs.</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
+      {% endif %}
 
-      <div class="card">
-        <h3>Selected VMs (Right)</h3>
-        <div class="actions">
-          <form method="post" id="selected_selected_form" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            <button class="remove" type="submit" name="action" value="remove">Remove selected VMs</button>
-          </form>
-          <form method="post" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            <button class="remove" type="submit" name="action" value="remove_unsupported">Remove all non OS supported images</button>
-          </form>
-          <form method="post" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            <button class="remove" type="submit" name="action" value="remove_duplicates" title="Keep the first occurrence of each VM name and remove later duplicate rows from the selected workload.">Remove duplicate VM names</button>
-          </form>
-          <form method="post" id="selected_bulk_form" class="inline-form">
-            <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-            <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-            <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-            <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-            {% for vm in selected_vms %}
-              <input type="hidden" name="vm_names" value="{{ vm.name }}" />
-            {% endfor %}
-            <button class="remove" type="submit" name="action" value="remove">Remove all filtered</button>
-          </form>
+      {% include "_warning_inbox.html" %}
+
+      <section class="inventory-toolbar" aria-label="Inventory filters and bulk actions">
+        <div class="inventory-toolbar__filters">
+          <label class="inventory-field inventory-field--search" for="inventory-search">
+            <span>Search inventory</span>
+            <input id="inventory-search" type="search" autocomplete="off" placeholder="VM name or operating system" />
+          </label>
+          <label class="inventory-field" for="inventory-support-filter">
+            <span>Native support</span>
+            <select id="inventory-support-filter">
+              <option value="all">All support states</option>
+              <option value="supported">Supported</option>
+              <option value="unsupported">Requires remediation</option>
+              <option value="review">Review</option>
+            </select>
+          </label>
+          <label class="inventory-field" for="inventory-power-filter">
+            <span>Power</span>
+            <select id="inventory-power-filter">
+              <option value="all">All power states</option>
+              <option value="on">Powered on</option>
+              <option value="off">Powered off</option>
+              <option value="unknown">Unknown</option>
+            </select>
+          </label>
+          <label class="inventory-field" for="inventory-placement-filter">
+            <span>Placement</span>
+            <select id="inventory-placement-filter">
+              <option value="all">All placements</option>
+              <option value="native">OCI Native</option>
+              <option value="ocvs">OCVS</option>
+              <option value="review">Review</option>
+            </select>
+          </label>
         </div>
-        <p><strong>Total VMs:</strong> {{ selected_summary.total_vms }} | <strong>Total CPUs:</strong> {{ selected_summary.total_cpus }} | <strong>Total Memory:</strong> {{ selected_summary.total_memory_display }}{% if selected_summary.duplicate_row_count %} | <strong>Duplicate VM rows:</strong> {{ selected_summary.duplicate_row_count }}{% endif %}</p>
-        <table class="sortable-table" data-table-name="selected">
-          <thead>
-            <tr>
-              <th class="select-col sortable" data-sort-type="text">Select</th>
-              <th class="power-col sortable" data-sort-type="text">
-                <div>Power</div>
-                <form method="get" style="margin-top: .35rem;">
-                  <select id="selected_power_filter" name="selected_power_filter" onchange="this.form.submit()" style="width: 100%;">
-                    <option value="ALL" {% if selected_power_filter == 'ALL' %}selected{% endif %}>All</option>
-                    {% for power_state in selected_power_options %}
-                      <option value="{{ power_state }}" {% if selected_power_filter == power_state %}selected{% endif %}>{{ power_state }}</option>
-                    {% endfor %}
-                  </select>
-                  <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-                  <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-                  <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-                </form>
-              </th>
-              <th class="sortable" data-sort-type="text">VM Name</th>
-              <th class="sortable" data-sort-type="text">
-                <div>OS (Full version)</div>
-                <form method="get" style="margin-top: .35rem;">
-                  <select id="selected_os_filter" name="selected_os_filter" onchange="this.form.submit()" style="width: 100%;">
-                    <option value="ALL" {% if selected_os_filter == 'ALL' %}selected{% endif %}>All OS</option>
-                    {% for os_name in selected_os_options %}
-                      <option value="{{ os_name }}" {% if os_name == selected_os_filter %}selected{% endif %}>{{ os_name }}</option>
-                    {% endfor %}
-                  </select>
-                  <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-                  <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-                  <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-                </form>
-              </th>
-              <th class="cpu-col sortable" data-sort-type="number">CPUs</th>
-              <th class="mem-col sortable" data-sort-type="number">Memory (MB)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for vm in selected_vms %}
-              <tr class="selectable-row" data-vm-name="{{ vm.name }}" data-row-index="{{ loop.index0 }}" data-table="selected">
-                <td class="selection-marker">&nbsp;</td>
-                <td>{{ vm.power_state }}</td>
-                <td>
-                  <div class="vm-cell">
-                    <form method="post" class="inline-form">
-                      <input type="hidden" name="action" value="remove" />
-                      <input type="hidden" name="vm_name" value="{{ vm.name }}" />
-                      <input type="hidden" name="available_os_filter" value="{{ available_os_filter }}" />
-                      <input type="hidden" name="selected_os_filter" value="{{ selected_os_filter }}" />
-                      <input type="hidden" name="available_power_filter" value="{{ available_power_filter }}" />
-                      <input type="hidden" name="selected_power_filter" value="{{ selected_power_filter }}" />
-                      <button class="remove move-btn" type="submit" title="Move to available" aria-label="Move to available">
-                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                          <path d="M14.71 6.71a1 1 0 0 0-1.42 0L8.7 11.3a1 1 0 0 0 0 1.41l4.59 4.59a1 1 0 1 0 1.42-1.41L10.83 12l3.88-3.88a1 1 0 0 0 0-1.41z"/>
-                        </svg>
-                      </button>
-                    </form>
-                    <span>{{ vm.name }}</span>
-                  </div>
-                </td>
-                <td>{{ vm.raw_os }}</td>
-                <td>{{ vm.cpus }}</td>
-                <td>{{ vm.memory_mb }}</td>
-              </tr>
-            {% else %}
-              <tr><td colspan="6">No selected VMs yet.</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
+
+        <div class="inventory-toolbar__commands">
+          <div class="inventory-command-group" aria-label="Inclusion commands">
+            <button type="button" class="inventory-button inventory-button--secondary" data-select-all>Select All</button>
+            <button type="button" class="inventory-button inventory-button--secondary" data-include-filtered>Include filtered</button>
+            <button type="button" class="inventory-button inventory-button--secondary" data-exclude-filtered>Exclude filtered</button>
+          </div>
+          <div class="inventory-command-group inventory-command-group--placement">
+            <label class="inventory-field" for="inventory-bulk-placement">
+              <span>Bulk placement</span>
+              <select id="inventory-bulk-placement">
+                <option value="">Choose placement</option>
+                <option value="native">OCI Native</option>
+                <option value="ocvs">OCVS</option>
+                <option value="review">Review</option>
+              </select>
+            </label>
+            <button type="button" class="inventory-button inventory-button--secondary" data-apply-placement>Apply</button>
+          </div>
+        </div>
+        <output id="inventory-bulk-scope" class="inventory-toolbar__scope" aria-live="polite">
+          Bulk scope: all {{ inventory_summary.vm_count }} loaded VMs.
+        </output>
+      </section>
+
+      {% include "_inventory_table.html" %}
+
+      <div class="inventory-review__actions">
+        <a class="inventory-button inventory-button--secondary" href="{{ url_for('index') }}">Back to Setup</a>
+        <button class="inventory-button inventory-button--primary" type="submit" name="continue_to_scenarios" value="1">
+          Save & Continue
+        </button>
       </div>
+    </form>
+
+    <div id="inventory-undo" class="inventory-undo" role="status" aria-live="polite" hidden>
+      <span data-undo-message></span>
+      <button type="button" class="inventory-undo__button" data-undo>Undo</button>
     </div>
-  </div>
+  </section>
 {% endblock %}
 {% block scripts %}
-  <script>
-    (function () {
-      const tableState = {
-        available: { selected: new Set(), lastClickedIndex: null, formId: "available_selected_form" },
-        selected: { selected: new Set(), lastClickedIndex: null, formId: "selected_selected_form" },
-      };
-
-      function clearHiddenVmNames(form) {
-        form.querySelectorAll('input[name="vm_names"]').forEach((el) => el.remove());
-      }
-
-      function appendVmNames(form, names) {
-        names.forEach((vmName) => {
-          const input = document.createElement('input');
-          input.type = 'hidden';
-          input.name = 'vm_names';
-          input.value = vmName;
-          form.appendChild(input);
-        });
-      }
-
-      function updateRowVisual(row, selected) {
-        const marker = row.querySelector('.selection-marker');
-        row.classList.toggle('is-selected', selected);
-        if (marker) marker.textContent = selected ? '✓' : '';
-      }
-
-      function getRowsInCurrentOrder(tableName) {
-        return Array.from(document.querySelectorAll(`tr.selectable-row[data-table="${tableName}"]`));
-      }
-
-      function applyRangeSelection(state, rows, start, end, add) {
-        const from = Math.min(start, end);
-        const to = Math.max(start, end);
-        for (let i = from; i <= to; i += 1) {
-          const row = rows[i];
-          if (!row) continue;
-          const vmName = row.dataset.vmName;
-          if (!vmName) continue;
-          if (add) state.selected.add(vmName);
-          else state.selected.delete(vmName);
-          updateRowVisual(row, state.selected.has(vmName));
-        }
-      }
-
-      Object.keys(tableState).forEach((tableName) => {
-        const state = tableState[tableName];
-        const initialRows = getRowsInCurrentOrder(tableName);
-
-        initialRows.forEach((row) => {
-          row.addEventListener('click', (event) => {
-            if (event.target.closest('form,button,input,select,a')) return;
-
-            const rows = getRowsInCurrentOrder(tableName);
-            const idx = rows.indexOf(row);
-            if (idx === -1) return;
-
-            const vmName = row.dataset.vmName;
-            if (!vmName) return;
-
-            const isSelected = state.selected.has(vmName);
-            const shouldAdd = !isSelected;
-
-            if (event.shiftKey && state.lastClickedIndex !== null) {
-              applyRangeSelection(state, rows, state.lastClickedIndex, idx, shouldAdd);
-            } else {
-              if (shouldAdd) state.selected.add(vmName);
-              else state.selected.delete(vmName);
-              updateRowVisual(row, state.selected.has(vmName));
-            }
-
-            state.lastClickedIndex = idx;
-          });
-        });
-
-        const form = document.getElementById(state.formId);
-        if (!form) return;
-
-        form.addEventListener('submit', (event) => {
-          clearHiddenVmNames(form);
-
-          if (!state.selected.size) {
-            event.preventDefault();
-            alert('No VMs selected. Click rows (Shift+Click for range) and try again.');
-            return;
-          }
-
-          appendVmNames(form, state.selected);
-        });
-      });
-
-      const continueForm = document.getElementById('continue_step4_form');
-      if (continueForm) {
-        continueForm.addEventListener('submit', () => {
-          clearHiddenVmNames(continueForm);
-          appendVmNames(continueForm, tableState.available.selected);
-        });
-      }
-
-      document.querySelectorAll('.sortable-table').forEach((table) => {
-        const headers = Array.from(table.querySelectorAll('thead th.sortable'));
-        const tbody = table.querySelector('tbody');
-        if (!tbody) return;
-
-        headers.forEach((header, colIndex) => {
-          header.addEventListener('click', (event) => {
-            if (event.target.closest('form,select,button,input,a')) return;
-
-            const sortType = header.dataset.sortType || 'text';
-            const isAsc = !header.classList.contains('sort-asc');
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-
-            rows.sort((a, b) => {
-              const aCell = a.children[colIndex];
-              const bCell = b.children[colIndex];
-              const aText = (aCell?.innerText || '').trim();
-              const bText = (bCell?.innerText || '').trim();
-
-              if (sortType === 'number') {
-                const aNum = parseFloat(aText.replace(/,/g, '')) || 0;
-                const bNum = parseFloat(bText.replace(/,/g, '')) || 0;
-                return isAsc ? aNum - bNum : bNum - aNum;
-              }
-
-              return isAsc
-                ? aText.localeCompare(bText, undefined, { numeric: true, sensitivity: 'base' })
-                : bText.localeCompare(aText, undefined, { numeric: true, sensitivity: 'base' });
-            });
-
-            headers.forEach((h) => h.classList.remove('sort-asc', 'sort-desc'));
-            header.classList.add(isAsc ? 'sort-asc' : 'sort-desc');
-
-            rows.forEach((row) => tbody.appendChild(row));
-          });
-        });
-      });
-    })();
-  </script>
+  <script src="{{ url_for('static', filename='js/inventory-review.js') }}" defer></script>
 {% endblock %}

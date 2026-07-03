@@ -162,10 +162,11 @@ BURST_FACTOR_MAP = {
     "12.5%": 0.125,
 }
 OS_LICENSE_VALUES = {"BYOL", "Lic Include"}
-HYBRID_PLACEMENT_VALUES = {"native", "ocvs"}
+HYBRID_PLACEMENT_VALUES = {"native", "ocvs", "review"}
 HYBRID_PLACEMENT_LABELS = {
     "native": "OCI Native",
     "ocvs": "OCVS",
+    "review": "Review",
 }
 HYBRID_PLACEMENT_OPTIONS = [
     {"value": "native", "label": "OCI Native"},
@@ -2248,6 +2249,7 @@ def _inventory_review_row(
         "vm_name": str(row.get("name") or row.get("source_name") or "Unknown VM"),
         "detected_value": detected_value,
         "issue": issue,
+        "reason": issue,
         "recommendation": recommendation,
         "action": action,
     }
@@ -2274,6 +2276,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
                 "severity": severity,
                 "count": len(rows),
                 "default_action": default_action,
+                "vm_names": [row["vm_name"] for row in rows],
                 "vm_rows": rows[:50],
                 "hidden_count": max(0, len(rows) - 50),
             }
@@ -2285,8 +2288,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
             _inventory_review_row(
                 row,
                 str(row.get("raw_os") or "Unknown / Empty"),
-                "Unsupported for OCI Native",
-                "Keep on OCVS, use Hybrid placement, or remediate the guest OS before Native migration.",
+                "Native migration requires a documented remediation treatment",
+                "Keep the VM in scope on OCVS or remediate the guest OS before Native migration.",
                 "Set OCVS",
             )
             for row in vm_rows
@@ -2295,10 +2298,10 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
         add_issue(
             "unsupported-native",
             "Unsupported for OCI Native",
-            "These VMs are not matched to the OCI-supported OS list and should be reviewed before using a Native-only path.",
-            "warning",
+            "These VMs remain in scope but require remediation review before using a Native placement.",
+            "advisory",
             unsupported_rows,
-            "Review affected VMs",
+            "Review Native treatment",
         )
 
     missing_storage_rows = [
@@ -2315,8 +2318,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
     add_issue(
         "missing-storage",
         "Missing storage values",
-        "OCI Native costing applies a minimum block volume size when storage is missing, so review these rows.",
-        "warning",
+        "Storage is required for reliable Native and OCVS sizing. Correct the source values before continuing.",
+        "critical",
         missing_storage_rows,
         "Review storage inputs",
     )
@@ -2336,7 +2339,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
         "missing-cpu",
         "Missing vCPU values",
         "VM rows with missing vCPU values can distort OCI Native and OCVS sizing.",
-        "warning",
+        "critical",
         missing_cpu_rows,
         "Review CPU inputs",
     )
@@ -2356,7 +2359,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
         "missing-memory",
         "Missing RAM values",
         "VM rows with missing RAM values can distort OCI Native and OCVS sizing.",
-        "warning",
+        "critical",
         missing_memory_rows,
         "Review RAM inputs",
     )
@@ -2376,7 +2379,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
         "unknown-os",
         "Unknown OS values",
         "Unknown operating systems require manual review before final target placement.",
-        "warning",
+        "advisory",
         unknown_os_rows,
         "Review OS values",
     )
@@ -2391,8 +2394,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
             row,
             str(row.get("source_name") or row.get("name") or "Unknown VM"),
             "Duplicate VM name",
-            "Keep the intended row or remove duplicate VM names in Workload Scope.",
-            "Review duplicate",
+            "Reconcile the source records and keep the intended workload row in scope.",
+            "Review source record",
         )
         for row in vm_rows
         if source_name_counts.get(str(row.get("source_name") or row.get("name") or "").strip(), 0) > 1
@@ -2401,7 +2404,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
         "duplicate-vm-name",
         "Duplicate VM names",
         "Duplicate source VM names were kept with suffixes and should be reviewed before export.",
-        "warning",
+        "advisory",
         duplicate_rows,
         "Review duplicates",
     )
@@ -6396,138 +6399,234 @@ def step3() -> str:
         flash(f"Could not load VM inventory data: {exc}", "rvtools_error")
         return redirect(url_for("index"))
 
-    vm_index = {vm["name"]: vm for vm in all_vms}
+    vm_index = {str(vm["name"]): vm for vm in all_vms}
     app_state = load_app_state()
     selected_vm_names = app_state.get("selected_vm_names", [])
     if not isinstance(selected_vm_names, list):
         selected_vm_names = []
     selected_vm_names = [n for n in selected_vm_names if n in vm_index]
+    supported_signatures = load_supported_os_signatures()
+    inventory_issues = build_inventory_review_issues(all_vms)
+    advisory_issue_ids = [
+        str(issue["id"])
+        for issue in inventory_issues
+        if issue.get("severity") == "advisory"
+    ]
+    critical_issues = [issue for issue in inventory_issues if issue.get("severity") == "critical"]
+    inventory_errors: list[str] = []
+    placement_errors: dict[str, str] = {}
+
+    def default_placement(vm: dict[str, Any]) -> str:
+        raw_os = str(vm.get("raw_os") or "")
+        if _is_unknown_os(raw_os) or not supported_signatures:
+            return "review"
+        if is_oci_supported_os(raw_os, supported_signatures):
+            return "native"
+        return "ocvs"
+
+    placement_field_names = {
+        vm_name: f"placement:{urlencode({'': vm_name})[1:]}"
+        for vm_name in vm_index
+    }
 
     if request.method == "POST":
-        action = request.form.get("action", "")
+        action = str(request.form.get("action", ""))
         redirect_to = str(request.form.get("redirect_to", "")).strip()
-        chosen_vm_names = request.form.getlist("vm_names")
-        single_vm_name = (request.form.get("vm_name") or "").strip()
-        if single_vm_name:
-            chosen_vm_names = [single_vm_name]
+        if action == "save_inventory_review":
+            submitted_names = request.form.getlist("included_vm_names")
+            submitted_name_set = {name for name in submitted_names if name in vm_index}
+            invalid_names = sorted({name for name in submitted_names if name not in vm_index})
+            candidate_names = [str(vm["name"]) for vm in all_vms if str(vm["name"]) in submitted_name_set]
+            submitted_acknowledgments = set(request.form.getlist("acknowledged_warning_ids"))
+            acknowledged_warning_ids = [
+                issue_id
+                for issue_id in advisory_issue_ids
+                if issue_id in submitted_acknowledgments
+            ]
+            app_state["acknowledged_warning_ids"] = acknowledged_warning_ids
 
-        if action == "add":
-            merged = list(dict.fromkeys(selected_vm_names + [n for n in chosen_vm_names if n in vm_index]))
-            selected_vm_names = merged
-        elif action == "remove":
-            selected_vm_names = [n for n in selected_vm_names if n not in set(chosen_vm_names)]
-        elif action == "remove_unsupported":
-            supported_signatures = load_supported_os_signatures()
-            if not supported_signatures:
-                flash(
-                    "Could not remove unsupported OS images: OCI-SupportedOS.txt is missing or empty.",
-                    "error",
+            if invalid_names:
+                inventory_errors.append(
+                    "Some submitted VMs are no longer present in the current inventory. Review the refreshed list."
                 )
+            if not candidate_names:
+                inventory_errors.append("Include at least one VM before saving Inventory Review.")
+                save_app_state(app_state)
             else:
+                existing_placements = app_state.get("step4_hybrid_placements", {})
+                if not isinstance(existing_placements, dict):
+                    existing_placements = {}
+                candidate_placements: dict[str, str] = {}
+                for vm_name in candidate_names:
+                    vm = vm_index[vm_name]
+                    field_name = placement_field_names[vm_name]
+                    if field_name in request.form:
+                        submitted_placement = str(request.form.get(field_name, "")).strip().lower()
+                        if submitted_placement not in {"native", "ocvs", "review"}:
+                            placement_errors[vm_name] = "Choose a valid placement: OCI Native, OCVS, or Review."
+                            continue
+                        candidate_placements[vm_name] = submitted_placement
+                    else:
+                        saved_placement = str(existing_placements.get(vm_name, "")).strip().lower()
+                        candidate_placements[vm_name] = (
+                            saved_placement
+                            if saved_placement in {"native", "ocvs", "review"}
+                            else default_placement(vm)
+                        )
+
+                selected_vm_names = candidate_names
+                app_state["selected_vm_names"] = selected_vm_names
+                app_state["step4_hybrid_placements"] = candidate_placements
+                app_state["acknowledged_warning_ids"] = acknowledged_warning_ids
+                save_app_state(app_state)
+
+                if request.form.get("continue_to_scenarios") == "1":
+                    if critical_issues:
+                        inventory_errors.append(
+                            "Resolve critical inventory issues in Setup or the source inventory before continuing."
+                        )
+                    unacknowledged_ids = [
+                        issue_id
+                        for issue_id in advisory_issue_ids
+                        if issue_id not in acknowledged_warning_ids
+                    ]
+                    if unacknowledged_ids:
+                        inventory_errors.append("Acknowledge advisory warnings before continuing to scenarios.")
+                    if placement_errors or any(name not in candidate_placements for name in candidate_names):
+                        inventory_errors.append("Choose a valid placement for every included VM before continuing.")
+                    if not inventory_errors:
+                        return redirect(url_for("step4", tab="native"))
+        else:
+            chosen_vm_names = request.form.getlist("vm_names")
+            single_vm_name = str(request.form.get("vm_name") or "").strip()
+            if single_vm_name:
+                chosen_vm_names = [single_vm_name]
+
+            if action == "add":
+                selected_vm_names = list(
+                    dict.fromkeys(selected_vm_names + [name for name in chosen_vm_names if name in vm_index])
+                )
+            elif action == "remove":
+                selected_vm_names = [name for name in selected_vm_names if name not in set(chosen_vm_names)]
+            elif action == "remove_unsupported":
+                if not supported_signatures:
+                    flash("Could not update unsupported workloads because the OCI support list is unavailable.", "error")
+                else:
+                    before_count = len(selected_vm_names)
+                    selected_vm_names = [
+                        name
+                        for name in selected_vm_names
+                        if name in vm_index
+                        and is_oci_supported_os(str(vm_index[name].get("raw_os", "")), supported_signatures)
+                    ]
+                    removed_count = before_count - len(selected_vm_names)
+                    flash(f"Removed {removed_count} unsupported VM(s) from the selected workload scope.", "success")
+            elif action == "remove_duplicates":
                 before_count = len(selected_vm_names)
-                selected_vm_names = [
-                    n
-                    for n in selected_vm_names
-                    if n in vm_index and is_oci_supported_os(str(vm_index[n].get("raw_os", "")), supported_signatures)
-                ]
+                selected_set_for_dedupe = set(selected_vm_names)
+                deduped_names: list[str] = []
+                seen_source_names: set[str] = set()
+                for vm in all_vms:
+                    vm_name = str(vm.get("name") or "").strip()
+                    if vm_name not in selected_set_for_dedupe:
+                        continue
+                    source_name = str(vm.get("source_name") or vm_name).strip()
+                    if source_name in seen_source_names:
+                        continue
+                    seen_source_names.add(source_name)
+                    deduped_names.append(vm_name)
+
+                selected_vm_names = deduped_names
                 removed_count = before_count - len(selected_vm_names)
-                flash(f"Removed {removed_count} non-OCI-supported or 32-bit VM image(s).", "success")
-        elif action == "remove_duplicates":
-            before_count = len(selected_vm_names)
-            selected_set_for_dedupe = set(selected_vm_names)
-            deduped_names: list[str] = []
-            seen_source_names: set[str] = set()
-            for vm in all_vms:
-                vm_name = str(vm.get("name") or "").strip()
-                if vm_name not in selected_set_for_dedupe:
-                    continue
-                source_name = str(vm.get("source_name") or vm_name).strip()
-                if source_name in seen_source_names:
-                    continue
-                seen_source_names.add(source_name)
-                deduped_names.append(vm_name)
+                if removed_count:
+                    flash(
+                        f"Removed {removed_count:,} duplicate VM name row(s) from the selected workload. First occurrence was kept.",
+                        "success",
+                    )
+                else:
+                    flash("No duplicate VM names were found in the selected workload.", "info")
 
-            selected_vm_names = deduped_names
-            removed_count = before_count - len(selected_vm_names)
-            if removed_count:
-                flash(
-                    f"Removed {removed_count:,} duplicate VM name row(s) from the selected workload. First occurrence was kept.",
-                    "success",
-                )
-            else:
-                flash("No duplicate VM names were found in the selected workload.", "info")
-
-        app_state["selected_vm_names"] = selected_vm_names
-        save_app_state(app_state)
-        if redirect_to == "step4":
-            if selected_vm_names:
-                return redirect(step4_tab_redirect("paths"))
-            flash("Select at least one VM before continuing to Migration Paths.", "error")
+            app_state["selected_vm_names"] = selected_vm_names
+            save_app_state(app_state)
+            if redirect_to == "step4":
+                if selected_vm_names:
+                    return redirect(step4_tab_redirect("paths"))
+                flash("Select at least one VM before continuing to Migration Paths.", "error")
 
     selected_set = set(selected_vm_names)
-    available_vms_all = [vm for vm in all_vms if vm["name"] not in selected_set]
-    selected_vms_all = [vm_index[name] for name in selected_vm_names if name in vm_index]
+    saved_placements = app_state.get("step4_hybrid_placements", {})
+    if not isinstance(saved_placements, dict):
+        saved_placements = {}
+    acknowledged_warning_ids = [
+        warning_id
+        for warning_id in app_state.get("acknowledged_warning_ids", [])
+        if warning_id in advisory_issue_ids
+    ]
+    issues_by_vm: dict[str, list[dict[str, Any]]] = {}
+    for issue in inventory_issues:
+        for vm_name in issue.get("vm_names", []):
+            issues_by_vm.setdefault(str(vm_name), []).append(issue)
 
-    available_os_filter = (request.values.get("available_os_filter") or "ALL").strip()
-    selected_os_filter = (request.values.get("selected_os_filter") or "ALL").strip()
-    available_power_filter = (request.values.get("available_power_filter") or "ALL").strip()
-    selected_power_filter = (request.values.get("selected_power_filter") or "ALL").strip()
+    inventory_rows: list[dict[str, Any]] = []
+    supported_count = 0
+    review_vm_names: set[str] = set()
+    for row_index, vm in enumerate(all_vms):
+        vm_name = str(vm["name"])
+        raw_os = str(vm.get("raw_os") or "Unknown / Empty")
+        if _is_unknown_os(raw_os) or not supported_signatures:
+            support_state = "review"
+            support_label = "Review"
+        elif is_oci_supported_os(raw_os, supported_signatures):
+            support_state = "supported"
+            support_label = "Supported"
+            supported_count += 1
+        else:
+            support_state = "unsupported"
+            support_label = "Requires remediation"
 
-    available_os_options = sorted({(vm.get("raw_os") or "").strip() for vm in available_vms_all if (vm.get("raw_os") or "").strip()})
-    selected_os_options = sorted({(vm.get("raw_os") or "").strip() for vm in selected_vms_all if (vm.get("raw_os") or "").strip()})
-    available_power_options = sorted({(vm.get("power_state") or "").strip() for vm in available_vms_all if (vm.get("power_state") or "").strip()})
-    selected_power_options = sorted({(vm.get("power_state") or "").strip() for vm in selected_vms_all if (vm.get("power_state") or "").strip()})
+        row_issues = issues_by_vm.get(vm_name, [])
+        if row_issues:
+            review_vm_names.add(vm_name)
+        placement = str(saved_placements.get(vm_name, "")).strip().lower()
+        if placement not in {"native", "ocvs", "review"}:
+            placement = default_placement(vm)
+        if vm_name in placement_errors:
+            placement = default_placement(vm)
+        power_state = str(vm.get("power_state") or "Unknown")
+        power_key = power_state.strip().lower().replace("powered", "")
+        if power_key not in {"on", "off"}:
+            power_key = "unknown"
+        memory_mb = _to_number(vm.get("memory_mb"))
+        storage_mib = _to_number(vm.get("provisioned_mib"))
+        inventory_rows.append(
+            {
+                **vm,
+                "row_index": row_index,
+                "included": vm_name in selected_set,
+                "support_state": support_state,
+                "support_label": support_label,
+                "placement": placement,
+                "placement_label": HYBRID_PLACEMENT_LABELS.get(placement, "Review"),
+                "placement_field_name": placement_field_names[vm_name],
+                "warning_ids": " ".join(str(issue["id"]) for issue in row_issues),
+                "warning_titles": [str(issue["title"]) for issue in row_issues],
+                "power_key": power_key,
+                "memory_gb": memory_mb / 1024.0,
+                "storage_gb": storage_mib / 1024.0,
+                "placement_error": placement_errors.get(vm_name, ""),
+            }
+        )
 
-    # If a filter value no longer exists after add/remove actions, reset to ALL
-    # so UI selection and displayed rows stay in sync.
-    if available_os_filter != "ALL" and available_os_filter not in available_os_options:
-        available_os_filter = "ALL"
-    if selected_os_filter != "ALL" and selected_os_filter not in selected_os_options:
-        selected_os_filter = "ALL"
-    if available_power_filter != "ALL" and available_power_filter not in available_power_options:
-        available_power_filter = "ALL"
-    if selected_power_filter != "ALL" and selected_power_filter not in selected_power_options:
-        selected_power_filter = "ALL"
-
-    def _matches_filters(vm: dict[str, Any], os_filter: str, power_filter: str) -> bool:
-        vm_os = (vm.get("raw_os") or "").strip()
-        vm_power = (vm.get("power_state") or "").strip()
-        if os_filter != "ALL" and vm_os != os_filter:
-            return False
-        if power_filter != "ALL" and vm_power != power_filter:
-            return False
-        return True
-
-    available_vms = (
-        [vm for vm in available_vms_all if _matches_filters(vm, available_os_filter, available_power_filter)]
-    )
-    selected_vms = (
-        [vm for vm in selected_vms_all if _matches_filters(vm, selected_os_filter, selected_power_filter)]
-    )
-
-    def _duplicate_row_count(vms: list[dict[str, Any]]) -> int:
-        source_name_counts: dict[str, int] = {}
-        for vm in vms:
-            source_name = str(vm.get("source_name") or vm.get("name") or "").strip()
-            if source_name:
-                source_name_counts[source_name] = source_name_counts.get(source_name, 0) + 1
-        return sum(max(0, count - 1) for count in source_name_counts.values())
-
-    available_mem_mb = int(sum(_to_number(vm.get("memory_mb")) for vm in available_vms))
-    selected_mem_mb = int(sum(_to_number(vm.get("memory_mb")) for vm in selected_vms))
-    available_summary = {
-        "total_vms": len(available_vms),
-        "total_cpus": int(sum(_to_number(vm.get("cpus")) for vm in available_vms)),
-        "total_memory_mb": available_mem_mb,
-        "total_memory_display": format_total_memory_gb_or_tb(available_mem_mb),
-        "duplicate_row_count": _duplicate_row_count(available_vms),
-    }
-    selected_summary = {
-        "total_vms": len(selected_vms),
-        "total_cpus": int(sum(_to_number(vm.get("cpus")) for vm in selected_vms)),
-        "total_memory_mb": selected_mem_mb,
-        "total_memory_display": format_total_memory_gb_or_tb(selected_mem_mb),
-        "duplicate_row_count": _duplicate_row_count(selected_vms),
+    total_memory_mb = int(sum(_to_number(vm.get("memory_mb")) for vm in all_vms))
+    total_storage_mib = int(sum(_to_number(vm.get("provisioned_mib")) for vm in all_vms))
+    inventory_summary = {
+        "vm_count": len(all_vms),
+        "total_vcpus": int(sum(_to_number(vm.get("cpus")) for vm in all_vms)),
+        "total_memory": format_total_memory_gb_or_tb(total_memory_mb),
+        "total_storage_gb": int(math.ceil(total_storage_mib / 1024.0)) if total_storage_mib else 0,
+        "powered_on_count": sum(1 for row in inventory_rows if row["power_key"] == "on"),
+        "native_supported_count": supported_count,
+        "review_count": len(review_vm_names),
     }
 
     return render_template(
@@ -6536,18 +6635,14 @@ def step3() -> str:
             "inventory",
             selected_rvtools_file=selected_rvtools_file,
             source_vinfo_csv=source_vinfo_csv,
-            available_vms=available_vms,
-            selected_vms=selected_vms,
-            available_summary=available_summary,
-            selected_summary=selected_summary,
-            available_os_filter=available_os_filter,
-            selected_os_filter=selected_os_filter,
-            available_power_filter=available_power_filter,
-            selected_power_filter=selected_power_filter,
-            available_os_options=available_os_options,
-            selected_os_options=selected_os_options,
-            available_power_options=available_power_options,
-            selected_power_options=selected_power_options,
+            inventory_rows=inventory_rows,
+            inventory_summary=inventory_summary,
+            inventory_issues=inventory_issues,
+            inventory_errors=inventory_errors,
+            acknowledged_warning_ids=acknowledged_warning_ids,
+            selected_vm_count=len(selected_vm_names),
+            critical_issue_count=len(critical_issues),
+            advisory_issue_count=len(advisory_issue_ids),
         ),
     )
 
