@@ -71,6 +71,7 @@ def _normalize_issue(issue: Mapping[str, Any]) -> dict[str, Any]:
         "stage": _string(issue.get("stage")) or "inventory",
         "affected_vm_names": normalized_vm_names,
         "severity": _string(issue.get("severity")).lower() or "advisory",
+        "acknowledged": False,
     }
 
 
@@ -89,6 +90,7 @@ def _integrity_issue(
         "stage": stage,
         "affected_vm_names": [],
         "severity": severity,
+        "acknowledged": False,
     }
 
 
@@ -132,6 +134,8 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
                 "Warning IDs must be a string or a collection of strings.",
             )
         )
+    for issue in issues:
+        issue["acknowledged"] = issue["id"] in acknowledged
     critical = [
         issue
         for issue in issues
@@ -143,6 +147,32 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
         issue
         for issue in issues
         if id(issue) not in critical_ids and issue["id"] not in acknowledged
+    ]
+    inventory_advisories = [
+        issue for issue in issues if id(issue) not in critical_ids
+    ]
+
+    scenario_issue_values, scenario_issues_valid = _issue_collection(
+        context.get("scenario_issues")
+    )
+    scenario_issues = [_normalize_issue(issue) for issue in scenario_issue_values]
+    for issue in scenario_issues:
+        issue["stage"] = "scenarios"
+    if not scenario_issues_valid:
+        scenario_issues.append(
+            _integrity_issue(
+                "invalid-scenario-issues",
+                "Invalid scenario issue data",
+                "Scenario issues must be a mapping or a list containing only mappings.",
+                stage="scenarios",
+            )
+        )
+    scenario_blockers = [
+        issue for issue in scenario_issues if issue["severity"] == "critical"
+    ]
+    scenario_blocker_ids = {id(issue) for issue in scenario_blockers}
+    scenario_advisories = [
+        issue for issue in scenario_issues if id(issue) not in scenario_blocker_ids
     ]
 
     scenario_results: dict[str, dict[str, Any]] = {}
@@ -217,8 +247,10 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
     )
     unsaved_value = context.get("has_unsaved_scenario_changes")
     scenarios_saved = isinstance(unsaved_value, bool) and not unsaved_value
-    scenarios_complete = scenarios_saved and any(
-        scenario["rankable"] for scenario in scenario_results.values()
+    scenarios_complete = (
+        scenarios_saved
+        and not scenario_blockers
+        and any(scenario["rankable"] for scenario in scenario_results.values())
     )
 
     prerequisites_ready = setup_ready and inventory_ready and scenarios_complete
@@ -266,8 +298,8 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
             },
             "scenarios": {
                 "state": "complete" if scenarios_complete else "needs_attention",
-                "blockers": [],
-                "advisories": scenario_integrity_items,
+                "blockers": scenario_blockers,
+                "advisories": scenario_advisories + scenario_integrity_items,
             },
             "results": {
                 "state": "complete" if customer_ready else "needs_attention",
@@ -276,8 +308,13 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
             },
         },
         "scenarios": scenario_results,
-        "blocking_items": critical,
-        "advisory_items": unacknowledged + scenario_integrity_items,
+        "blocking_items": critical + scenario_blockers,
+        "advisory_items": (
+            unacknowledged + scenario_advisories + scenario_integrity_items
+        ),
+        "display_advisory_items": (
+            inventory_advisories + scenario_advisories + scenario_integrity_items
+        ),
         "lowest_complete_scenario": lowest_complete,
         "customer_ready_export": customer_ready,
     }

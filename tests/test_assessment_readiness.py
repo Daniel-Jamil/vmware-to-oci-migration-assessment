@@ -1,6 +1,8 @@
 import copy
+import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
@@ -99,9 +101,24 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
         },
     ]
     scenario_rows = [
-        {"id": "native", "monthly_cost": 125.0},
-        {"id": "ocvs", "monthly_cost": 825.0},
-        {"id": "hybrid", "monthly_cost": 475.0},
+        {
+            "id": "native",
+            "monthly_cost": 125.0,
+            "native_vm_count": 2,
+            "ocvs_vm_count": 0,
+        },
+        {
+            "id": "ocvs",
+            "monthly_cost": 825.0,
+            "native_vm_count": 0,
+            "ocvs_vm_count": 2,
+        },
+        {
+            "id": "hybrid",
+            "monthly_cost": 475.0,
+            "native_vm_count": 1,
+            "ocvs_vm_count": 1,
+        },
     ]
     physical_cores = {"ocvs": 384, "hybrid": 128}
     analysis = {
@@ -294,7 +311,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual("needs_attention", native["state"])
         self.assertTrue(native["rankable"])
         self.assertEqual(["legacy-01"], native["affected_vm_names"])
-        source_advisories = result["stages"]["inventory"]["advisories"]
+        source_advisories = result["display_advisory_items"]
         unsupported = next(
             item for item in source_advisories if item["id"] == "unsupported-native"
         )
@@ -335,7 +352,7 @@ class ReadinessTests(unittest.TestCase):
             )
             unsupported = next(
                 item
-                for item in adapter_calls[0][1]["stages"]["inventory"]["advisories"]
+                for item in adapter_calls[0][1]["display_advisory_items"]
                 if item["id"] == "unsupported-native"
             )
             self.assert_readiness_item_contract(
@@ -345,6 +362,11 @@ class ReadinessTests(unittest.TestCase):
                 severity="advisory",
                 affected_vm_names=["legacy-01"],
                 acknowledged=True,
+            )
+            self.assertIn(b"Unsupported for OCI Native", response.data)
+            self.assertIn(
+                b"These VMs remain in scope but require remediation review before using a Native placement.",
+                response.data,
             )
             fit_item = next(
                 item
@@ -407,6 +429,364 @@ class ReadinessTests(unittest.TestCase):
             )
             with client.session_transaction() as sess:
                 self.assertNotIn("_step4_unsaved_scenario_changes", sess)
+            response.close()
+
+    def test_step4_early_redirect_preserves_pending_unsaved_signal(self) -> None:
+        with app_module.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+                sess["_step4_unsaved_scenario_changes"] = True
+
+            response = client.get("/step4?tab=native")
+
+            self.assertEqual(302, response.status_code)
+            with client.session_transaction() as sess:
+                self.assertIs(True, sess["_step4_unsaved_scenario_changes"])
+
+    def test_successful_step4_export_clears_pending_unsaved_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, current_step4_client() as (
+            client,
+            state,
+        ), patch.object(
+            app_module,
+            "EXPORTS_DIR",
+            Path(temp_dir),
+        ), patch.object(
+            app_module,
+            "build_migration_price_workbook_xlsx",
+            return_value=b"regression workbook",
+        ):
+            with client.session_transaction() as sess:
+                sess["_step4_unsaved_scenario_changes"] = True
+            response = client.post(
+                "/step4",
+                data={
+                    "action": "export_excel",
+                    "active_scenario": "price",
+                    **{
+                        app_module.inventory_placement_field_name(
+                            "hybrid_placement", vm_name
+                        ): placement
+                        for vm_name, placement in state[
+                            "step4_hybrid_placements"
+                        ].items()
+                    },
+                },
+            )
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                response.mimetype,
+            )
+            with client.session_transaction() as sess:
+                self.assertNotIn("_step4_unsaved_scenario_changes", sess)
+            response.close()
+
+    def test_critical_fit_warning_centrally_blocks_customer_ready_export(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["app_state"]["assessor_recommendation"] = "ocvs"
+        inputs["scenario_analysis"]["fit_warnings"] = [
+            {
+                "id": "host-limit",
+                "severity": "critical",
+                "title": "OCVS host limit exceeded",
+                "detail": "The selected OCVS shape exceeds the supported cluster limit.",
+            }
+        ]
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertTrue(result["scenarios"]["ocvs"]["rankable"])
+        self.assertEqual("needs_attention", result["stages"]["scenarios"]["state"])
+        self.assertEqual("needs_attention", result["stages"]["results"]["state"])
+        self.assertEqual("incomplete", result["overall_state"])
+        self.assertFalse(result["customer_ready_export"])
+        self.assertIn(
+            "OCVS host limit exceeded",
+            {item["title"] for item in result["blocking_items"]},
+        )
+
+    def test_advisory_fit_warning_does_not_block_rankability_or_export(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["app_state"]["assessor_recommendation"] = "ocvs"
+        inputs["scenario_analysis"]["fit_warnings"] = [
+            {
+                "id": "capacity-review",
+                "severity": "warning",
+                "title": "Review spare capacity",
+                "detail": "Confirm the selected spare-node policy with the platform team.",
+            }
+        ]
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertTrue(result["scenarios"]["ocvs"]["rankable"])
+        self.assertEqual("complete", result["stages"]["scenarios"]["state"])
+        self.assertTrue(result["customer_ready_export"])
+        self.assertIn(
+            "Review spare capacity",
+            {item["title"] for item in result["advisory_items"]},
+        )
+
+    def test_fit_warning_ids_are_collision_safe_and_deterministic(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["inventory_issues"] = [
+            {
+                "id": "fit-capacity-alert",
+                "title": "Inventory capacity alert",
+                "detail": "Inventory source advisory.",
+                "severity": "advisory",
+                "vm_names": ["app-01"],
+            }
+        ]
+        inputs["app_state"]["acknowledged_warning_ids"] = ["fit-capacity-alert"]
+        inputs["scenario_analysis"]["fit_warnings"] = [
+            {
+                "id": "fit-capacity-alert",
+                "severity": "warning",
+                "title": "Scenario capacity alert",
+                "detail": "First scenario advisory.",
+            },
+            {
+                "id": "fit-capacity-alert",
+                "severity": "warning",
+                "title": "Scenario capacity alert",
+                "detail": "Second scenario advisory.",
+            },
+        ]
+
+        first = app_module.build_current_readiness_context(**copy.deepcopy(inputs))
+        second = app_module.build_current_readiness_context(**copy.deepcopy(inputs))
+        first_ids = [
+            item["id"]
+            for item in first["advisory_items"]
+            if item["title"] == "Scenario capacity alert"
+        ]
+        second_ids = [
+            item["id"]
+            for item in second["advisory_items"]
+            if item["title"] == "Scenario capacity alert"
+        ]
+
+        self.assertEqual(first_ids, second_ids)
+        self.assertEqual(2, len(first_ids))
+        self.assertEqual(2, len(set(first_ids)))
+        self.assertNotIn("fit-capacity-alert", first_ids)
+
+    def test_ocvs_pricing_fails_closed_for_missing_or_malformed_capacity(self) -> None:
+        mutations = {
+            "missing summary": lambda values: values["scenario_analysis"].update(
+                ocvs_price=None
+            ),
+            "missing host count": lambda values: values["scenario_analysis"][
+                "ocvs_price"
+            ].update(selected={"pricing_available": True}),
+            "zero host count": lambda values: values["scenario_analysis"][
+                "ocvs_price"
+            ]["selected"].update(host_count=0),
+            "malformed host count": lambda values: values["scenario_analysis"][
+                "ocvs_price"
+            ]["selected"].update(host_count="not-a-count"),
+            "pricing unavailable": lambda values: values["scenario_analysis"][
+                "ocvs_price"
+            ]["selected"].update(pricing_available=False),
+            "missing physical cores": lambda values: values["scenario_analysis"][
+                "vmware_license_summary"
+            ].update(ocvs={}),
+            "zero physical cores": lambda values: values["scenario_analysis"][
+                "vmware_license_summary"
+            ]["ocvs"].update(physical_cores=0),
+            "malformed physical cores": lambda values: values["scenario_analysis"][
+                "vmware_license_summary"
+            ]["ocvs"].update(physical_cores="not-a-count"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                mutate(inputs)
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["ocvs"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["ocvs"]["rankable"])
+
+    def test_hybrid_pricing_distinguishes_empty_and_malformed_ocvs_subsets(self) -> None:
+        empty_inputs = current_adapter_inputs()
+        hybrid_row = next(
+            row
+            for row in empty_inputs["scenario_analysis"]["scenario_comparison"]["rows"]
+            if row["id"] == "hybrid"
+        )
+        hybrid_row["ocvs_vm_count"] = 0
+        empty_inputs["scenario_analysis"]["supported_native_rows"] = copy.deepcopy(
+            empty_inputs["pricing_inputs"]["modeled_vm_rows"]
+        )
+        empty_inputs["scenario_analysis"]["hybrid_ocvs_price"] = None
+        empty_inputs["scenario_analysis"]["vmware_license_summary"]["hybrid"] = {}
+
+        empty_result = app_module.build_current_readiness_context(**empty_inputs)
+
+        self.assertEqual(
+            "complete", empty_result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertTrue(empty_result["scenarios"]["hybrid"]["rankable"])
+
+        malformed_values = (None, -1, "one", 1.5, True)
+        for malformed_count in malformed_values:
+            with self.subTest(malformed_count=malformed_count):
+                inputs = current_adapter_inputs()
+                hybrid_row = next(
+                    row
+                    for row in inputs["scenario_analysis"]["scenario_comparison"]["rows"]
+                    if row["id"] == "hybrid"
+                )
+                hybrid_row["ocvs_vm_count"] = malformed_count
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+
+    def test_hybrid_positive_ocvs_subset_requires_hosts_pricing_cores_and_vcf(self) -> None:
+        mutations = {
+            "missing summary": lambda values: values["scenario_analysis"].update(
+                hybrid_ocvs_price=None
+            ),
+            "zero hosts": lambda values: values["scenario_analysis"][
+                "hybrid_ocvs_price"
+            ]["selected"].update(host_count=0),
+            "pricing unavailable": lambda values: values["scenario_analysis"][
+                "hybrid_ocvs_price"
+            ]["selected"].update(pricing_available=False),
+            "zero cores": lambda values: values["scenario_analysis"][
+                "vmware_license_summary"
+            ]["hybrid"].update(physical_cores=0),
+            "zero VCF": lambda values: (
+                values["app_state"].update(
+                    step4_vmware_license_price_per_core_yearly=0.0
+                ),
+                values["scenario_analysis"]["vmware_license_summary"].update(
+                    price_per_core_yearly=0.0
+                ),
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                mutate(inputs)
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+
+    def test_adapter_rejects_malformed_selected_vm_names_without_crashing(self) -> None:
+        for malformed_names in (17, True, "app-01", {"app-01"}, ["app-01", 17]):
+            with self.subTest(malformed_names=malformed_names):
+                inputs = current_adapter_inputs()
+                inputs["selected_vm_names"] = malformed_names
+
+                try:
+                    result = app_module.build_current_readiness_context(**inputs)
+                except (TypeError, ValueError) as exc:
+                    self.fail(f"malformed selected VM names escaped the adapter: {exc}")
+
+                self.assertIn(
+                    "invalid-selected-vm-names",
+                    {item["id"] for item in result["blocking_items"]},
+                )
+                self.assertEqual(
+                    "needs_attention", result["stages"]["inventory"]["state"]
+                )
+                self.assertFalse(result["customer_ready_export"])
+
+    def test_adapter_preserves_malformed_unsupported_rows_as_integrity_advisory(self) -> None:
+        malformed_values = (
+            17,
+            True,
+            "legacy-01",
+            {"vm_name": "legacy-01"},
+            [{"vm_name": "legacy-01"}, 17],
+        )
+        for malformed_rows in malformed_values:
+            with self.subTest(malformed_rows=malformed_rows):
+                inputs = current_adapter_inputs()
+                inputs["app_state"]["assessor_recommendation"] = "native"
+                inputs["app_state"]["assessor_recommendation_rationale"] = (
+                    "Remediate unsupported workloads before migration."
+                )
+                inputs["scenario_analysis"]["oci_unsupported_rows"] = malformed_rows
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "needs_attention", result["scenarios"]["native"]["state"]
+                )
+                self.assertTrue(result["scenarios"]["native"]["rankable"])
+                self.assertFalse(result["customer_ready_export"])
+                self.assertIn(
+                    "invalid-native-unsupported-vms",
+                    {item["id"] for item in result["advisory_items"]},
+                )
+
+    def test_adapter_malformed_issue_and_scenario_inputs_fail_closed(self) -> None:
+        inventory_inputs = current_adapter_inputs()
+        inventory_inputs["app_state"]["assessor_recommendation"] = "ocvs"
+        inventory_inputs["inventory_issues"] = 17
+
+        inventory_result = app_module.build_current_readiness_context(
+            **inventory_inputs
+        )
+
+        self.assertIn(
+            "invalid-inventory-issues",
+            {item["id"] for item in inventory_result["blocking_items"]},
+        )
+        self.assertFalse(inventory_result["customer_ready_export"])
+
+        malformed_scenarios = (
+            ("analysis", 17, []),
+            ("views", current_adapter_inputs()["scenario_analysis"], 17),
+            (
+                "comparison rows",
+                {
+                    **current_adapter_inputs()["scenario_analysis"],
+                    "scenario_comparison": {"rows": "not-a-list"},
+                },
+                [],
+            ),
+            (
+                "fit warnings",
+                {
+                    **current_adapter_inputs()["scenario_analysis"],
+                    "fit_warnings": "not-a-list",
+                },
+                [],
+            ),
+        )
+        for label, analysis, views in malformed_scenarios:
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                inputs["app_state"]["assessor_recommendation"] = "ocvs"
+                inputs["scenario_analysis"] = analysis
+                inputs["scenario_views"] = views
+
+                try:
+                    result = app_module.build_current_readiness_context(**inputs)
+                except (TypeError, ValueError) as exc:
+                    self.fail(f"malformed scenario input escaped the adapter: {exc}")
+
+                self.assertEqual(
+                    "needs_attention", result["stages"]["scenarios"]["state"]
+                )
+                self.assertFalse(result["customer_ready_export"])
 
     def test_current_adapter_blocks_ocvs_ranking_without_vcf_unit_price(self) -> None:
         adapter = getattr(app_module, "build_current_readiness_context", None)
@@ -482,6 +862,100 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual("needs_attention", native["state"])
         self.assertTrue(native["rankable"])
         self.assertEqual("native", result["lowest_complete_scenario"])
+
+    def test_pure_model_critical_scenario_issue_blocks_completion(self) -> None:
+        context = complete_context()
+        context["recommendation"] = "ocvs"
+        context["scenario_issues"] = [
+            {
+                "id": "fit-host-limit",
+                "title": "OCVS host limit exceeded",
+                "detail": "The modeled host count exceeds the supported cluster limit.",
+                "stage": "scenarios",
+                "severity": "critical",
+                "affected_vm_names": [],
+            }
+        ]
+
+        result = build_assessment_readiness(context)
+
+        self.assertTrue(result["scenarios"]["ocvs"]["rankable"])
+        self.assertEqual("needs_attention", result["stages"]["scenarios"]["state"])
+        self.assertEqual("needs_attention", result["stages"]["results"]["state"])
+        self.assertEqual("incomplete", result["overall_state"])
+        self.assertFalse(result["customer_ready_export"])
+        self.assertEqual(
+            ["fit-host-limit"],
+            [item["id"] for item in result["stages"]["scenarios"]["blockers"]],
+        )
+        self.assertIn(
+            "fit-host-limit", {item["id"] for item in result["blocking_items"]}
+        )
+
+    def test_pure_model_advisory_scenario_issue_remains_nonblocking(self) -> None:
+        context = complete_context()
+        context["recommendation"] = "ocvs"
+        context["scenario_issues"] = [
+            {
+                "id": "fit-capacity-review",
+                "title": "Review spare capacity",
+                "detail": "Confirm spare capacity before final approval.",
+                "stage": "scenarios",
+                "severity": "warning",
+                "affected_vm_names": [],
+            }
+        ]
+
+        result = build_assessment_readiness(context)
+
+        self.assertTrue(result["scenarios"]["ocvs"]["rankable"])
+        self.assertEqual("complete", result["stages"]["scenarios"]["state"])
+        self.assertTrue(result["customer_ready_export"])
+        self.assertIn(
+            "fit-capacity-review",
+            {item["id"] for item in result["advisory_items"]},
+        )
+
+    def test_pure_model_display_advisories_include_acknowledged_inventory_items(self) -> None:
+        context = complete_context()
+        context["recommendation"] = "ocvs"
+
+        result = build_assessment_readiness(context)
+
+        self.assertNotIn(
+            "unsupported-native", {item["id"] for item in result["advisory_items"]}
+        )
+        unsupported = next(
+            item
+            for item in result["display_advisory_items"]
+            if item["id"] == "unsupported-native"
+        )
+        self.assertIs(True, unsupported["acknowledged"])
+        self.assertTrue(result["customer_ready_export"])
+
+    def test_pure_model_malformed_scenario_issues_fail_closed(self) -> None:
+        malformed_values = (
+            17,
+            True,
+            "fit-host-limit",
+            [{"id": "fit-capacity-review", "severity": "warning"}, 17],
+        )
+        for malformed in malformed_values:
+            with self.subTest(malformed=malformed):
+                context = complete_context()
+                context["recommendation"] = "ocvs"
+                context["scenario_issues"] = malformed
+
+                result = build_assessment_readiness(context)
+
+                self.assertEqual(
+                    "needs_attention", result["stages"]["scenarios"]["state"]
+                )
+                self.assertFalse(result["customer_ready_export"])
+                self.assertIn(
+                    "invalid-scenario-issues",
+                    {item["id"] for item in result["blocking_items"]},
+                )
 
     def test_incomplete_ocvs_and_hybrid_pricing_excludes_them_from_ranking(self) -> None:
         context = complete_context()

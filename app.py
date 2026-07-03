@@ -2813,13 +2813,16 @@ def _readiness_positive_number(value: Any) -> bool:
     return math.isfinite(parsed) and parsed > 0.0
 
 
-def _readiness_nonnegative_int(value: Any) -> int:
+def _readiness_nonnegative_count(value: Any) -> int | None:
     if isinstance(value, bool):
-        return 0
+        return None
     try:
-        return max(0, int(float(value)))
+        parsed = float(value)
     except (TypeError, ValueError, OverflowError):
-        return 0
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0 or not parsed.is_integer():
+        return None
+    return int(parsed)
 
 
 def _readiness_vm_name(row: dict[str, Any]) -> str:
@@ -2867,24 +2870,118 @@ def build_current_readiness_context(
     pricing_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Adapt already-loaded assessment data to the central readiness model."""
-    rows = [row for row in (inventory_rows or []) if isinstance(row, dict)]
+    adapter_inventory_issues: list[dict[str, Any]] = []
+    adapter_scenario_issues: list[dict[str, Any]] = []
+
+    def add_integrity_issue(
+        target: list[dict[str, Any]],
+        issue_id: str,
+        title: str,
+        detail: str,
+        *,
+        stage: str,
+        severity: str = "critical",
+    ) -> None:
+        target.append(
+            _readiness_item(
+                {
+                    "id": issue_id,
+                    "title": title,
+                    "detail": detail,
+                    "severity": severity,
+                    "affected_vm_names": [],
+                },
+                stage=stage,
+                acknowledged_ids=set(),
+            )
+        )
+
+    if inventory_rows is None:
+        inventory_row_values: list[Any] = []
+    elif isinstance(inventory_rows, list):
+        inventory_row_values = inventory_rows
+        if not all(isinstance(row, dict) for row in inventory_row_values):
+            add_integrity_issue(
+                adapter_inventory_issues,
+                "invalid-inventory-rows",
+                "Invalid inventory row data",
+                "Inventory rows must be a list containing only mappings.",
+                stage="inventory",
+            )
+    else:
+        inventory_row_values = []
+        add_integrity_issue(
+            adapter_inventory_issues,
+            "invalid-inventory-rows",
+            "Invalid inventory row data",
+            "Inventory rows must be a list containing only mappings.",
+            stage="inventory",
+        )
+    rows = [row for row in inventory_row_values if isinstance(row, dict)]
     row_by_name = {
         _readiness_vm_name(row): row
         for row in rows
         if _readiness_vm_name(row)
     }
+
+    selected_values: list[Any]
+    selected_values_valid = True
+    if selected_vm_names is None:
+        selected_values = []
+    elif isinstance(selected_vm_names, list):
+        selected_values = selected_vm_names
+    else:
+        selected_values = []
+        selected_values_valid = False
     selected_names: list[str] = []
     selected_seen: set[str] = set()
-    for name in selected_vm_names or []:
-        clean_name = str(name).strip()
-        if clean_name in row_by_name and clean_name not in selected_seen:
-            selected_names.append(clean_name)
-            selected_seen.add(clean_name)
+    for name in selected_values:
+        if not isinstance(name, str):
+            selected_values_valid = False
+            continue
+        clean_name = name.strip()
+        if not clean_name or clean_name not in row_by_name or clean_name in selected_seen:
+            selected_values_valid = False
+            continue
+        selected_names.append(clean_name)
+        selected_seen.add(clean_name)
+    if not selected_values_valid:
+        add_integrity_issue(
+            adapter_inventory_issues,
+            "invalid-selected-vm-names",
+            "Invalid selected VM names",
+            "Selected VM names must be a unique list of inventory VM names.",
+            stage="inventory",
+        )
 
     state = app_state if isinstance(app_state, dict) else {}
     setup = setup_metadata if isinstance(setup_metadata, dict) else {}
-    analysis = scenario_analysis if isinstance(scenario_analysis, dict) else {}
-    pricing = pricing_inputs if isinstance(pricing_inputs, dict) else {}
+    if scenario_analysis is None:
+        analysis: dict[str, Any] = {}
+    elif isinstance(scenario_analysis, dict):
+        analysis = scenario_analysis
+    else:
+        analysis = {}
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-scenario-analysis",
+            "Invalid scenario analysis data",
+            "Scenario analysis must be a mapping when supplied.",
+            stage="scenarios",
+        )
+    if pricing_inputs is None:
+        pricing: dict[str, Any] = {}
+    elif isinstance(pricing_inputs, dict):
+        pricing = pricing_inputs
+    else:
+        pricing = {}
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-pricing-inputs",
+            "Invalid pricing input data",
+            "Pricing inputs must be a mapping when supplied.",
+            stage="scenarios",
+        )
     acknowledged_value = state.get("acknowledged_warning_ids", [])
     acknowledged_ids = {
         str(item).strip()
@@ -2892,36 +2989,62 @@ def build_current_readiness_context(
         if str(item).strip()
     } if isinstance(acknowledged_value, list) else set()
 
-    source_issues = (
-        inventory_issues
-        if isinstance(inventory_issues, list)
-        else build_inventory_review_issues(rows)
-    )
+    if inventory_issues is None:
+        source_issue_values: list[Any] = build_inventory_review_issues(rows)
+    elif isinstance(inventory_issues, dict):
+        source_issue_values = [inventory_issues]
+    elif isinstance(inventory_issues, list):
+        source_issue_values = inventory_issues
+        if not all(isinstance(issue, dict) for issue in source_issue_values):
+            add_integrity_issue(
+                adapter_inventory_issues,
+                "invalid-inventory-issues",
+                "Invalid inventory issue data",
+                "Inventory issues must be a mapping or a list containing only mappings.",
+                stage="inventory",
+            )
+    else:
+        source_issue_values = []
+        add_integrity_issue(
+            adapter_inventory_issues,
+            "invalid-inventory-issues",
+            "Invalid inventory issue data",
+            "Inventory issues must be a mapping or a list containing only mappings.",
+            stage="inventory",
+        )
     mapped_inventory_issues = [
         _readiness_item(
             issue,
             stage="inventory",
             acknowledged_ids=acknowledged_ids,
         )
-        for issue in source_issues
+        for issue in source_issue_values
         if isinstance(issue, dict)
-    ]
+    ] + adapter_inventory_issues
 
-    unsupported_native_names: list[str] = []
+    unsupported_native_input: Any = []
     if "oci_unsupported_rows" in analysis:
-        unsupported_source = analysis.get("oci_unsupported_rows", [])
-        if isinstance(unsupported_source, list):
+        unsupported_source = analysis.get("oci_unsupported_rows")
+        if (
+            isinstance(unsupported_source, list)
+            and all(isinstance(row, dict) for row in unsupported_source)
+            and all(_readiness_vm_name(row) for row in unsupported_source)
+        ):
             unsupported_set = {
                 _readiness_vm_name(row)
                 for row in unsupported_source
-                if isinstance(row, dict) and _readiness_vm_name(row)
+                if _readiness_vm_name(row)
             }
-            unsupported_native_names = [
+            unsupported_native_input = [
                 name for name in selected_names if name in unsupported_set
             ]
+        else:
+            # Preserve malformed compatibility data for the pure model's
+            # integrity advisory instead of silently treating it as empty.
+            unsupported_native_input = 0
     else:
         supported_signatures = load_supported_os_signatures()
-        unsupported_native_names = [
+        unsupported_native_input = [
             name
             for name in selected_names
             if not supported_signatures
@@ -2935,14 +3058,64 @@ def build_current_readiness_context(
             )
         ]
 
-    comparison = analysis.get("scenario_comparison", {})
-    comparison_rows = comparison.get("rows", []) if isinstance(comparison, dict) else []
+    comparison_rows: list[Any] = []
+    if "scenario_comparison" in analysis:
+        comparison = analysis.get("scenario_comparison")
+        if not isinstance(comparison, dict):
+            add_integrity_issue(
+                adapter_scenario_issues,
+                "invalid-scenario-comparison",
+                "Invalid scenario comparison data",
+                "Scenario comparison data must be a mapping.",
+                stage="scenarios",
+            )
+        else:
+            comparison_value = comparison.get("rows")
+            if not isinstance(comparison_value, list):
+                add_integrity_issue(
+                    adapter_scenario_issues,
+                    "invalid-scenario-comparison-rows",
+                    "Invalid scenario comparison rows",
+                    "Scenario comparison rows must be a list containing only mappings.",
+                    stage="scenarios",
+                )
+            else:
+                comparison_rows = comparison_value
+                if not all(isinstance(row, dict) for row in comparison_rows):
+                    add_integrity_issue(
+                        adapter_scenario_issues,
+                        "invalid-scenario-comparison-rows",
+                        "Invalid scenario comparison rows",
+                        "Scenario comparison rows must be a list containing only mappings.",
+                        stage="scenarios",
+                    )
     scenario_rows = {
         str(row.get("id") or "").strip().lower(): row
         for row in comparison_rows
         if isinstance(row, dict) and str(row.get("id") or "").strip()
-    } if isinstance(comparison_rows, list) else {}
-    for view in scenario_views or []:
+    }
+    if scenario_views is None:
+        view_values: list[Any] = []
+    elif isinstance(scenario_views, list):
+        view_values = scenario_views
+        if not all(isinstance(view, dict) for view in view_values):
+            add_integrity_issue(
+                adapter_scenario_issues,
+                "invalid-scenario-views",
+                "Invalid scenario view data",
+                "Scenario views must be a list containing only mappings.",
+                stage="scenarios",
+            )
+    else:
+        view_values = []
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-scenario-views",
+            "Invalid scenario view data",
+            "Scenario views must be a list containing only mappings.",
+            stage="scenarios",
+        )
+    for view in view_values:
         if not isinstance(view, dict):
             continue
         scenario_id = str(view.get("id") or "").strip().lower()
@@ -2957,11 +3130,27 @@ def build_current_readiness_context(
         and price_lookup
     )
     modeled_rows_value = pricing.get("modeled_vm_rows", [])
-    modeled_rows = (
-        [row for row in modeled_rows_value if isinstance(row, dict)]
-        if isinstance(modeled_rows_value, list)
-        else []
-    )
+    if isinstance(modeled_rows_value, list):
+        modeled_rows = [
+            row for row in modeled_rows_value if isinstance(row, dict)
+        ]
+        if not all(isinstance(row, dict) for row in modeled_rows_value):
+            add_integrity_issue(
+                adapter_scenario_issues,
+                "invalid-modeled-vm-rows",
+                "Invalid modeled VM rows",
+                "Modeled VM rows must be a list containing only mappings.",
+                stage="scenarios",
+            )
+    else:
+        modeled_rows = []
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-modeled-vm-rows",
+            "Invalid modeled VM rows",
+            "Modeled VM rows must be a list containing only mappings.",
+            stage="scenarios",
+        )
     modeled_by_name = {
         _readiness_vm_name(row): row
         for row in modeled_rows
@@ -3005,22 +3194,57 @@ def build_current_readiness_context(
             for name in required_names
         )
 
-    def ocvs_infrastructure_complete(summary: Any) -> bool:
-        selected = summary.get("selected", {}) if isinstance(summary, dict) else {}
+    def ocvs_infrastructure_complete(
+        summary: Any,
+        license_item: Any,
+        workload_count: int | None,
+    ) -> bool:
+        if workload_count is None:
+            return False
+        if workload_count == 0:
+            return True
+        if not isinstance(summary, dict) or not isinstance(license_item, dict):
+            return False
+        selected = summary.get("selected")
         if not isinstance(selected, dict):
             return False
-        host_count = _readiness_nonnegative_int(selected.get("host_count", 0))
-        if host_count == 0:
-            return True
-        return bool(price_source_available and selected.get("pricing_available") is True)
+        host_count = _readiness_nonnegative_count(selected.get("host_count"))
+        physical_cores = _readiness_nonnegative_count(
+            license_item.get("physical_cores")
+        )
+        return bool(
+            price_source_available
+            and host_count is not None
+            and host_count > 0
+            and selected.get("pricing_available") is True
+            and physical_cores is not None
+            and physical_cores > 0
+            and vcf_price_per_core_yearly > 0.0
+        )
 
     full_selected_rows = [row_by_name[name] for name in selected_names]
     hybrid_native_value = analysis.get("supported_native_rows", [])
-    hybrid_native_rows = (
-        [row for row in hybrid_native_value if isinstance(row, dict)]
-        if isinstance(hybrid_native_value, list)
-        else []
-    )
+    if isinstance(hybrid_native_value, list):
+        hybrid_native_rows = [
+            row for row in hybrid_native_value if isinstance(row, dict)
+        ]
+        if not all(isinstance(row, dict) for row in hybrid_native_value):
+            add_integrity_issue(
+                adapter_scenario_issues,
+                "invalid-hybrid-native-rows",
+                "Invalid Hybrid Native rows",
+                "Hybrid Native rows must be a list containing only mappings.",
+                stage="scenarios",
+            )
+    else:
+        hybrid_native_rows = []
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-hybrid-native-rows",
+            "Invalid Hybrid Native rows",
+            "Hybrid Native rows must be a list containing only mappings.",
+            stage="scenarios",
+        )
     vmware_summary = analysis.get("vmware_license_summary", {})
     if not isinstance(vmware_summary, dict):
         vmware_summary = {}
@@ -3035,6 +3259,75 @@ def build_current_readiness_context(
     if not math.isfinite(vcf_price_per_core_yearly):
         vcf_price_per_core_yearly = 0.0
 
+    hybrid_scenario_row = scenario_rows.get("hybrid", {})
+    if "ocvs_vm_count" in hybrid_scenario_row:
+        hybrid_ocvs_workload_count = _readiness_nonnegative_count(
+            hybrid_scenario_row.get("ocvs_vm_count")
+        )
+    else:
+        placement_plan = analysis.get("hybrid_placement_plan")
+        hybrid_ocvs_workload_count = (
+            _readiness_nonnegative_count(placement_plan.get("ocvs_priced_count"))
+            if isinstance(placement_plan, dict)
+            and "ocvs_priced_count" in placement_plan
+            else None
+        )
+
+    fit_warning_values = analysis.get("fit_warnings", [])
+    if isinstance(fit_warning_values, list):
+        fit_warning_mappings = [
+            warning for warning in fit_warning_values if isinstance(warning, dict)
+        ]
+        if not all(isinstance(warning, dict) for warning in fit_warning_values):
+            add_integrity_issue(
+                adapter_scenario_issues,
+                "invalid-fit-warnings",
+                "Invalid scenario fit warnings",
+                "Scenario fit warnings must be a list containing only mappings.",
+                stage="scenarios",
+            )
+    else:
+        fit_warning_mappings = []
+        add_integrity_issue(
+            adapter_scenario_issues,
+            "invalid-fit-warnings",
+            "Invalid scenario fit warnings",
+            "Scenario fit warnings must be a list containing only mappings.",
+            stage="scenarios",
+        )
+
+    used_issue_ids = {
+        str(item.get("id") or "").strip()
+        for item in mapped_inventory_issues + adapter_scenario_issues
+        if str(item.get("id") or "").strip()
+    }
+    used_issue_ids.update(
+        {"invalid-native-unsupported-vms", "invalid-scenario-issues"}
+    )
+    fit_issues: list[dict[str, Any]] = []
+    for index, warning in enumerate(fit_warning_mappings):
+        title = str(warning.get("title") or "Scenario review item").strip()
+        detail = str(warning.get("detail") or title).strip()
+        source_id = str(warning.get("id") or title or index + 1).strip().lower()
+        source_slug = re.sub(r"[^a-z0-9]+", "-", source_id).strip("-")
+        base_id = source_slug if source_slug.startswith("fit-") else f"fit-{source_slug}"
+        if base_id == "fit-":
+            base_id = f"fit-{index + 1}"
+        item_id = base_id
+        suffix = 2
+        while item_id in used_issue_ids:
+            item_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_issue_ids.add(item_id)
+        fit_issues.append(
+            _readiness_item(
+                {**warning, "id": item_id, "title": title, "detail": detail},
+                stage="scenarios",
+                acknowledged_ids=set(),
+            )
+        )
+    scenario_issues = adapter_scenario_issues + fit_issues
+
     scenario_inputs: dict[str, dict[str, Any]] = {}
     for scenario_id in ("native", "ocvs", "hybrid"):
         scenario_row = scenario_rows.get(scenario_id, {})
@@ -3047,12 +3340,11 @@ def build_current_readiness_context(
         else:
             summary_key = "ocvs_price" if scenario_id == "ocvs" else "hybrid_ocvs_price"
             license_item = vmware_summary.get(scenario_id, {})
-            if not isinstance(license_item, dict):
-                license_item = {}
-            physical_cores = _readiness_nonnegative_int(
-                license_item.get("physical_cores", 0)
+            ocvs_workload_count = (
+                len(selected_names)
+                if scenario_id == "ocvs"
+                else hybrid_ocvs_workload_count
             )
-            vcf_complete = physical_cores == 0 or vcf_price_per_core_yearly > 0.0
             native_subset_complete = (
                 True
                 if scenario_id == "ocvs"
@@ -3061,15 +3353,18 @@ def build_current_readiness_context(
             pricing_complete = bool(
                 modeled
                 and native_subset_complete
-                and ocvs_infrastructure_complete(analysis.get(summary_key, {}))
-                and vcf_complete
+                and ocvs_infrastructure_complete(
+                    analysis.get(summary_key),
+                    license_item,
+                    ocvs_workload_count,
+                )
             )
         scenario_inputs[scenario_id] = {
             "technically_eligible": modeled,
             "pricing_complete": pricing_complete,
             "monthly_cost": monthly_cost,
             "unsupported_vm_names": (
-                unsupported_native_names if scenario_id == "native" else []
+                unsupported_native_input if scenario_id == "native" else []
             ),
         }
 
@@ -3092,6 +3387,7 @@ def build_current_readiness_context(
                 "acknowledged_warning_ids": list(acknowledged_ids),
             },
             "scenarios": scenario_inputs,
+            "scenario_issues": scenario_issues,
             "has_unsaved_scenario_changes": has_unsaved_scenario_changes,
             "recommendation": state.get("assessor_recommendation", ""),
             "recommendation_rationale": state.get(
@@ -3100,61 +3396,39 @@ def build_current_readiness_context(
         }
     )
 
-    source_by_id = {item["id"]: item for item in mapped_inventory_issues}
+    source_by_id = {
+        item["id"]: item for item in mapped_inventory_issues + scenario_issues
+    }
 
     def enrich_model_item(item: dict[str, Any]) -> dict[str, Any]:
         enriched = {**source_by_id.get(str(item.get("id") or ""), {}), **item}
-        enriched["message"] = str(
-            enriched.get("detail") or enriched.get("title") or enriched.get("id") or ""
+        title = str(enriched.get("title") or "").strip()
+        detail = str(enriched.get("detail") or "").strip()
+        enriched["message"] = (
+            f"{title}: {detail}"
+            if title and detail and detail != title
+            else detail or title or str(enriched.get("id") or "")
         )
         enriched.setdefault("acknowledged", False)
         return enriched
 
-    inventory_blockers = [
-        enrich_model_item(item) for item in readiness.get("blocking_items", [])
-    ]
-    blocker_ids = {item["id"] for item in inventory_blockers}
-    inventory_source_advisories = [
-        item for item in mapped_inventory_issues if item["id"] not in blocker_ids
-    ]
-    readiness["blocking_items"] = inventory_blockers
-    readiness["advisory_items"] = [
-        enrich_model_item(item) for item in readiness.get("advisory_items", [])
-    ]
-    readiness["stages"]["inventory"]["blockers"] = inventory_blockers
-    readiness["stages"]["inventory"]["advisories"] = inventory_source_advisories
-
-    fit_blockers: list[dict[str, Any]] = []
-    fit_advisories: list[dict[str, Any]] = []
-    fit_warning_values = analysis.get("fit_warnings", [])
-    used_fit_ids: dict[str, int] = {}
-    if isinstance(fit_warning_values, list):
-        for index, warning in enumerate(fit_warning_values):
-            if not isinstance(warning, dict):
-                continue
-            title = str(warning.get("title") or "Scenario review item").strip()
-            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-            base_id = str(warning.get("id") or f"fit-{slug or index + 1}").strip()
-            used_fit_ids[base_id] = used_fit_ids.get(base_id, 0) + 1
-            item_id = (
-                base_id
-                if used_fit_ids[base_id] == 1
-                else f"{base_id}-{used_fit_ids[base_id]}"
-            )
-            fit_item = _readiness_item(
-                {**warning, "id": item_id, "title": title},
-                stage="scenarios",
-                acknowledged_ids=set(),
-            )
-            if fit_item["severity"] == "critical":
-                fit_blockers.append(fit_item)
-            else:
-                fit_advisories.append(fit_item)
-
-    readiness["blocking_items"].extend(fit_blockers)
-    readiness["advisory_items"].extend(fit_advisories)
-    readiness["stages"]["scenarios"]["blockers"].extend(fit_blockers)
-    readiness["stages"]["scenarios"]["advisories"].extend(fit_advisories)
+    for collection_name in (
+        "blocking_items",
+        "advisory_items",
+        "display_advisory_items",
+    ):
+        values = readiness.get(collection_name, [])
+        readiness[collection_name] = [
+            enrich_model_item(item) for item in values if isinstance(item, dict)
+        ]
+    for stage_values in readiness.get("stages", {}).values():
+        if not isinstance(stage_values, dict):
+            continue
+        for collection_name in ("blockers", "advisories"):
+            values = stage_values.get(collection_name, [])
+            stage_values[collection_name] = [
+                enrich_model_item(item) for item in values if isinstance(item, dict)
+            ]
     return readiness
 
 
@@ -3179,7 +3453,10 @@ def build_workspace_context(
             readiness.get("blocking_items", readiness.get("blockers", []))
         )
         workspace_readiness["advisories"] = list(
-            readiness.get("advisory_items", readiness.get("advisories", []))
+            readiness.get(
+                "display_advisory_items",
+                readiness.get("advisory_items", readiness.get("advisories", [])),
+            )
         )
     for collection_name in ("blockers", "advisories"):
         if not isinstance(workspace_readiness.get(collection_name), (list, tuple)):
@@ -7240,10 +7517,7 @@ def step3() -> str:
 @app.route("/step4", methods=["GET", "POST"])
 def step4() -> str:
     _cleanup_legacy_session_keys()
-    has_unsaved_scenario_changes = bool(
-        request.method == "GET"
-        and session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, False) is True
-    )
+    has_unsaved_scenario_changes = False
 
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
     customer_name = normalize_customer_name(session.get("customer_name", ""))
@@ -7608,6 +7882,7 @@ def step4() -> str:
         step4_last_updated_at = datetime.now().isoformat(timespec="seconds")
         app_state["step4_last_updated_at"] = step4_last_updated_at
         save_app_state(app_state)
+        session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, None)
 
         # Apply latest form selections to in-request variables so export can use them immediately.
         vm_shape_selection = updated_shapes
@@ -7684,7 +7959,6 @@ def step4() -> str:
                 }
             )
 
-            session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, None)
             flash("Migration path settings saved.", "success")
             return redirect(step4_tab_redirect(active_scenario))
 
@@ -7792,6 +8066,10 @@ def step4() -> str:
             download_name=filename,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             max_age=0,
+        )
+    if request.method == "GET":
+        has_unsaved_scenario_changes = bool(
+            session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, False) is True
         )
     readiness = build_current_readiness_context(
         inventory_rows=all_vms,

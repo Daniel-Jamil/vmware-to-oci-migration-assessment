@@ -392,6 +392,21 @@ def validate_current_readiness_routes() -> None:
     adapter = getattr(app_module, "build_current_readiness_context", None)
     check("current readiness adapter exists", callable(adapter))
 
+    with app_module.app.test_client() as redirect_client:
+        with redirect_client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess[app_module.STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+        redirect_response = redirect_client.get("/step4?tab=native")
+        with redirect_client.session_transaction() as sess:
+            marker_preserved = (
+                sess.get(app_module.STEP4_UNSAVED_READINESS_SESSION_KEY) is True
+            )
+        check(
+            "Step 4 prerequisite redirect preserves pending unsaved readiness",
+            redirect_response.status_code == 302 and marker_preserved,
+            f"status={redirect_response.status_code}, preserved={marker_preserved}",
+        )
+
     price_file = find_price_file()
     inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
     selected_names = [str(row["name"]) for row in inventory_rows]
@@ -477,10 +492,10 @@ def validate_current_readiness_routes() -> None:
                     and item.get("affected_vm_names") == ["vm-legacy-01"]
                     and item.get("severity") == "advisory"
                     and item.get("acknowledged") is True
-                    for item in readiness.get("stages", {})
-                    .get("inventory", {})
-                    .get("advisories", [])
-                ),
+                    for item in readiness.get("display_advisory_items", [])
+                )
+                and b"Unsupported for OCI Native" in response.data
+                and b"These VMs remain in scope but require remediation review" in response.data,
                 str(readiness),
             )
             check(
@@ -533,6 +548,35 @@ def validate_current_readiness_routes() -> None:
                     }.items()
                 },
             }
+            with client.session_transaction() as sess:
+                sess[app_module.STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+            export_data = dict(valid_save_data)
+            export_data["action"] = "export_excel"
+            export_data["active_scenario"] = "price"
+            prior_calls = len(readiness_results)
+            response = client.post("/step4", data=export_data)
+            with client.session_transaction() as sess:
+                export_marker_cleared = (
+                    app_module.STEP4_UNSAVED_READINESS_SESSION_KEY not in sess
+                )
+                exported_readiness_workbook = str(
+                    sess.get("last_export_file", "")
+                ).strip()
+            check(
+                "persisted Step 4 Excel export clears pending unsaved readiness",
+                response.status_code == 200
+                and response.mimetype
+                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                and len(readiness_results) == prior_calls
+                and export_marker_cleared,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, cleared={export_marker_cleared}",
+            )
+            response.close()
+            if exported_readiness_workbook:
+                Path(exported_readiness_workbook).unlink(missing_ok=True)
+
+            with client.session_transaction() as sess:
+                sess[app_module.STEP4_UNSAVED_READINESS_SESSION_KEY] = True
             prior_calls = len(readiness_results)
             response = client.post(
                 "/step4",
