@@ -443,6 +443,15 @@ def validate_saved_assessments() -> None:
     price_file = find_price_file()
 
     with app_module.app.test_client() as client:
+        response = client.get("/")
+        check(
+            "empty saved assessment list still shows load controls",
+            response.status_code == 200
+            and b"Load Previous Assessment" in response.data
+            and b"No saved assessments yet" in response.data
+            and b'name="assessment_id"' in response.data,
+        )
+
         client.post(
             "/",
             data={"action": "save_customer_name", "customer_name": "Saved Assessment Customer"},

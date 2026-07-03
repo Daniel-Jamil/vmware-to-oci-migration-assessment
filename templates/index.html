@@ -215,6 +215,11 @@
       color: var(--error);
       border-color: var(--error);
     }
+    .assessment-form button:disabled,
+    .assessment-form select:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+    }
     .assessment-meta {
       margin: .45rem 0 0;
       color: var(--muted);
@@ -563,22 +568,26 @@
           <button type="submit">Save Current Assessment</button>
         </form>
 
-        {% if saved_assessments %}
-          <form method="post" class="assessment-form">
-            <label for="assessment_id">Previously saved</label>
-            <select id="assessment_id" name="assessment_id" required>
+        <form method="post" class="assessment-form">
+          <h4 style="margin: .25rem 0 0;">Load Previous Assessment</h4>
+          <label for="assessment_id">Previously saved</label>
+          <select id="assessment_id" name="assessment_id" {% if saved_assessments %}required{% else %}disabled{% endif %}>
+            {% if saved_assessments %}
               {% for assessment in saved_assessments %}
                 <option value="{{ assessment.id }}" {% if assessment.id == active_assessment_id %}selected{% endif %}>
                   {{ assessment.name }} - {{ assessment.updated_at_display }} - {{ "{:,}".format(assessment.vm_count) }} VM(s)
                 </option>
               {% endfor %}
-            </select>
-            <div class="assessment-actions">
-              <button type="submit" name="action" value="load_assessment">Load</button>
-              <button type="submit" name="action" value="delete_assessment" class="assessment-delete-button">Delete</button>
-            </div>
-          </form>
-        {% else %}
+            {% else %}
+              <option selected>No saved assessments yet</option>
+            {% endif %}
+          </select>
+          <div class="assessment-actions">
+            <button type="submit" name="action" value="load_assessment" {% if not saved_assessments %}disabled{% endif %}>Load</button>
+            <button type="submit" name="action" value="delete_assessment" class="assessment-delete-button" {% if not saved_assessments %}disabled{% endif %}>Delete</button>
+          </div>
+        </form>
+        {% if not saved_assessments %}
           <p class="assessment-meta">No saved assessments yet.</p>
         {% endif %}
       </section>
