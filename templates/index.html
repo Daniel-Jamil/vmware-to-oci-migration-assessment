@@ -606,7 +606,7 @@
               {% if price_list_choices %}
                 <option value="">Select a saved price list</option>
                 {% for choice in price_list_choices %}
-                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_pricelist_file %}selected{% endif %}>{{ choice.label }}</option>
+                  <option value="{{ choice.token }}" {% if choice.file_path == selected_pricelist_file %}selected{% endif %}>{{ choice.label }}</option>
                 {% endfor %}
               {% else %}
                 <option selected>No local price lists available</option>
@@ -665,7 +665,7 @@
               >
                 <option value="">Select a catalog file</option>
                 {% for choice in rvtools_file_choices %}
-                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.label }}</option>
+                  <option value="{{ choice.token }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.label }}</option>
                 {% endfor %}
               </select>
               <p class="setup-field__hint" id="rvtools_file-hint">Choose a previously stored .xlsx, .xlsm, or .csv inventory.</p>

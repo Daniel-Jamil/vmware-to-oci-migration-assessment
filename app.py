@@ -972,17 +972,19 @@ def build_source_file_info(path_text: Any) -> dict[str, Any]:
 
 def build_catalog_choices(paths: list[str], source_kind: str) -> list[dict[str, str]]:
     choices: list[dict[str, str]] = []
-    for index, path_text in enumerate(paths, start=1):
+    for index, path_text in enumerate(paths):
         source_info = build_source_file_info(path_text)
         updated_at = str(source_info.get("updated_at") or "Date unavailable")
+        display_index = index + 1
         if source_kind == "pricing":
-            label = f"Saved price list {index} - {updated_at}"
+            label = f"Saved price list {display_index} - {updated_at}"
         else:
             size_kb = source_info.get("size_kb")
             size_label = f"{size_kb} KB" if size_kb != "" else "Size unavailable"
-            label = f"Saved inventory {index} - {updated_at} - {size_label}"
+            label = f"Saved inventory {display_index} - {updated_at} - {size_label}"
         choices.append(
             {
+                "token": f"catalog-{index}",
                 "file_name": str(source_info.get("file_name") or ""),
                 "file_path": str(source_info.get("file_path") or ""),
                 "label": label,
@@ -995,9 +997,16 @@ def resolve_catalog_selection(submitted_value: Any, paths: list[str]) -> str:
     clean_value = str(submitted_value or "").strip().replace("\\", "/")
     if not clean_value:
         return ""
-    if clean_value in paths:
+    normalized_paths = [str(path_text).strip().replace("\\", "/") for path_text in paths]
+    if clean_value in normalized_paths:
         return clean_value
-    matches = [path_text for path_text in paths if Path(path_text).name == clean_value]
+    if clean_value.startswith("catalog-"):
+        token_match = re.fullmatch(r"catalog-(0|[1-9]\d*)", clean_value)
+        if not token_match:
+            return ""
+        choice_index = int(token_match.group(1))
+        return normalized_paths[choice_index] if choice_index < len(normalized_paths) else ""
+    matches = [path_text for path_text in normalized_paths if Path(path_text).name == clean_value]
     return matches[0] if len(matches) == 1 else ""
 
 
@@ -5973,7 +5982,7 @@ def index() -> str:
                 }
                 flash(
                     f"Live {selected_currency} price-list download did not complete. "
-                    f"Using existing local {selected_currency} price list: {Path(source_file).name}.",
+                    f"Using existing local {selected_currency} price list.",
                     "pricing_info",
                 )
                 return True
@@ -6140,7 +6149,7 @@ def index() -> str:
         elif action == "select_pricelist":
             chosen_price_file = resolve_catalog_selection(
                 request.form.get("price_list_file", ""),
-                list_downloaded_price_lists(),
+                price_list_options,
             )
             if not chosen_price_file:
                 field_errors["price_list_file"] = "Select an available OCI price list."

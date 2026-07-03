@@ -359,6 +359,188 @@ def validate_unsupported_currency_workspace_shell() -> None:
     )
 
 
+def validate_pricing_fallback_filename_concealment() -> None:
+    price_file = find_price_file()
+    original_fetch_oci_price_list = app_module.fetch_oci_price_list
+
+    def reject_live_pricing(_currency_code: str) -> dict[str, object]:
+        raise ValueError("Regression fallback trigger")
+
+    app_module.fetch_oci_price_list = reject_live_pricing
+    try:
+        with app_module.app.test_client() as client:
+            response = client.post(
+                "/",
+                data={"action": "download_pricing", "currency_code": "EUR"},
+            )
+    finally:
+        app_module.fetch_oci_price_list = original_fetch_oci_price_list
+
+    html = response.data.decode("utf-8")
+    fallback_flash = re.search(
+        r"Live EUR price-list download did not complete\.\s*Using existing local EUR price list[^<]*",
+        html,
+    )
+    fallback_text = fallback_flash.group(0) if fallback_flash else ""
+    check(
+        "local pricing fallback flash hides the source filename",
+        response.status_code == 200
+        and fallback_flash is not None
+        and Path(price_file).name not in fallback_text
+        and fallback_text.endswith("price list."),
+        fallback_text,
+    )
+
+
+def validate_catalog_choice_tokens() -> None:
+    duplicate_name = "shared_catalog_inventory.csv"
+    duplicate_files = [
+        app_module.RVTOOLS_DIR / "duplicate-source-a" / duplicate_name,
+        app_module.RVTOOLS_DIR / "duplicate-source-b" / duplicate_name,
+    ]
+    for duplicate_file in duplicate_files:
+        duplicate_file.parent.mkdir(parents=True, exist_ok=True)
+        duplicate_file.write_bytes(CSV_INVENTORY.read_bytes())
+
+    try:
+        inventory_paths = app_module.list_rvtools_export_files()
+        duplicate_paths = [
+            path_text for path_text in inventory_paths if Path(path_text).name == duplicate_name
+        ]
+        inventory_choices = app_module.build_catalog_choices(inventory_paths, "inventory")
+        expected_inventory_tokens = [f"catalog-{index}" for index in range(len(inventory_paths))]
+        inventory_tokens = [choice.get("token", "") for choice in inventory_choices]
+        token_by_path = {
+            str(choice.get("file_path", "")): str(choice.get("token", ""))
+            for choice in inventory_choices
+        }
+        expected_duplicate_tokens = {
+            path_text: f"catalog-{inventory_paths.index(path_text)}"
+            for path_text in duplicate_paths
+        }
+        duplicate_token_resolutions = {
+            path_text: app_module.resolve_catalog_selection(token, inventory_paths)
+            for path_text, token in expected_duplicate_tokens.items()
+        }
+
+        price_paths = app_module.list_downloaded_price_lists()[: app_module.MAX_VISIBLE_PRICE_LISTS]
+        price_choices = app_module.build_catalog_choices(price_paths, "pricing")
+        expected_price_tokens = [f"catalog-{index}" for index in range(len(price_paths))]
+        price_tokens = [choice.get("token", "") for choice in price_choices]
+
+        malformed_tokens = [
+            "catalog-",
+            "catalog-x",
+            "catalog--1",
+            "catalog-01",
+            f"catalog-{len(inventory_paths)}",
+            "catalog-999999",
+        ]
+        malformed_results = {
+            token: app_module.resolve_catalog_selection(token, inventory_paths)
+            for token in malformed_tokens
+        }
+        exact_path_results = {
+            path_text: app_module.resolve_catalog_selection(path_text, inventory_paths)
+            for path_text in duplicate_paths
+        }
+        unique_basename_result = app_module.resolve_catalog_selection(
+            CSV_INVENTORY.name,
+            inventory_paths,
+        )
+        duplicate_basename_result = app_module.resolve_catalog_selection(
+            duplicate_name,
+            inventory_paths,
+        )
+
+        with app_module.app.test_client() as client:
+            response = client.get("/")
+            html = response.data.decode("utf-8")
+            inventory_select = re.search(r'<select[^>]*id="rvtools_file".*?</select>', html, re.S)
+            inventory_option_values = (
+                re.findall(r'<option[^>]*value="([^"]*)"', inventory_select.group(0))
+                if inventory_select
+                else []
+            )
+            price_select = re.search(r'<select[^>]*id="price_list_file".*?</select>', html, re.S)
+            price_option_values = (
+                re.findall(r'<option[^>]*value="([^"]*)"', price_select.group(0))
+                if price_select
+                else []
+            )
+
+            duplicate_route_results: dict[str, str] = {}
+            for path_text, token in expected_duplicate_tokens.items():
+                client.post(
+                    "/",
+                    data={
+                        "action": "select_rvtools_file",
+                        "inventory_mode": "upload",
+                        "rvtools_file": token,
+                    },
+                )
+                with client.session_transaction() as sess:
+                    duplicate_route_results[path_text] = str(sess.get("selected_rvtools_file", ""))
+
+            selected_price_path = price_paths[0] if price_paths else ""
+            selected_price_token = expected_price_tokens[0] if expected_price_tokens else ""
+            if selected_price_token:
+                client.post(
+                    "/",
+                    data={
+                        "action": "select_pricelist",
+                        "price_list_file": selected_price_token,
+                    },
+                )
+            with client.session_transaction() as sess:
+                selected_price_result = str(sess.get("selected_pricelist_file", ""))
+
+        token_contract = (
+            len(duplicate_paths) == 2
+            and inventory_tokens == expected_inventory_tokens
+            and all(token_by_path.get(path_text) == token for path_text, token in expected_duplicate_tokens.items())
+            and duplicate_token_resolutions == {path_text: path_text for path_text in duplicate_paths}
+            and price_tokens == expected_price_tokens
+            and all(result == "" for result in malformed_results.values())
+            and exact_path_results == {path_text: path_text for path_text in duplicate_paths}
+            and unique_basename_result == str(CSV_INVENTORY).replace("\\", "/")
+            and duplicate_basename_result == ""
+            and all(token in inventory_option_values for token in expected_duplicate_tokens.values())
+            and duplicate_name not in inventory_option_values
+            and all(path_text not in inventory_option_values for path_text in duplicate_paths)
+            and all(token in price_option_values for token in expected_price_tokens)
+            and all(Path(path_text).name not in price_option_values for path_text in price_paths)
+            and duplicate_route_results == {path_text: path_text for path_text in duplicate_paths}
+            and selected_price_result == selected_price_path
+        )
+        check(
+            "opaque catalog tokens select duplicate basenames independently",
+            token_contract,
+            json.dumps(
+                {
+                    "inventory_tokens": inventory_tokens,
+                    "expected_inventory_tokens": expected_inventory_tokens,
+                    "duplicate_token_resolutions": duplicate_token_resolutions,
+                    "malformed_results": malformed_results,
+                    "inventory_option_values": inventory_option_values,
+                    "duplicate_route_results": duplicate_route_results,
+                    "price_tokens": price_tokens,
+                    "price_option_values": price_option_values,
+                    "selected_price_result": selected_price_result,
+                    "selected_price_path": selected_price_path,
+                },
+                sort_keys=True,
+            ),
+        )
+    finally:
+        for duplicate_file in duplicate_files:
+            duplicate_file.unlink(missing_ok=True)
+            try:
+                duplicate_file.parent.rmdir()
+            except OSError:
+                pass
+
+
 def validate_workspace_context_contracts() -> None:
     state_id = f"workspace_contract_{uuid4().hex}"
     with app_module.app.test_request_context("/"):
@@ -589,7 +771,7 @@ def validate_price_list_dropdown_policy() -> None:
         response = client.get("/")
         html = response.data.decode("utf-8")
         price_select = re.search(r'<select[^>]*id="price_list_file".*?</select>', html, re.S)
-        price_option_count = len(re.findall(r'<option value="[^"]*oci_pricing_', price_select.group(0))) if price_select else 0
+        price_option_count = len(re.findall(r'<option value="catalog-\d+"', price_select.group(0))) if price_select else 0
         check("price list dropdown capped at 10", price_option_count == 10, str(price_option_count))
         check(
             "currency list EMEA plus USD",
@@ -2107,6 +2289,8 @@ def main() -> None:
     validate_workspace_shell_behavior()
     validate_workspace_source_contracts()
     validate_unsupported_currency_workspace_shell()
+    validate_pricing_fallback_filename_concealment()
+    validate_catalog_choice_tokens()
     validate_shared_workspace_shell()
     validate_stage1_setup_redesign()
     validate_stage1_identity_save_and_loaded_manual_mode()
