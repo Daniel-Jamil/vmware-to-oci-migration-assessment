@@ -1,0 +1,38 @@
+{
+  "BM.DenseIO2.52": {
+    "1_year": 35.0,
+    "3_year": 45.0
+  },
+  "BM.DenseIO.E4.128": {
+    "1_year": 35.0,
+    "3_year": 50.0
+  },
+  "BM.Standard3.64": {
+    "1_year": 30.0,
+    "3_year": 40.0
+  },
+  "BM.Standard2.52": {
+    "1_year": 35.0,
+    "3_year": 45.0
+  },
+  "BM.Standard.E4.128": {
+    "1_year": 35.0,
+    "3_year": 45.0
+  },
+  "BM.GPU.A10.4": {
+    "1_year": 35.0,
+    "3_year": 45.0
+  },
+  "BM.Standard.E5.192": {
+    "1_year": 35.0,
+    "3_year": 50.0
+  },
+  "BM.DenseIO.E5.128": {
+    "1_year": 35.0,
+    "3_year": 50.0
+  },
+  "BM.Optimized3.36": {
+    "1_year": 10.0,
+    "3_year": 50.0
+  }
+}

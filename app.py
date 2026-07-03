@@ -136,6 +136,7 @@ SUPPORTED_RVTOOLS_EXTENSIONS = {".xlsx", ".xlsm", ".csv"}
 OS_MAPPING_CONFIG_PATH = Path("config/os_mapping.json")
 OCI_SUPPORTED_OS_PATH = Path("OCI-SupportedOS.txt")
 OCI_PRICE_MAPPING_PATH = Path("OCI-PriceMapping")
+OCVS_TERM_DISCOUNTS_PATH = Path("config/ocvs_term_discounts.json")
 APP_STATE_DIR = Path("downloads/app_state")
 PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_VISIBLE_PRICE_LISTS = 10
@@ -146,6 +147,12 @@ MIN_BLOCK_VOLUME_GB = 50
 VPU_OPTIONS = list(range(10, 121, 10))
 VALID_BURST_VALUES = {"100%", "50%", "12.5%", "1:1"}
 VALID_OCVS_DR_NODE_COUNTS = {0, 1, 2}
+OCVS_COMMITMENT_TERMS = {"payg", "1_year", "3_year"}
+OCVS_COMMITMENT_LABELS = {
+    "payg": "Pay as you go",
+    "1_year": "1-Year",
+    "3_year": "3-Year",
+}
 BURST_FACTOR_MAP = {
     "100%": 1.0,
     "1:1": 1.0,
@@ -170,6 +177,18 @@ OCVS_DEFAULT_SIZING_POLICY = {
     "storage_headroom_pct": 25.0,
     "dense_vsan_usable_pct": 50.0,
     "standard_storage_vpu": 10,
+}
+
+OCVS_DEFAULT_TERM_DISCOUNTS = {
+    "BM.DenseIO2.52": {"1_year": 35.0, "3_year": 45.0},
+    "BM.DenseIO.E4.128": {"1_year": 35.0, "3_year": 50.0},
+    "BM.Standard3.64": {"1_year": 30.0, "3_year": 40.0},
+    "BM.Standard2.52": {"1_year": 35.0, "3_year": 45.0},
+    "BM.Standard.E4.128": {"1_year": 35.0, "3_year": 45.0},
+    "BM.GPU.A10.4": {"1_year": 35.0, "3_year": 45.0},
+    "BM.Standard.E5.192": {"1_year": 35.0, "3_year": 50.0},
+    "BM.DenseIO.E5.128": {"1_year": 35.0, "3_year": 50.0},
+    "BM.Optimized3.36": {"1_year": 10.0, "3_year": 50.0},
 }
 
 OCVS_HOST_PROFILES = [
@@ -309,6 +328,7 @@ def _default_app_state() -> dict[str, Any]:
         "step4_iaas_discount_pct": 0.0,
         "step4_ocvs_profile": "best_fit",
         "step4_ocvs_policy": dict(OCVS_DEFAULT_SIZING_POLICY),
+        "step4_ocvs_commitment_term": "payg",
         "step4_vmware_license_price_per_core_yearly": 0.0,
         "step4_ocvs_dr_nodes": 0,
         "step4_last_updated_at": "",
@@ -319,6 +339,23 @@ def normalize_ocvs_profile(value: Any) -> str:
     selected = str(value or "best_fit").strip()
     valid_shapes = {str(profile.get("shape", "")).strip() for profile in OCVS_HOST_PROFILES}
     return selected if selected == "best_fit" or selected in valid_shapes else "best_fit"
+
+
+def normalize_ocvs_commitment_term(value: Any) -> str:
+    selected = str(value or "payg").strip().lower().replace("-", "_")
+    aliases = {
+        "pay_as_you_go": "payg",
+        "paygo": "payg",
+        "payg": "payg",
+        "1yr": "1_year",
+        "1_year": "1_year",
+        "one_year": "1_year",
+        "3yr": "3_year",
+        "3_year": "3_year",
+        "three_year": "3_year",
+    }
+    selected = aliases.get(selected, selected)
+    return selected if selected in OCVS_COMMITMENT_TERMS else "payg"
 
 
 def normalize_ocvs_dr_nodes(value: Any) -> int:
@@ -356,6 +393,44 @@ def normalize_ocvs_policy(value: Any) -> dict[str, Any]:
         "dense_vsan_usable_pct": _bounded_float(raw.get("dense_vsan_usable_pct"), float(default["dense_vsan_usable_pct"]), 10.0, 95.0),
         "standard_storage_vpu": _bounded_int(raw.get("standard_storage_vpu"), int(default["standard_storage_vpu"]), 10, 120),
     }
+
+
+def load_ocvs_term_discounts() -> dict[str, dict[str, float]]:
+    discounts: dict[str, dict[str, float]] = {
+        shape: {term: float(value) for term, value in terms.items()}
+        for shape, terms in OCVS_DEFAULT_TERM_DISCOUNTS.items()
+    }
+    if not OCVS_TERM_DISCOUNTS_PATH.exists():
+        return discounts
+
+    try:
+        loaded = json.loads(OCVS_TERM_DISCOUNTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return discounts
+    if not isinstance(loaded, dict):
+        return discounts
+
+    for shape, term_values in loaded.items():
+        if not isinstance(term_values, dict):
+            continue
+        clean_shape = str(shape or "").strip()
+        if not clean_shape:
+            continue
+        shape_discounts = discounts.setdefault(clean_shape, {})
+        for term, raw_pct in term_values.items():
+            clean_term = normalize_ocvs_commitment_term(term)
+            if clean_term == "payg":
+                continue
+            shape_discounts[clean_term] = _bounded_float(raw_pct, 0.0, 0.0, 100.0)
+    return discounts
+
+
+def ocvs_term_discount_pct(shape: Any, commitment_term: Any) -> float:
+    term = normalize_ocvs_commitment_term(commitment_term)
+    if term == "payg":
+        return 0.0
+    shape_key = str(shape or "").strip()
+    return float(load_ocvs_term_discounts().get(shape_key, {}).get(term, 0.0) or 0.0)
 
 
 def _state_file_path() -> Path:
@@ -481,6 +556,9 @@ def load_app_state() -> dict[str, Any]:
     default["step4_iaas_discount_pct"] = max(0.0, min(100.0, discount_value))
     default["step4_ocvs_profile"] = normalize_ocvs_profile(default.get("step4_ocvs_profile", "best_fit"))
     default["step4_ocvs_policy"] = normalize_ocvs_policy(default.get("step4_ocvs_policy", {}))
+    default["step4_ocvs_commitment_term"] = normalize_ocvs_commitment_term(
+        default.get("step4_ocvs_commitment_term", "payg")
+    )
     default["step4_vmware_license_price_per_core_yearly"] = _bounded_float(
         default.get("step4_vmware_license_price_per_core_yearly"),
         0.0,
@@ -1718,6 +1796,137 @@ def build_inventory_import_summary(vm_rows: list[dict[str, Any]], source: str) -
     }
 
 
+def _parse_manual_sizing_int(form_key: str, label: str) -> int:
+    raw_value = str(request.form.get(form_key, "")).strip()
+    try:
+        parsed = int(float(raw_value))
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a whole number.")
+    if parsed < 0:
+        raise ValueError(f"{label} cannot be negative.")
+    return parsed
+
+
+def _distribute_integer_total(total: int, count: int) -> list[int]:
+    if count <= 0:
+        return []
+    base = total // count
+    remainder = total % count
+    return [base + (1 if idx < remainder else 0) for idx in range(count)]
+
+
+def create_manual_inventory_csv_from_form() -> tuple[Path, list[str]]:
+    vm_count = _parse_manual_sizing_int("manual_vm_count", "VM count")
+    total_vcpus = _parse_manual_sizing_int("manual_total_vcpus", "Total vCPU")
+    total_memory_gb = _parse_manual_sizing_int("manual_total_memory_gb", "Total RAM GB")
+    total_storage_gb = _parse_manual_sizing_int("manual_total_storage_gb", "Total storage GB")
+    supported_count = _parse_manual_sizing_int("manual_supported_vm_count", "OCI-supported VM count")
+    unsupported_count = _parse_manual_sizing_int("manual_unsupported_vm_count", "Unsupported/legacy VM count")
+
+    if vm_count <= 0:
+        raise ValueError("VM count must be greater than zero.")
+    if supported_count + unsupported_count != vm_count:
+        raise ValueError("Manual sizing counts must add up to the VM count.")
+    if total_vcpus < vm_count or total_memory_gb < vm_count or total_storage_gb < vm_count:
+        raise ValueError("Total vCPU, RAM GB, and storage GB must each be at least the VM count.")
+
+    cpu_values = _distribute_integer_total(total_vcpus, vm_count)
+    memory_gb_values = _distribute_integer_total(total_memory_gb, vm_count)
+    storage_gb_values = _distribute_integer_total(total_storage_gb, vm_count)
+    os_values = ["Oracle Linux 8 (64-bit)"] * supported_count + ["Solaris 11.4 (64-bit)"] * unsupported_count
+
+    manual_dir = RVTOOLS_DIR / "manual"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    file_path = manual_dir / f"manual_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.csv"
+    vm_names: list[str] = []
+    headers = [
+        "VM",
+        "Powerstate",
+        "Template",
+        "OS according to the configuration file",
+        "CPUs",
+        "Memory",
+        "Provisioned MiB",
+    ]
+    with file_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for idx in range(vm_count):
+            vm_name = f"manual-vm-{idx + 1:03d}"
+            vm_names.append(vm_name)
+            writer.writerow(
+                [
+                    vm_name,
+                    "poweredOn",
+                    "False",
+                    os_values[idx],
+                    cpu_values[idx],
+                    memory_gb_values[idx] * 1024,
+                    storage_gb_values[idx] * 1024,
+                ]
+            )
+
+    return file_path, vm_names
+
+
+def is_manual_inventory_path(path_text: Any) -> bool:
+    clean_path = str(path_text or "").strip().replace("\\", "/")
+    if not clean_path:
+        return False
+    path = Path(clean_path)
+    return path.parent.name == "manual" and path.name.startswith("manual_inventory_") and path.suffix.lower() == ".csv"
+
+
+def default_manual_sizing_form() -> dict[str, Any]:
+    return {
+        "is_active": False,
+        "submit_label": "Create Manual Inventory",
+        "vm_count": "",
+        "total_vcpus": "",
+        "total_memory_gb": "",
+        "total_storage_gb": "",
+        "supported_vm_count": "0",
+        "unsupported_vm_count": "0",
+    }
+
+
+def build_manual_sizing_form(selected_path: Any) -> dict[str, Any]:
+    form_state = default_manual_sizing_form()
+    if not is_manual_inventory_path(selected_path):
+        return form_state
+
+    try:
+        vm_rows, _source = load_vms_from_vinfo(str(selected_path))
+    except Exception:
+        return form_state
+    if not vm_rows:
+        return form_state
+
+    unsupported_count = sum(
+        1
+        for row in vm_rows
+        if str(row.get("mapped_os") or "").strip().lower().startswith("unmapped")
+    )
+    supported_count = max(0, len(vm_rows) - unsupported_count)
+    form_state.update(
+        {
+            "is_active": True,
+            "submit_label": "Update Manual Inventory",
+            "vm_count": str(len(vm_rows)),
+            "total_vcpus": str(int(sum(_to_number(row.get("cpus")) for row in vm_rows))),
+            "total_memory_gb": str(
+                int(sum(math.ceil(_to_number(row.get("memory_mb")) / 1024.0) for row in vm_rows))
+            ),
+            "total_storage_gb": str(
+                int(sum(math.ceil(_to_number(row.get("provisioned_mib")) / 1024.0) for row in vm_rows))
+            ),
+            "supported_vm_count": str(supported_count),
+            "unsupported_vm_count": str(unsupported_count),
+        }
+    )
+    return form_state
+
+
 def build_rejected_inventory_info(file_info: dict[str, Any], reason: str) -> dict[str, Any]:
     reason_text = str(reason or "").strip()
     normalized_reason = reason_text.lower()
@@ -1853,6 +2062,7 @@ def build_ocvs_price_summary(
     selected_profile: str = "best_fit",
     dr_node_count: int = 0,
     vmware_license_price_per_core_yearly: float = 0.0,
+    ocvs_commitment_term: str = "payg",
 ) -> dict[str, Any]:
     """Size OCVS host options from selected VM totals and return the lowest-cost profile."""
     total_vcpus = sum(int(row.get("cpus", 0) or 0) for row in vm_rows)
@@ -1862,6 +2072,8 @@ def build_ocvs_price_summary(
 
     policy = normalize_ocvs_policy(policy or OCVS_DEFAULT_SIZING_POLICY)
     selected_profile = normalize_ocvs_profile(selected_profile)
+    ocvs_commitment_term = normalize_ocvs_commitment_term(ocvs_commitment_term)
+    ocvs_commitment_label = OCVS_COMMITMENT_LABELS.get(ocvs_commitment_term, OCVS_COMMITMENT_LABELS["payg"])
     dr_node_count = normalize_ocvs_dr_nodes(dr_node_count)
     vcpu_per_ocpu = max(1.0, float(policy["vcpu_per_ocpu"]))
     cpu_headroom_factor = max(0.01, 1.0 - (float(policy["cpu_headroom_pct"]) / 100.0))
@@ -1915,11 +2127,13 @@ def build_ocvs_price_summary(
         ocpu_unit_price = float(price_lookup.get(str(profile.get("ocpu_display_name", "")).strip(), 0.0))
         memory_unit_price = float(price_lookup.get(str(profile.get("memory_display_name", "")).strip(), 0.0))
         nvme_unit_price = float(price_lookup.get(str(profile.get("nvme_display_name", "")).strip(), 0.0))
+        commitment_discount_pct = ocvs_term_discount_pct(profile.get("shape", ""), ocvs_commitment_term)
+        commitment_discount_factor = max(0.0, min(1.0, 1.0 - (commitment_discount_pct / 100.0)))
         host_monthly_cost = (
             (ocpus * ocpu_unit_price * HOURS_PER_MONTH)
             + (memory_gb * memory_unit_price * HOURS_PER_MONTH)
             + (nvme_tb * nvme_unit_price * HOURS_PER_MONTH)
-        ) * discount_factor
+        ) * discount_factor * commitment_discount_factor
         total_monthly_cost = (host_count * host_monthly_cost) + storage_monthly_cost
         physical_cores = host_count * ocpus
         vmware_license_yearly_cost = physical_cores * price_per_core_yearly
@@ -1966,6 +2180,9 @@ def build_ocvs_price_summary(
                 "vmware_license_monthly_cost": vmware_license_monthly_cost,
                 "vmware_license_yearly_cost": vmware_license_yearly_cost,
                 "selection_monthly_cost": selection_monthly_cost,
+                "commitment_term": ocvs_commitment_term,
+                "commitment_label": ocvs_commitment_label,
+                "commitment_discount_pct": commitment_discount_pct,
                 "ocpus_per_host": ocpus,
                 "memory_gb_per_host": memory_gb,
                 "raw_storage_tb_per_host": nvme_tb,
@@ -1999,6 +2216,8 @@ def build_ocvs_price_summary(
         },
         "policy": policy,
         "dr_node_count": dr_node_count,
+        "commitment_term": ocvs_commitment_term,
+        "commitment_label": ocvs_commitment_label,
     }
 
 
@@ -2784,6 +3003,7 @@ def build_price_analysis_from_rows(
     source_pricelist_file: str,
     vmware_license_price_per_core_yearly: float,
     ocvs_dr_nodes: int,
+    ocvs_commitment_term: str = "payg",
     hybrid_placement_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     overall = summarize_native_price(vm_rows)
@@ -2797,6 +3017,7 @@ def build_price_analysis_from_rows(
         selected_profile=ocvs_profile_choice,
         dr_node_count=ocvs_dr_nodes,
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_commitment_term=ocvs_commitment_term,
     )
     ocvs_selected = ocvs_price["selected"]
     supported_signatures = load_supported_os_signatures()
@@ -2827,6 +3048,7 @@ def build_price_analysis_from_rows(
         selected_profile=ocvs_profile_choice,
         dr_node_count=ocvs_dr_nodes,
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_commitment_term=ocvs_commitment_term,
     )
     hybrid_ocvs_selected = hybrid_ocvs_price["selected"]
     vmware_license_summary = build_vmware_license_summary(
@@ -3053,6 +3275,7 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
     iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
     ocvs_profile_choice = normalize_ocvs_profile(app_state.get("step4_ocvs_profile", "best_fit"))
     ocvs_policy = normalize_ocvs_policy(app_state.get("step4_ocvs_policy", {}))
+    ocvs_commitment_term = normalize_ocvs_commitment_term(app_state.get("step4_ocvs_commitment_term", "payg"))
     vmware_license_price_per_core_yearly = _bounded_float(
         app_state.get("step4_vmware_license_price_per_core_yearly"),
         0.0,
@@ -3099,6 +3322,7 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         source_pricelist_file=source_pricelist_file,
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
         ocvs_dr_nodes=ocvs_dr_nodes,
+        ocvs_commitment_term=ocvs_commitment_term,
         hybrid_placement_selection=hybrid_placement_selection,
     )
     migration_waves = build_migration_waves(
@@ -3116,6 +3340,7 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         "vm_rows": vm_rows,
         "ocvs_profile_choice": ocvs_profile_choice,
         "ocvs_policy": ocvs_policy,
+        "ocvs_commitment_term": ocvs_commitment_term,
         "ocvs_dr_nodes": ocvs_dr_nodes,
         "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
         "step4_last_updated_at": step4_last_updated_at,
@@ -3555,6 +3780,7 @@ def build_migration_price_workbook_xlsx(
     iaas_discount_pct: float,
     ocvs_profile_choice: str,
     ocvs_policy: dict[str, Any],
+    ocvs_commitment_term: str,
     ocvs_dr_nodes: int,
     vmware_license_price_per_core_yearly: float,
     block_storage_unit_price: float,
@@ -3596,6 +3822,9 @@ def build_migration_price_workbook_xlsx(
     vmware_license_summary = analysis["vmware_license_summary"]
     hybrid_placement_plan = analysis.get("hybrid_placement_plan", {})
     hybrid_placement_rows = list(hybrid_placement_plan.get("rows", []))
+    ocvs_commitment_term = normalize_ocvs_commitment_term(ocvs_commitment_term)
+    ocvs_commitment_label = OCVS_COMMITMENT_LABELS.get(ocvs_commitment_term, OCVS_COMMITMENT_LABELS["payg"])
+    ocvs_commitment_discount_pct = float(ocvs_price.get("selected", {}).get("commitment_discount_pct", 0.0) or 0.0)
 
     def money(value: Any) -> float:
         return float(value or 0.0)
@@ -3666,6 +3895,8 @@ def build_migration_price_workbook_xlsx(
             ["Windows OS Unit Price", money(windows_os_unit_price), pricing_currency or "USD"],
             ["IaaS Discount Factor", max(0.0, min(1.0, 1.0 - (float(iaas_discount_pct or 0.0) / 100.0))), ""],
             ["IaaS Discount %", float(iaas_discount_pct or 0.0) / 100.0, ""],
+            ["OCVS Commitment Term", ocvs_commitment_label, ""],
+            ["OCVS Commitment Discount %", ocvs_commitment_discount_pct / 100.0, ""],
             ["VCF List Price / Core / Year", money(vmware_license_price_per_core_yearly), pricing_currency or "USD"],
         ]
         row_count = max(len(shape_rows), len(parameter_rows))
@@ -4296,6 +4527,12 @@ def build_migration_price_workbook_xlsx(
         [
             ["Selected Shape", ocvs_selected.get("shape", ""), ocvs_selected.get("label", "")],
             ["Host Type", ocvs_selected.get("host_type", ""), ""],
+            ["OCVS Commitment Term", ocvs_selected.get("commitment_label", ocvs_commitment_label), ""],
+            [
+                "OCVS Commitment Discount",
+                float(ocvs_selected.get("commitment_discount_pct", 0.0) or 0.0) / 100.0,
+                "Applied to OCVS host compute only.",
+            ],
             ["Required Nodes Before Spare", integer(ocvs_selected.get("base_host_count")), ""],
             ["Spare Nodes", integer(ocvs_selected.get("dr_node_count")), ""],
             ["Total Nodes Including Spare", integer(ocvs_selected.get("host_count")), selected_shape_reason],
@@ -4303,7 +4540,8 @@ def build_migration_price_workbook_xlsx(
             ["OCPUs / Node", integer(ocvs_selected.get("ocpus_per_host")), ""],
             ["RAM GB / Node", integer(ocvs_selected.get("memory_gb_per_host")), ""],
         ],
-        integer_rows={3, 4, 5, 7, 8},
+        percent_rows={4},
+        integer_rows={5, 6, 7, 9, 10},
     )
     add_section(rows, row_styles, "Capacity Drivers")
     add_table(
@@ -4616,6 +4854,8 @@ def build_migration_price_workbook_xlsx(
             cell_styles[(row_idx, 6)] = STYLE_CURRENCY
         elif parameter == "IaaS Discount %":
             cell_styles[(row_idx, 6)] = STYLE_PERCENT
+        elif parameter == "OCVS Commitment Discount %":
+            cell_styles[(row_idx, 6)] = STYLE_PERCENT
     price_list_sheet = {
         "name": "Price List",
         "rows": rows,
@@ -4650,13 +4890,15 @@ def build_migration_price_workbook_xlsx(
         cell_styles,
         [
             ["IaaS discount", float(iaas_discount_pct) / 100.0, "Applied to OCI compute/storage run-rate where modeled."],
+            ["OCVS Commitment Term", ocvs_commitment_label, "Applied to OCVS host compute only."],
+            ["OCVS Commitment Discount", ocvs_commitment_discount_pct / 100.0, "Selected shape discount for the active term."],
             ["Block Volume capacity unit price", money(block_storage_unit_price), pricing_currency or "USD"],
             ["Block Volume performance unit price", money(block_perf_unit_price), pricing_currency or "USD"],
             ["Windows OS unit price", money(windows_os_unit_price), pricing_currency or "USD"],
             ["VCF list price / core / year", money(vmware_license_price_per_core_yearly), pricing_currency or "USD"],
         ],
-        percent_rows={1},
-        currency_rows={2, 3, 4, 5},
+        percent_rows={1, 3},
+        currency_rows={4, 5, 6, 7},
     )
     add_section(rows, row_styles, "OCVS Profile Assumptions")
     add_key_values(
@@ -4665,6 +4907,8 @@ def build_migration_price_workbook_xlsx(
         cell_styles,
         [
             ["OCVS profile", "Lowest cost" if ocvs_profile_choice == "best_fit" else ocvs_profile_choice, ""],
+            ["OCVS Commitment Term", ocvs_commitment_label, ""],
+            ["OCVS Commitment Discount", ocvs_commitment_discount_pct / 100.0, ""],
             ["vCPU per OCPU", float(ocvs_policy["vcpu_per_ocpu"]), ""],
             ["CPU headroom", float(ocvs_policy["cpu_headroom_pct"]) / 100.0, ""],
             ["RAM headroom", float(ocvs_policy["memory_headroom_pct"]) / 100.0, ""],
@@ -4673,8 +4917,8 @@ def build_migration_price_workbook_xlsx(
             ["Standard datastore VPU", integer(ocvs_policy["standard_storage_vpu"]), "VPU/GB"],
             ["Spare nodes", integer(ocvs_dr_nodes), ""],
         ],
-        percent_rows={3, 4, 5, 6},
-        integer_rows={7, 8},
+        percent_rows={3, 5, 6, 7, 8},
+        integer_rows={9, 10},
     )
     add_section(rows, row_styles, "Shape Mapping and Pricing")
     add_table(
@@ -4876,6 +5120,7 @@ def index() -> str:
                     rvtools_import_summary=rvtools_import_summary,
                     rvtools_rejected_info=rvtools_rejected_info,
                     customer_name=customer_name,
+                    manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
                 )
 
             def use_local_price_list_fallback(reason: str) -> bool:
@@ -5028,6 +5273,37 @@ def index() -> str:
                         "VM inventory export file uploaded, selected, and validated successfully.",
                     )
 
+        elif action == "create_manual_inventory":
+            is_update = is_manual_inventory_path(selected_rvtools_file)
+            try:
+                manual_path, _generated_names = create_manual_inventory_csv_from_form()
+                vm_rows, source = load_vms_from_vinfo(str(manual_path))
+            except ValueError as exc:
+                flash(str(exc), "rvtools_error")
+            except Exception as exc:
+                flash(f"Manual workload summary could not be created: {exc}", "rvtools_error")
+            else:
+                clear_rejected_inventory()
+                selected_rvtools_file = str(manual_path).replace("\\", "/")
+                rvtools_file_info = {
+                    "file_path": selected_rvtools_file,
+                    "file_name": manual_path.name,
+                    "size_kb": round(manual_path.stat().st_size / 1024, 2),
+                }
+                rvtools_import_summary = build_inventory_import_summary(vm_rows, source)
+                session["selected_rvtools_file"] = selected_rvtools_file
+                session["rvtools_file_info"] = rvtools_file_info
+                session["rvtools_import_summary"] = rvtools_import_summary
+                manual_state = _default_app_state()
+                manual_state["selected_vm_names"] = [str(row.get("name", "")) for row in vm_rows if str(row.get("name", ""))]
+                save_app_state(manual_state)
+                clear_step4_snapshot()
+                action_word = "updated" if is_update else "created"
+                flash(
+                    f"Manual workload summary {action_word} with {len(manual_state['selected_vm_names']):,} generated VM row(s).",
+                    "rvtools_success",
+                )
+
         elif action == "select_pricelist":
             chosen_price_file = str(request.form.get("price_list_file", "")).strip().replace("\\", "/")
             if not chosen_price_file:
@@ -5079,6 +5355,7 @@ def index() -> str:
         rvtools_import_summary=rvtools_import_summary,
         rvtools_rejected_info=rvtools_rejected_info,
         customer_name=customer_name,
+        manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
     )
 
 
@@ -5323,6 +5600,7 @@ def step4() -> str:
     iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
     ocvs_profile_choice = normalize_ocvs_profile(app_state.get("step4_ocvs_profile", "best_fit"))
     ocvs_policy = normalize_ocvs_policy(app_state.get("step4_ocvs_policy", {}))
+    ocvs_commitment_term = normalize_ocvs_commitment_term(app_state.get("step4_ocvs_commitment_term", "payg"))
     vmware_license_price_per_core_yearly = _bounded_float(
         app_state.get("step4_vmware_license_price_per_core_yearly"),
         0.0,
@@ -5345,6 +5623,9 @@ def step4() -> str:
         restored_hybrid_placements = dict(hybrid_placement_selection)
         restored_ocvs_profile = normalize_ocvs_profile(snapshot.get("ocvs_profile", ocvs_profile_choice))
         restored_ocvs_policy = normalize_ocvs_policy(snapshot.get("ocvs_policy", ocvs_policy))
+        restored_ocvs_commitment_term = normalize_ocvs_commitment_term(
+            snapshot.get("ocvs_commitment_term", ocvs_commitment_term)
+        )
         restored_vmware_license_price = _bounded_float(
             snapshot.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly),
             vmware_license_price_per_core_yearly,
@@ -5397,6 +5678,7 @@ def step4() -> str:
         hybrid_placement_selection = restored_hybrid_placements
         ocvs_profile_choice = restored_ocvs_profile
         ocvs_policy = restored_ocvs_policy
+        ocvs_commitment_term = restored_ocvs_commitment_term
         vmware_license_price_per_core_yearly = restored_vmware_license_price
         ocvs_dr_nodes = restored_ocvs_dr_nodes
 
@@ -5408,6 +5690,7 @@ def step4() -> str:
         app_state["step4_hybrid_placements"] = hybrid_placement_selection
         app_state["step4_ocvs_profile"] = ocvs_profile_choice
         app_state["step4_ocvs_policy"] = ocvs_policy
+        app_state["step4_ocvs_commitment_term"] = ocvs_commitment_term
         app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
         if snapshot.get("saved_at") and not app_state.get("step4_last_updated_at"):
@@ -5448,6 +5731,9 @@ def step4() -> str:
             request.form.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly)
         ).strip()
         ocvs_profile_choice = normalize_ocvs_profile(request.form.get("ocvs_profile", ocvs_profile_choice))
+        ocvs_commitment_term = normalize_ocvs_commitment_term(
+            request.form.get("ocvs_commitment_term", ocvs_commitment_term)
+        )
         ocvs_dr_nodes = normalize_ocvs_dr_nodes(request.form.get("ocvs_dr_nodes", ocvs_dr_nodes))
         ocvs_policy = normalize_ocvs_policy(
             {
@@ -5593,6 +5879,7 @@ def step4() -> str:
         app_state["step4_iaas_discount_pct"] = iaas_discount_pct
         app_state["step4_ocvs_profile"] = ocvs_profile_choice
         app_state["step4_ocvs_policy"] = ocvs_policy
+        app_state["step4_ocvs_commitment_term"] = ocvs_commitment_term
         app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
         step4_last_updated_at = datetime.now().isoformat(timespec="seconds")
@@ -5667,6 +5954,7 @@ def step4() -> str:
                     "source_vinfo_csv": source_vinfo_csv,
                     "ocvs_profile": ocvs_profile_choice,
                     "ocvs_policy": ocvs_policy,
+                    "ocvs_commitment_term": ocvs_commitment_term,
                     "ocvs_dr_nodes": ocvs_dr_nodes,
                     "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
                     "vm_settings": all_vm_settings,
@@ -5715,6 +6003,7 @@ def step4() -> str:
         source_pricelist_file=source_pricelist_file,
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
         ocvs_dr_nodes=ocvs_dr_nodes,
+        ocvs_commitment_term=ocvs_commitment_term,
         hybrid_placement_selection=hybrid_placement_selection,
     )
     overall = analysis["overall"]
@@ -5764,6 +6053,7 @@ def step4() -> str:
             iaas_discount_pct=iaas_discount_pct,
             ocvs_profile_choice=ocvs_profile_choice,
             ocvs_policy=ocvs_policy,
+            ocvs_commitment_term=ocvs_commitment_term,
             ocvs_dr_nodes=ocvs_dr_nodes,
             vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
             block_storage_unit_price=block_storage_unit_price,
@@ -5804,6 +6094,11 @@ def step4() -> str:
         hybrid_ocvs_price=hybrid_ocvs_price,
         ocvs_profiles=OCVS_HOST_PROFILES,
         ocvs_profile_choice=ocvs_profile_choice,
+        ocvs_commitment_options=[
+            {"value": value, "label": OCVS_COMMITMENT_LABELS[value]}
+            for value in ["payg", "1_year", "3_year"]
+        ],
+        ocvs_commitment_term=ocvs_commitment_term,
         ocvs_policy=ocvs_policy,
         ocvs_dr_nodes=ocvs_dr_nodes,
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,

@@ -312,6 +312,119 @@ def validate_step3_duplicate_removal() -> None:
         )
 
 
+def validate_manual_sizing_input() -> None:
+    with app_module.app.test_client() as client:
+        response = client.get("/")
+        check(
+            "manual sizing form renders",
+            response.status_code == 200
+            and b"Manual Workload Summary" in response.data
+            and b"manual_windows_vm_count" not in response.data,
+        )
+
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "manual_vm_count": "6",
+                "manual_total_vcpus": "25",
+                "manual_total_memory_gb": "96",
+                "manual_total_storage_gb": "1200",
+                "manual_supported_vm_count": "5",
+                "manual_unsupported_vm_count": "1",
+            },
+            follow_redirects=True,
+        )
+        check(
+            "manual sizing creates inventory",
+            response.status_code == 200
+            and b"Manual workload summary created" in response.data
+            and b"Selected VM Inventory File" in response.data,
+        )
+        check(
+            "manual sizing form prefilled after create",
+            b"Update Manual Inventory" in response.data
+            and b'name="manual_vm_count" type="number" min="1" step="1" value="6"' in response.data
+            and b'name="manual_total_vcpus" type="number" min="1" step="1" value="25"' in response.data
+            and b'name="manual_supported_vm_count" type="number" min="0" step="1" value="5"' in response.data,
+        )
+
+        with client.session_transaction() as sess:
+            selected_file = str(sess.get("selected_rvtools_file", ""))
+        manual_rows, source = app_module.load_vms_from_vinfo(selected_file)
+        state = app_module.load_app_state()
+        selected_names = state.get("selected_vm_names", [])
+        check("manual source path selected", "/manual/" in selected_file.replace("\\", "/"), selected_file)
+        check("manual source loads", len(manual_rows) == 6 and "manual" in source.lower(), source)
+        check("manual rows auto-selected", len(selected_names) == 6, str(selected_names))
+        check(
+            "manual totals preserved",
+            sum(int(row["cpus"]) for row in manual_rows) == 25
+            and sum(int(math.ceil(int(row["memory_mb"]) / 1024.0)) for row in manual_rows) == 96
+            and sum(int(math.ceil(int(row["provisioned_mib"]) / 1024.0)) for row in manual_rows) == 1200,
+            str(manual_rows),
+        )
+
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "manual_vm_count": "4",
+                "manual_total_vcpus": "18",
+                "manual_total_memory_gb": "80",
+                "manual_total_storage_gb": "900",
+                "manual_supported_vm_count": "3",
+                "manual_unsupported_vm_count": "1",
+            },
+            follow_redirects=True,
+        )
+        with client.session_transaction() as sess:
+            updated_selected_file = str(sess.get("selected_rvtools_file", ""))
+        updated_rows, _updated_source = app_module.load_vms_from_vinfo(updated_selected_file)
+        updated_state = app_module.load_app_state()
+        updated_names = updated_state.get("selected_vm_names", [])
+        check(
+            "manual sizing updates existing summary",
+            response.status_code == 200
+            and b"Manual workload summary updated" in response.data
+            and updated_selected_file != selected_file
+            and len(updated_rows) == 4
+            and len(updated_names) == 4,
+            updated_selected_file,
+        )
+        check(
+            "manual updated totals preserved",
+            sum(int(row["cpus"]) for row in updated_rows) == 18
+            and sum(int(math.ceil(int(row["memory_mb"]) / 1024.0)) for row in updated_rows) == 80
+            and sum(int(math.ceil(int(row["provisioned_mib"]) / 1024.0)) for row in updated_rows) == 900,
+            str(updated_rows),
+        )
+        selected_file = updated_selected_file
+
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "manual_vm_count": "5",
+                "manual_total_vcpus": "20",
+                "manual_total_memory_gb": "64",
+                "manual_total_storage_gb": "500",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "2",
+            },
+            follow_redirects=True,
+        )
+        with client.session_transaction() as sess:
+            selected_file_after_invalid = str(sess.get("selected_rvtools_file", ""))
+        check(
+            "manual invalid counts rejected",
+            response.status_code == 200
+            and b"Manual sizing counts must add up to the VM count" in response.data
+            and selected_file_after_invalid == selected_file,
+            selected_file_after_invalid,
+        )
+
+
 def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
     inventory = CSV_INVENTORY
     price_file = find_price_file()
@@ -431,6 +544,7 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                 ("ocvs_dense_vsan_usable_pct", "50"),
                 ("ocvs_standard_storage_vpu", "10"),
                 ("ocvs_dr_nodes", "1"),
+                ("ocvs_commitment_term", "3_year"),
                 ("vmware_license_price_per_core_yearly", "400"),
                 ("hybrid_vm_name", first_vm),
                 ("hybrid_placement", "ocvs"),
@@ -443,6 +557,7 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
 
         state = app_module.load_app_state()
         placements = state.get("step4_hybrid_placements", {})
+        check("ocvs commitment term persists", state.get("step4_ocvs_commitment_term") == "3_year", str(state))
         check(
             "hybrid placement persists",
             placements.get(first_vm) == "ocvs" and placements.get(second_vm) == "native",
@@ -609,6 +724,12 @@ def validate_workbook(workbook_path: Path) -> None:
         )
         check("price comparison sections", all(token in sheet_data["Price Comparison"][0] for token in ["Price Signal", "Ranked Migration Path Price Comparison", "3-Year Cost"]))
         check("ocvs sections", all(token in sheet_data["OCVS Analysis"][0] for token in ["Workload Capacity Requirements", "OCVS Sizing Decision", "Capacity Drivers"]))
+        check(
+            "ocvs commitment exported",
+            "OCVS Commitment Term" in sheet_data["OCVS Analysis"][0]
+            and "OCVS Commitment Term" in sheet_data["Technical Details"][0]
+            and "3-Year" in sheet_data["Technical Details"][0],
+        )
         check("technical sizing notes label", "Sizing Summary Notes" in sheet_data["Technical Details"][0])
         check("old warning labels removed", "Fit Warnings" not in sheet_data["Technical Details"][0] and "Severity" not in sheet_data["Technical Details"][0])
         check(
@@ -671,6 +792,7 @@ def validate_pricing_invariants(state: dict[str, object]) -> None:
             1_000_000.0,
         ),
         ocvs_dr_nodes=app_module.normalize_ocvs_dr_nodes(state.get("step4_ocvs_dr_nodes", 0)),
+        ocvs_commitment_term=app_module.normalize_ocvs_commitment_term(state.get("step4_ocvs_commitment_term", "payg")),
         hybrid_placement_selection=state.get("step4_hybrid_placements", {}),
     )
 
@@ -728,6 +850,62 @@ def validate_pricing_invariants(state: dict[str, object]) -> None:
         analysis["scenario_comparison"]["monthly_spread"] * 36.0,
     )
 
+    payg_analysis = app_module.build_price_analysis_from_rows(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=unit_prices["block_storage_unit_price"],
+        block_perf_unit_price=unit_prices["block_perf_unit_price"],
+        windows_os_unit_price=unit_prices["windows_os_unit_price"],
+        iaas_discount_pct=0.0,
+        ocvs_policy=app_module.normalize_ocvs_policy({}),
+        ocvs_profile_choice="BM.Standard.E4.128",
+        source_pricelist_file=source_pricelist_file,
+        vmware_license_price_per_core_yearly=0.0,
+        ocvs_dr_nodes=0,
+        ocvs_commitment_term="payg",
+        hybrid_placement_selection={},
+    )
+    one_year_analysis = app_module.build_price_analysis_from_rows(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=unit_prices["block_storage_unit_price"],
+        block_perf_unit_price=unit_prices["block_perf_unit_price"],
+        windows_os_unit_price=unit_prices["windows_os_unit_price"],
+        iaas_discount_pct=0.0,
+        ocvs_policy=app_module.normalize_ocvs_policy({}),
+        ocvs_profile_choice="BM.Standard.E4.128",
+        source_pricelist_file=source_pricelist_file,
+        vmware_license_price_per_core_yearly=0.0,
+        ocvs_dr_nodes=0,
+        ocvs_commitment_term="1_year",
+        hybrid_placement_selection={},
+    )
+    three_year_analysis = app_module.build_price_analysis_from_rows(
+        vm_rows=vm_rows,
+        price_lookup=price_lookup,
+        block_storage_unit_price=unit_prices["block_storage_unit_price"],
+        block_perf_unit_price=unit_prices["block_perf_unit_price"],
+        windows_os_unit_price=unit_prices["windows_os_unit_price"],
+        iaas_discount_pct=0.0,
+        ocvs_policy=app_module.normalize_ocvs_policy({}),
+        ocvs_profile_choice="BM.Standard.E4.128",
+        source_pricelist_file=source_pricelist_file,
+        vmware_license_price_per_core_yearly=0.0,
+        ocvs_dr_nodes=0,
+        ocvs_commitment_term="3_year",
+        hybrid_placement_selection={},
+    )
+    payg_host = float(payg_analysis["ocvs_price"]["selected"]["host_monthly_cost"])
+    one_year_host = float(one_year_analysis["ocvs_price"]["selected"]["host_monthly_cost"])
+    three_year_host = float(three_year_analysis["ocvs_price"]["selected"]["host_monthly_cost"])
+    check_close("ocvs one-year term discount", one_year_host, payg_host * 0.65)
+    check_close("ocvs three-year term discount", three_year_host, payg_host * 0.55)
+    check(
+        "hybrid ocvs term metadata",
+        three_year_analysis["hybrid_ocvs_price"]["selected"]["commitment_term"] == "3_year"
+        and three_year_analysis["hybrid_ocvs_price"]["selected"]["commitment_discount_pct"] == 45.0,
+    )
+
 
 def main() -> None:
     create_regression_fixtures()
@@ -745,6 +923,7 @@ def main() -> None:
     )
 
     validate_inventory_imports()
+    validate_manual_sizing_input()
     validate_step3_duplicate_removal()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)
