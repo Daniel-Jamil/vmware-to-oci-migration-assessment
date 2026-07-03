@@ -134,6 +134,25 @@
       </div>
       <div id="native-bulk-pending" class="native-bulk-pending" role="status" aria-live="polite" hidden></div>
 
+      {% set first_native_row = native_vm_input_rows|first %}
+      <div class="native-mobile-row-nav" data-native-mobile-nav hidden>
+        <button
+          type="button"
+          data-native-mobile-previous
+          aria-label="Show previous VM"
+          disabled
+        ><span aria-hidden="true">&larr;</span></button>
+        <span data-native-mobile-status role="status" aria-live="polite" aria-atomic="true">
+          {% if first_native_row %}VM 1 of {{ native_vm_input_rows|length }}: {{ first_native_row.vm_name }}{% else %}No matching VMs{% endif %}
+        </span>
+        <button
+          type="button"
+          data-native-mobile-next
+          aria-label="Show next VM{% if native_vm_input_rows|length > 1 %}, {{ native_vm_input_rows[1].vm_name }}{% endif %}"
+          {% if native_vm_input_rows|length <= 1 %}disabled{% endif %}
+        ><span aria-hidden="true">&rarr;</span></button>
+      </div>
+
       <div class="native-editor-scroll" tabindex="0" role="region" aria-label="Native editor rows">
         <table class="vm-table native-editor-table">
           <thead>
@@ -156,8 +175,12 @@
             {% for row in native_vm_input_rows %}
               {% set row_id = 'native-row-' ~ row.native_row_index %}
               <tr
+                id="native-editor-row-{{ row.native_row_index }}"
                 class="vm-row native-editor-row"
                 data-native-editor-row
+                data-native-mobile-index="{{ loop.index0 }}"
+                data-native-mobile-active="{{ 'true' if loop.first else 'false' }}"
+                data-native-vm-name="{{ row.vm_name }}"
                 data-native-support="{{ row.native_support_state }}"
                 data-memory-gb="{{ row.memory_gb }}"
                 data-provisioned-gb="{{ row.provisioned_gb }}"
@@ -172,15 +195,15 @@
                 data-initial-license-included="{{ 1 if row.os_license == 'Lic Include' else 0 }}"
                 data-initial-vpu="{{ row.vpu }}"
               >
-                <th scope="row">
+                <th scope="row" data-mobile-label="VM">
                   <span class="native-editor-row__name">{{ row.vm_name }}</span>
                   <input type="hidden" name="vm_name" value="{{ row.vm_name }}" />
                 </th>
-                <td><span class="native-editor-row__os">{{ row.os_name }}</span></td>
-                <td>
+                <td data-mobile-label="OS"><span class="native-editor-row__os">{{ row.os_name }}</span></td>
+                <td data-mobile-label="Native status">
                   <span class="native-support native-support--{{ row.native_support_state }}">{{ row.native_support_label }}</span>
                 </td>
-                <td>
+                <td data-mobile-label="OCI target">
                   <label class="scenario-visually-hidden" for="{{ row_id }}-oci-shape">{{ row.vm_name }} OCI target shape setting</label>
                   <select id="{{ row_id }}-oci-shape" name="oci_shape" required>
                     {% for shape_name in shape_options %}
@@ -188,11 +211,11 @@
                     {% endfor %}
                   </select>
                 </td>
-                <td>
+                <td data-mobile-label="OCPU">
                   <label class="scenario-visually-hidden" for="{{ row_id }}-ocpu">{{ row.vm_name }} OCPU setting</label>
                   <input id="{{ row_id }}-ocpu" type="number" name="vm_ocpu" value="{{ row.ocpu }}" min="1" step="1" required />
                 </td>
-                <td>
+                <td data-mobile-label="Burst">
                   <label class="scenario-visually-hidden" for="{{ row_id }}-burst">{{ row.vm_name }} burst setting</label>
                   <select id="{{ row_id }}-burst" name="vm_burst" required>
                     {% for burst_value in ['100%', '50%', '12.5%'] %}
@@ -200,13 +223,13 @@
                     {% endfor %}
                   </select>
                 </td>
-                <td>
+                <td data-mobile-label="VPU">
                   <label class="scenario-visually-hidden" for="{{ row_id }}-vpu">{{ row.vm_name }} VPU setting</label>
                   <select id="{{ row_id }}-vpu" name="vm_vpu" required>
                     {% for vpu in vpu_options %}<option value="{{ vpu }}" {% if row.vpu == vpu %}selected{% endif %}>{{ vpu }}</option>{% endfor %}
                   </select>
                 </td>
-                <td>
+                <td data-mobile-label="OS license">
                   {% if row.is_windows_server %}
                     <label class="scenario-visually-hidden" for="{{ row_id }}-os-license">{{ row.vm_name }} OS license setting</label>
                     <select id="{{ row_id }}-os-license" name="vm_os_license" required>
@@ -218,10 +241,10 @@
                     <input type="hidden" name="vm_os_license" value="" />
                   {% endif %}
                 </td>
-                <td>{{ row.cpus }}</td>
-                <td>{{ "{:,}".format(row.memory_gb) }} GB</td>
-                <td>{{ "{:,}".format(row.provisioned_gb) }} GB</td>
-                <td class="native-cost-cell">
+                <td data-mobile-label="vCPU">{{ row.cpus }}</td>
+                <td data-mobile-label="RAM">{{ "{:,}".format(row.memory_gb) }} GB</td>
+                <td data-mobile-label="Storage">{{ "{:,}".format(row.provisioned_gb) }} GB</td>
+                <td class="native-cost-cell" data-mobile-label="Monthly cost">
                   <strong class="total-cost">{{ pricing_symbol }}{{ "{:,.2f}".format(row.cpu_ram_monthly_cost + row.storage_monthly_cost + row.os_license_monthly_cost) }}</strong>
                   <span class="cpu-ram-cost" hidden>{{ pricing_symbol }}{{ "{:,.2f}".format(row.cpu_ram_monthly_cost) }}</span>
                   <span class="storage-cost" hidden>{{ pricing_symbol }}{{ "{:,.2f}".format(row.storage_monthly_cost) }}</span>

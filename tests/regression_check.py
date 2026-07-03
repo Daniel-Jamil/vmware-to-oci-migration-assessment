@@ -179,7 +179,13 @@ def sheet_text_rows(zf: zipfile.ZipFile, sheet_path: str) -> list[list[str]]:
         values = []
         for cell in row.findall("m:c", XLSX_NS):
             text = cell.find(".//m:t", XLSX_NS)
-            values.append(text.text if text is not None and text.text is not None else "")
+            number = cell.find("m:v", XLSX_NS)
+            if text is not None and text.text is not None:
+                values.append(text.text)
+            elif number is not None and number.text is not None:
+                values.append(number.text)
+            else:
+                values.append("")
         if any(value.strip() for value in values):
             text_rows.append(values)
     return text_rows
@@ -3085,6 +3091,24 @@ def validate_task7_native_scenario_workspace() -> None:
         all(count == 50 for count in submitted_control_counts.values()),
         str(submitted_control_counts),
     )
+    mobile_nav = re.search(
+        r'<div\b[^>]*data-native-mobile-nav[^>]*>(.*?)</div>',
+        html,
+        re.S,
+    )
+    mobile_nav_html = mobile_nav.group(1) if mobile_nav else ""
+    check(
+        "Native mobile editor exposes one accessible focused-row navigator",
+        mobile_nav is not None
+        and 'data-native-mobile-previous' in mobile_nav_html
+        and 'data-native-mobile-next' in mobile_nav_html
+        and 'data-native-mobile-status' in mobile_nav_html
+        and 'aria-live="polite"' in mobile_nav_html
+        and 'VM 1 of 50' in mobile_nav_html
+        and html.count('data-native-mobile-active="true"') == 1
+        and html.count("data-native-mobile-index=") == 50,
+        mobile_nav_html,
+    )
 
     remediation_response = client.get("/step4?tab=native&native_support=remediation")
     remediation_html = remediation_response.data.decode("utf-8", errors="replace")
@@ -3203,6 +3227,50 @@ def validate_task7_native_scenario_workspace() -> None:
         f"location={partial_post.headers.get('Location')}, state={updated_state}",
     )
 
+    task7_export = client.post(
+        "/step4",
+        data={"action": "export_excel", "active_scenario": "native"},
+        follow_redirects=False,
+    )
+    task7_export_path = ""
+    with client.session_transaction() as sess:
+        task7_export_path = str(sess.get("last_export_file", "") or "")
+    try:
+        with zipfile.ZipFile(BytesIO(task7_export.data)) as zf:
+            task7_sheet_map = workbook_sheet_map(zf)
+            selected_vm_rows = sheet_text_rows(zf, task7_sheet_map["Selected VMs"])
+            exported_vm_names = {
+                row[0]
+                for row in selected_vm_rows[1:]
+                if row and row[0]
+            }
+            native_analysis_rows = sheet_text_rows(
+                zf,
+                task7_sheet_map["OCI Native Analysis"],
+            )
+            native_aggregates = {
+                row[0]: row[1]
+                for row in native_analysis_rows
+                if len(row) >= 2
+                and row[0] in {"VM Count", "vCPU Count", "Memory GB", "Storage GB"}
+            }
+        check(
+            "Task 7 workbook export retains all 75 VMs and full-list Native totals",
+            task7_export.status_code == 200
+            and task7_export.data.startswith(b"PK")
+            and exported_vm_names == set(selected_names)
+            and native_aggregates == {
+                "VM Count": "75",
+                "vCPU Count": "300",
+                "Memory GB": "600",
+                "Storage GB": "7500",
+            },
+            f"names={len(exported_vm_names)}, aggregates={native_aggregates}",
+        )
+    finally:
+        if task7_export_path:
+            Path(task7_export_path).unlink(missing_ok=True)
+
     price_response = client.get("/step4?tab=price")
     price_html = price_response.data.decode("utf-8", errors="replace")
     check(
@@ -3232,7 +3300,7 @@ def validate_task7_native_scenario_workspace() -> None:
         and "js/scenario-editor.js" in step4_source,
     )
     check(
-        "Scenario editor source exposes roving tabs dirty live status and navigation warning hooks",
+        "Scenario editor source retains dirty state across tabs and focuses one mobile row",
         all(token in scenario_js for token in [
             "ArrowLeft",
             "ArrowRight",
@@ -3245,15 +3313,24 @@ def validate_task7_native_scenario_workspace() -> None:
             "data-dirty-navigation",
             "workspace-stage-select",
             "control.form === scenarioForm",
-        ]),
+            "confirmScenarioSwitch",
+            "navigationConfirmed",
+            "matchMedia(\"(max-width: 767px)\")",
+            "data-native-mobile-active",
+            "row.hidden",
+        ])
+        and "clearDirty" not in scenario_js,
     )
     check(
-        "Scenario CSS constrains page width and provides scroll sticky and mobile contracts",
+        "Scenario CSS provides sticky desktop and focused mobile editor contracts",
         all(token in scenarios_css for token in [
             "overflow-x: auto",
             "position: sticky",
             "max-width: 100%",
             "@media (max-width: 600px)",
+            "@media (max-width: 767px)",
+            ".native-mobile-row-nav",
+            'data-native-mobile-active="true"',
             "--oracle-red",
             "--status-green",
         ]),

@@ -8,6 +8,12 @@
   const dirtyLiveRegion = document.querySelector("[data-scenario-dirty-live]");
   const mainTitle = document.getElementById("step4-main-title");
   const stageSelect = document.getElementById("workspace-stage-select");
+  const nativeRows = Array.from(document.querySelectorAll("[data-native-editor-row]"));
+  const nativeMobileNav = document.querySelector("[data-native-mobile-nav]");
+  const nativeMobilePrevious = document.querySelector("[data-native-mobile-previous]");
+  const nativeMobileNext = document.querySelector("[data-native-mobile-next]");
+  const nativeMobileStatus = document.querySelector("[data-native-mobile-status]");
+  const nativeMobileMedia = window.matchMedia("(max-width: 767px)");
   const currentStageValue = stageSelect ? stageSelect.value : "";
   const titleByScenario = {
     native: "Migration to OCI Native",
@@ -16,6 +22,11 @@
   };
   let dirty = false;
   let submitting = false;
+  let navigationConfirmed = false;
+  let activeNativeRowIndex = Math.max(
+    0,
+    nativeRows.findIndex((row) => row.getAttribute("data-native-mobile-active") === "true"),
+  );
 
   function announce(message) {
     if (dirtyLiveRegion) dirtyLiveRegion.textContent = message;
@@ -28,14 +39,16 @@
     announce("Unsaved scenario changes. Recalculate and save before leaving this view.");
   }
 
-  function clearDirty() {
-    dirty = false;
-    delete document.documentElement.dataset.scenarioDirty;
-  }
-
   function confirmDiscard() {
     if (!dirty) return true;
     return window.confirm("You have unsaved scenario changes. Leave this view and discard them?");
+  }
+
+  function confirmScenarioSwitch() {
+    if (!dirty) return true;
+    return window.confirm(
+      "You have unsaved scenario changes. Switch scenarios while keeping those changes pending?",
+    );
   }
 
   function activateTab(tab, updateUrl) {
@@ -69,6 +82,62 @@
     );
   }
 
+  function updateNativeMobileButton(button, targetIndex, direction) {
+    if (!button) return;
+    const targetRow = nativeRows[targetIndex];
+    button.disabled = !targetRow;
+    if (!targetRow) {
+      button.removeAttribute("aria-controls");
+      button.setAttribute("aria-label", `No ${direction} VM`);
+      return;
+    }
+    const vmName = targetRow.dataset.nativeVmName || `VM ${targetIndex + 1}`;
+    button.setAttribute("aria-controls", targetRow.id);
+    button.setAttribute("aria-label", `Show ${direction} VM, ${vmName}`);
+  }
+
+  function renderNativeMobileRow() {
+    const isMobile = nativeMobileMedia.matches;
+    activeNativeRowIndex = Math.min(
+      Math.max(activeNativeRowIndex, 0),
+      Math.max(nativeRows.length - 1, 0),
+    );
+    nativeRows.forEach((row, index) => {
+      const isActive = index === activeNativeRowIndex;
+      row.setAttribute("data-native-mobile-active", isActive ? "true" : "false");
+      row.hidden = isMobile && !isActive;
+      if (row.hidden) row.setAttribute("aria-hidden", "true");
+      else row.removeAttribute("aria-hidden");
+    });
+    if (nativeMobileNav) nativeMobileNav.hidden = !isMobile || nativeRows.length === 0;
+    if (nativeMobileStatus) {
+      if (nativeRows.length) {
+        const activeRow = nativeRows[activeNativeRowIndex];
+        const vmName = activeRow.dataset.nativeVmName || `VM ${activeNativeRowIndex + 1}`;
+        nativeMobileStatus.textContent = `VM ${activeNativeRowIndex + 1} of ${nativeRows.length}: ${vmName}`;
+      } else {
+        nativeMobileStatus.textContent = "No matching VMs";
+      }
+    }
+    updateNativeMobileButton(nativeMobilePrevious, activeNativeRowIndex - 1, "previous");
+    updateNativeMobileButton(nativeMobileNext, activeNativeRowIndex + 1, "next");
+  }
+
+  if (nativeMobilePrevious) {
+    nativeMobilePrevious.addEventListener("click", function () {
+      activeNativeRowIndex -= 1;
+      renderNativeMobileRow();
+    });
+  }
+  if (nativeMobileNext) {
+    nativeMobileNext.addEventListener("click", function () {
+      activeNativeRowIndex += 1;
+      renderNativeMobileRow();
+    });
+  }
+  nativeMobileMedia.addEventListener("change", renderNativeMobileRow);
+  renderNativeMobileRow();
+
   document.addEventListener(
     "click",
     function (event) {
@@ -77,8 +146,7 @@
       if (tab) {
         event.preventDefault();
         event.stopImmediatePropagation();
-        if (!confirmDiscard()) return;
-        if (dirty) clearDirty();
+        if (!confirmScenarioSwitch()) return;
         activateTab(tab, true);
         tab.focus();
         return;
@@ -93,7 +161,7 @@
           event.stopImmediatePropagation();
           return;
         }
-        clearDirty();
+        navigationConfirmed = true;
       }
     },
     true,
@@ -109,7 +177,7 @@
         stageSelect.value = currentStageValue;
         return;
       }
-      clearDirty();
+      navigationConfirmed = true;
     },
     true,
   );
@@ -124,8 +192,7 @@
       else return;
 
       event.preventDefault();
-      if (!confirmDiscard()) return;
-      if (dirty) clearDirty();
+      if (!confirmScenarioSwitch()) return;
       const nextTab = tabs[nextIndex];
       activateTab(nextTab, true);
       nextTab.focus();
@@ -162,7 +229,7 @@
   });
 
   window.addEventListener("beforeunload", function (event) {
-    if (!dirty || submitting) return;
+    if (!dirty || submitting || navigationConfirmed) return;
     event.preventDefault();
     event.returnValue = "";
   });
