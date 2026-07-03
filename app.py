@@ -2293,7 +2293,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
                 "Set OCVS",
             )
             for row in vm_rows
-            if not is_oci_supported_os(str(row.get("raw_os") or ""), supported_signatures)
+            if not _is_unknown_os(row.get("raw_os"))
+            and not is_oci_supported_os(str(row.get("raw_os") or ""), supported_signatures)
         ]
         add_issue(
             "unsupported-native",
@@ -6437,13 +6438,6 @@ def step3() -> str:
             submitted_name_set = {name for name in submitted_names if name in vm_index}
             invalid_names = sorted({name for name in submitted_names if name not in vm_index})
             candidate_names = [str(vm["name"]) for vm in all_vms if str(vm["name"]) in submitted_name_set]
-            submitted_acknowledgments = set(request.form.getlist("acknowledged_warning_ids"))
-            acknowledged_warning_ids = [
-                issue_id
-                for issue_id in advisory_issue_ids
-                if issue_id in submitted_acknowledgments
-            ]
-            app_state["acknowledged_warning_ids"] = acknowledged_warning_ids
 
             if invalid_names:
                 inventory_errors.append(
@@ -6451,7 +6445,6 @@ def step3() -> str:
                 )
             if not candidate_names:
                 inventory_errors.append("Include at least one VM before saving Inventory Review.")
-                save_app_state(app_state)
             else:
                 existing_placements = app_state.get("step4_hybrid_placements", {})
                 if not isinstance(existing_placements, dict):
@@ -6474,6 +6467,12 @@ def step3() -> str:
                             else default_placement(vm)
                         )
 
+                submitted_acknowledgments = set(request.form.getlist("acknowledged_warning_ids"))
+                acknowledged_warning_ids = [
+                    issue_id
+                    for issue_id in advisory_issue_ids
+                    if issue_id in submitted_acknowledgments
+                ]
                 selected_vm_names = candidate_names
                 app_state["selected_vm_names"] = selected_vm_names
                 app_state["step4_hybrid_placements"] = candidate_placements
@@ -6509,18 +6508,10 @@ def step3() -> str:
             elif action == "remove":
                 selected_vm_names = [name for name in selected_vm_names if name not in set(chosen_vm_names)]
             elif action == "remove_unsupported":
-                if not supported_signatures:
-                    flash("Could not update unsupported workloads because the OCI support list is unavailable.", "error")
-                else:
-                    before_count = len(selected_vm_names)
-                    selected_vm_names = [
-                        name
-                        for name in selected_vm_names
-                        if name in vm_index
-                        and is_oci_supported_os(str(vm_index[name].get("raw_os", "")), supported_signatures)
-                    ]
-                    removed_count = before_count - len(selected_vm_names)
-                    flash(f"Removed {removed_count} unsupported VM(s) from the selected workload scope.", "success")
+                flash(
+                    "The remove unsupported action is no longer supported. Use the inventory inclusion controls instead.",
+                    "error",
+                )
             elif action == "remove_duplicates":
                 before_count = len(selected_vm_names)
                 selected_set_for_dedupe = set(selected_vm_names)

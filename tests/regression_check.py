@@ -34,6 +34,8 @@ XLSM_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.xlsm"
 MOB_ID_INVENTORY = app_module.RVTOOLS_DIR / "mob_id_inventory.xlsx"
 DUPLICATE_INVENTORY = app_module.RVTOOLS_DIR / "duplicate_inventory.csv"
 INVENTORY_REVIEW_INVENTORY = app_module.RVTOOLS_DIR / "inventory_review.csv"
+UNKNOWN_ONLY_INVENTORY = app_module.RVTOOLS_DIR / "unknown_only_inventory.csv"
+LARGE_INVENTORY = app_module.RVTOOLS_DIR / "large_inventory_950.csv"
 OFFICE_LOCK_INVENTORY = app_module.RVTOOLS_DIR / "~$regression_inventory.xlsx"
 REJECTED_INPUT = app_module.RVTOOLS_DIR / "not_vm_inventory.csv"
 EXPECTED_VM_COUNT = 4
@@ -249,6 +251,33 @@ def create_regression_fixtures() -> None:
     ]
     INVENTORY_REVIEW_INVENTORY.write_text(
         "\n".join(",".join(value for value in row) for row in inventory_review_rows) + "\n",
+        encoding="utf-8",
+    )
+    unknown_only_rows = [
+        ["VM", "Powerstate", "Template", "OS according to the configuration file", "CPUs", "Memory", "Provisioned MiB"],
+        ["unknown-only-vm", "poweredOn", "False", "Unknown", "2", "4096", "51200"],
+    ]
+    UNKNOWN_ONLY_INVENTORY.write_text(
+        "\n".join(",".join(value for value in row) for row in unknown_only_rows) + "\n",
+        encoding="utf-8",
+    )
+    large_inventory_rows = [
+        ["VM", "Powerstate", "Template", "OS according to the configuration file", "CPUs", "Memory", "Provisioned MiB"]
+    ]
+    large_inventory_rows.extend(
+        [
+            f"large-vm-{index + 1:04d}",
+            "poweredOn" if index % 2 == 0 else "poweredOff",
+            "False",
+            "Oracle Linux 8 (64-bit)",
+            "4",
+            "8192",
+            "102400",
+        ]
+        for index in range(950)
+    )
+    LARGE_INVENTORY.write_text(
+        "\n".join(",".join(value for value in row) for row in large_inventory_rows) + "\n",
         encoding="utf-8",
     )
     xlsx_bytes = app_module._build_xlsx_workbook_bytes(
@@ -2025,6 +2054,15 @@ def validate_guided_inventory_review() -> None:
         and issues_by_id.get("missing-storage", {}).get("severity") == "critical",
         str(issues),
     )
+    unknown_only_rows, _ = app_module.load_vms_from_vinfo(str(UNKNOWN_ONLY_INVENTORY))
+    unknown_only_issues = app_module.build_inventory_review_issues(unknown_only_rows)
+    check(
+        "unknown OS belongs only to unknown advisory",
+        [issue.get("id") for issue in unknown_only_issues] == ["unknown-os"]
+        and unknown_only_issues[0].get("vm_names") == ["unknown-only-vm"]
+        and unknown_only_issues[0].get("severity") == "advisory",
+        str(unknown_only_issues),
+    )
 
     state_id = f"guided_inventory_{uuid4().hex}"
     with app_module.app.test_request_context("/"):
@@ -2142,6 +2180,69 @@ def validate_guided_inventory_review() -> None:
             and "Affected VMs" in html,
         )
 
+        preserved_state = json.loads(
+            json.dumps(
+                {
+                    "selected_vm_names": state.get("selected_vm_names"),
+                    "step4_hybrid_placements": state.get("step4_hybrid_placements"),
+                    "acknowledged_warning_ids": state.get("acknowledged_warning_ids"),
+                }
+            )
+        )
+        response = client.post("/step3", data={"action": "remove_unsupported"})
+        state_after_retired_action = app_module.load_app_state()
+        check(
+            "retired remove unsupported action cannot mutate scope",
+            response.status_code == 200
+            and b"no longer supported" in response.data
+            and state_after_retired_action.get("selected_vm_names") == preserved_state["selected_vm_names"],
+            str(state_after_retired_action.get("selected_vm_names")),
+        )
+
+        response = client.post(
+            "/step3",
+            data={"action": "save_inventory_review", "continue_to_scenarios": "1"},
+        )
+        state_after_empty_scope = app_module.load_app_state()
+        check(
+            "invalid empty inventory scope preserves prior saved state",
+            response.status_code == 200
+            and b"Include at least one VM" in response.data
+            and {
+                "selected_vm_names": state_after_empty_scope.get("selected_vm_names"),
+                "step4_hybrid_placements": state_after_empty_scope.get("step4_hybrid_placements"),
+                "acknowledged_warning_ids": state_after_empty_scope.get("acknowledged_warning_ids"),
+            }
+            == preserved_state,
+            str(state_after_empty_scope),
+        )
+
+    unknown_state_id = f"guided_unknown_{uuid4().hex}"
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = unknown_state_id
+            sess["selected_rvtools_file"] = str(UNKNOWN_ONLY_INVENTORY)
+        response = client.post(
+            "/step3",
+            data=MultiDict(
+                [
+                    ("action", "save_inventory_review"),
+                    ("included_vm_names", "unknown-only-vm"),
+                    ("acknowledged_warning_ids", "unknown-os"),
+                ]
+            ),
+        )
+        unknown_state = app_module.load_app_state()
+        check(
+            "unknown-only inventory saves Review placement",
+            response.status_code == 200
+            and unknown_state.get("selected_vm_names") == ["unknown-only-vm"]
+            and unknown_state.get("step4_hybrid_placements") == {"unknown-only-vm": "review"}
+            and unknown_state.get("acknowledged_warning_ids") == ["unknown-os"],
+            str(unknown_state),
+        )
+
     def inventory_client(inventory_path: Path) -> tuple[object, str]:
         local_client = app_module.app.test_client()
         local_state_id = f"guided_continue_{uuid4().hex}"
@@ -2235,6 +2336,42 @@ def validate_guided_inventory_review() -> None:
         response.status_code in {302, 303}
         and response.headers.get("Location", "").endswith("/step4?tab=native"),
         f"status={response.status_code}, location={response.headers.get('Location')}",
+    )
+
+
+def validate_large_inventory_review_containment() -> None:
+    large_rows, _ = app_module.load_vms_from_vinfo(str(LARGE_INVENTORY))
+    check("large inventory fixture has 950 VMs", len(large_rows) == 950, str(len(large_rows)))
+    state_id = f"guided_large_{uuid4().hex}"
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(LARGE_INVENTORY)
+        response = client.get("/step3")
+
+    html = response.data.decode("utf-8", errors="replace")
+    inventory_css = (ROOT / "static" / "css" / "inventory-review.css").read_text(encoding="utf-8")
+    check(
+        "950-row inventory keeps one bounded control tree",
+        response.status_code == 200
+        and html.count("<table") == 1
+        and html.count('name="included_vm_names"') == 950
+        and html.count('class="inventory-row-details"') == 950
+        and 'class="inventory-table-wrap inventory-table-scroll"' in html,
+        f"status={response.status_code}",
+    )
+    check(
+        "desktop inventory table source is height constrained and sticky",
+        re.search(
+            r"\.inventory-table-wrap\s*\{[^}]*max-height:\s*clamp\([^;]+\);[^}]*overflow:\s*auto;",
+            inventory_css,
+            re.S,
+        )
+        is not None
+        and re.search(r"#inventory-table thead th\s*\{[^}]*position:\s*sticky;", inventory_css, re.S)
+        is not None
+        and "#inventory-table tbody tr[data-inventory-row] .inventory-col-name" in inventory_css,
     )
 
 
@@ -3217,6 +3354,7 @@ def main() -> None:
     validate_saved_assessments()
     validate_step3_duplicate_removal()
     validate_guided_inventory_review()
+    validate_large_inventory_review_containment()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)
     validate_workbook(workbook_path)

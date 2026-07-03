@@ -451,6 +451,11 @@
   font-weight: 700;
 }
 
+.inventory-table-wrap {
+  max-height: clamp(420px, calc(100vh - 220px), 760px);
+  overflow: auto;
+}
+
 .inventory-table-scroll {
   width: 100%;
   max-width: 100%;
@@ -780,6 +785,10 @@
 
   .inventory-table-scroll {
     overflow-x: hidden;
+  }
+
+  .inventory-table-wrap {
+    max-height: none;
   }
 
   #inventory-table {
