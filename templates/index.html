@@ -96,13 +96,19 @@
       border-top: 1px solid var(--line);
     }
     label { font-weight: 600; font-size: .92rem; }
-    select, input[type="text"], input[type="file"], input[type="number"], button {
+    select, input[type="text"], input[type="file"], input[type="number"], textarea, button {
       padding: .62rem .72rem;
       font-size: .92rem;
       border-radius: var(--radius);
       border: 1px solid var(--line-strong);
     }
-    select, input[type="text"], input[type="file"], input[type="number"] { background: #fff; color: var(--text); }
+    select, input[type="text"], input[type="file"], input[type="number"], textarea { background: #fff; color: var(--text); }
+    textarea {
+      min-height: 5rem;
+      resize: vertical;
+      font-family: inherit;
+      line-height: 1.35;
+    }
     button {
       cursor: pointer;
       background: var(--accent);
@@ -173,6 +179,48 @@
       text-decoration: none;
     }
     a.btn:hover { border-color: var(--accent); color: var(--accent); }
+    .assessment-form {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: .45rem;
+      border-top: 0;
+      padding: 0;
+      margin: .7rem 0 0;
+    }
+    .assessment-form label {
+      font-size: .78rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .assessment-form button,
+    .assessment-form select,
+    .assessment-form input,
+    .assessment-form textarea {
+      width: 100%;
+      min-width: 0;
+    }
+    .assessment-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .45rem;
+    }
+    .assessment-delete-button {
+      background: #fff;
+      color: var(--error);
+      border-color: #efc4c1;
+    }
+    .assessment-delete-button:hover {
+      background: #fef1f1;
+      color: var(--error);
+      border-color: var(--error);
+    }
+    .assessment-meta {
+      margin: .45rem 0 0;
+      color: var(--muted);
+      font-size: .82rem;
+      line-height: 1.35;
+    }
     code { background: #eff2f5; padding: .1rem .35rem; border-radius: 2px; }
     @media (max-width: 980px) {
       .wizard-steps { grid-template-columns: 1fr; }
@@ -491,6 +539,48 @@
           {% endif %}
           <a class="btn" href="#download_pricing_form">Review OCI Price List</a>
         </div>
+      </section>
+      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
+        <h3>Saved Assessments</h3>
+        <form method="post" class="assessment-form">
+          <input type="hidden" name="action" value="save_assessment" />
+          <label for="assessment_name">Assessment name</label>
+          <input
+            id="assessment_name"
+            name="assessment_name"
+            type="text"
+            maxlength="120"
+            value="{{ active_assessment_name or customer_name or '' }}"
+            placeholder="Customer migration review"
+          />
+          <label for="assessment_notes">Notes</label>
+          <textarea
+            id="assessment_notes"
+            name="assessment_notes"
+            maxlength="2000"
+            placeholder="Reminder, review status, assumptions, or follow-up items"
+          >{{ active_assessment_notes or '' }}</textarea>
+          <button type="submit">Save Current Assessment</button>
+        </form>
+
+        {% if saved_assessments %}
+          <form method="post" class="assessment-form">
+            <label for="assessment_id">Previously saved</label>
+            <select id="assessment_id" name="assessment_id" required>
+              {% for assessment in saved_assessments %}
+                <option value="{{ assessment.id }}" {% if assessment.id == active_assessment_id %}selected{% endif %}>
+                  {{ assessment.name }} - {{ assessment.updated_at_display }} - {{ "{:,}".format(assessment.vm_count) }} VM(s)
+                </option>
+              {% endfor %}
+            </select>
+            <div class="assessment-actions">
+              <button type="submit" name="action" value="load_assessment">Load</button>
+              <button type="submit" name="action" value="delete_assessment" class="assessment-delete-button">Delete</button>
+            </div>
+          </form>
+        {% else %}
+          <p class="assessment-meta">No saved assessments yet.</p>
+        {% endif %}
       </section>
       <section class="redwood-panel" style="margin: 0; padding: .8rem;">
         <div style="display: flex; justify-content: space-between; gap: .75rem; align-items: center;">

@@ -439,6 +439,146 @@ def validate_manual_sizing_input() -> None:
         )
 
 
+def validate_saved_assessments() -> None:
+    price_file = find_price_file()
+
+    with app_module.app.test_client() as client:
+        client.post(
+            "/",
+            data={"action": "save_customer_name", "customer_name": "Saved Assessment Customer"},
+            follow_redirects=True,
+        )
+        client.post(
+            "/",
+            data={"action": "select_pricelist", "price_list_file": price_file},
+            follow_redirects=True,
+        )
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "manual_vm_count": "3",
+                "manual_total_vcpus": "12",
+                "manual_total_memory_gb": "48",
+                "manual_total_storage_gb": "600",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "1",
+            },
+            follow_redirects=True,
+        )
+        check("saved assessment source setup", response.status_code == 200 and b"Manual workload summary created" in response.data)
+
+        with client.session_transaction() as sess:
+            saved_inventory_file = str(sess.get("selected_rvtools_file", ""))
+
+        state = app_module.load_app_state()
+        state["step4_ocvs_commitment_term"] = "3_year"
+        state["step4_iaas_discount_pct"] = 12.5
+        state["step4_hybrid_placements"] = {"manual-vm-001": "native", "manual-vm-002": "ocvs"}
+        app_module.save_app_state(state)
+
+        response = client.post(
+            "/",
+            data={
+                "action": "save_assessment",
+                "assessment_name": "Alpha Migration Review",
+                "assessment_notes": "Sizing reviewed with customer architecture team.",
+            },
+            follow_redirects=True,
+        )
+        check(
+            "saved assessment creates snapshot",
+            response.status_code == 200
+            and b"Assessment saved." in response.data
+            and b"Alpha Migration Review" in response.data
+            and b"Sizing reviewed with customer architecture team." in response.data,
+        )
+
+        saved_assessments = app_module.list_saved_assessments()
+        saved_assessment = next(
+            assessment for assessment in saved_assessments if assessment.get("name") == "Alpha Migration Review"
+        )
+        saved_assessment_id = str(saved_assessment["id"])
+
+        client.post(
+            "/",
+            data={"action": "save_customer_name", "customer_name": "Mutated Active Assessment"},
+            follow_redirects=True,
+        )
+        client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "manual_vm_count": "5",
+                "manual_total_vcpus": "20",
+                "manual_total_memory_gb": "80",
+                "manual_total_storage_gb": "1000",
+                "manual_supported_vm_count": "5",
+                "manual_unsupported_vm_count": "0",
+            },
+            follow_redirects=True,
+        )
+        mutated_state = app_module.load_app_state()
+        mutated_state["step4_ocvs_commitment_term"] = "payg"
+        mutated_state["step4_iaas_discount_pct"] = 0.0
+        mutated_state["step4_hybrid_placements"] = {}
+        app_module.save_app_state(mutated_state)
+
+        response = client.post(
+            "/",
+            data={"action": "load_assessment", "assessment_id": saved_assessment_id},
+            follow_redirects=True,
+        )
+        check(
+            "saved assessment loads snapshot",
+            response.status_code == 200
+            and b"Assessment loaded." in response.data
+            and b"Saved Assessment Customer" in response.data
+            and b"Alpha Migration Review" in response.data
+            and b'name="manual_vm_count" type="number" min="1" step="1" value="3"' in response.data
+            and b'name="manual_total_vcpus" type="number" min="1" step="1" value="12"' in response.data,
+        )
+
+        with client.session_transaction() as sess:
+            loaded_inventory_file = str(sess.get("selected_rvtools_file", ""))
+            loaded_price_file = str(sess.get("selected_pricelist_file", ""))
+            loaded_customer = str(sess.get("customer_name", ""))
+            loaded_assessment_name = str(sess.get("active_assessment_name", ""))
+            loaded_assessment_notes = str(sess.get("active_assessment_notes", ""))
+
+        loaded_state = app_module.load_app_state()
+        check("saved assessment inventory restored", loaded_inventory_file == saved_inventory_file, loaded_inventory_file)
+        check("saved assessment price list restored", loaded_price_file == price_file, loaded_price_file)
+        check("saved assessment customer restored", loaded_customer == "Saved Assessment Customer", loaded_customer)
+        check("saved assessment name restored", loaded_assessment_name == "Alpha Migration Review", loaded_assessment_name)
+        check(
+            "saved assessment notes restored",
+            loaded_assessment_notes == "Sizing reviewed with customer architecture team.",
+            loaded_assessment_notes,
+        )
+        check(
+            "saved assessment state restored",
+            loaded_state.get("step4_ocvs_commitment_term") == "3_year"
+            and loaded_state.get("step4_iaas_discount_pct") == 12.5
+            and loaded_state.get("step4_hybrid_placements", {}).get("manual-vm-001") == "native"
+            and len(loaded_state.get("selected_vm_names", [])) == 3,
+            str(loaded_state),
+        )
+
+        response = client.post(
+            "/",
+            data={"action": "delete_assessment", "assessment_id": saved_assessment_id},
+            follow_redirects=True,
+        )
+        check("saved assessment deletes snapshot", response.status_code == 200 and b"Assessment deleted." in response.data)
+        check(
+            "saved assessment removed from list",
+            all(assessment.get("id") != saved_assessment_id for assessment in app_module.list_saved_assessments()),
+            str(app_module.list_saved_assessments()),
+        )
+        app_module.save_preferences({})
+
+
 def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
     inventory = CSV_INVENTORY
     price_file = find_price_file()
@@ -938,6 +1078,7 @@ def main() -> None:
 
     validate_inventory_imports()
     validate_manual_sizing_input()
+    validate_saved_assessments()
     validate_step3_duplicate_removal()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)

@@ -138,6 +138,7 @@ OCI_SUPPORTED_OS_PATH = Path("OCI-SupportedOS.txt")
 OCI_PRICE_MAPPING_PATH = Path("OCI-PriceMapping")
 OCVS_TERM_DISCOUNTS_PATH = Path("config/ocvs_term_discounts.json")
 APP_STATE_DIR = Path("downloads/app_state")
+SAVED_ASSESSMENT_SCHEMA_VERSION = 1
 PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_VISIBLE_PRICE_LISTS = 10
 NATIVE_VM_INPUT_ROW_LIMIT = 500
@@ -573,6 +574,262 @@ def load_app_state() -> dict[str, Any]:
 def save_app_state(state: dict[str, Any]) -> None:
     state_file = _state_file_path()
     state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _saved_assessments_dir() -> Path:
+    saved_dir = APP_STATE_DIR / "saved_assessments"
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    return saved_dir
+
+
+def normalize_assessment_name(value: Any) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    return clean[:120]
+
+
+def normalize_assessment_notes(value: Any) -> str:
+    clean = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return clean[:2000]
+
+
+def _assessment_slug(value: Any) -> str:
+    base = normalize_assessment_name(value).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
+    return (slug[:64].strip("_") or "assessment")
+
+
+def _new_assessment_id(name: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{_assessment_slug(name)}_{timestamp}_{uuid4().hex[:8]}"
+
+
+def _clean_assessment_id(value: Any) -> str:
+    clean = str(value or "").strip()
+    if not re.fullmatch(r"[a-z0-9_]{1,160}", clean):
+        return ""
+    return clean
+
+
+def _saved_assessment_file_path(assessment_id: Any) -> Path | None:
+    clean_id = _clean_assessment_id(assessment_id)
+    if not clean_id:
+        return None
+    return _saved_assessments_dir() / f"{clean_id}.json"
+
+
+def _assessment_default_name() -> str:
+    customer_name = normalize_customer_name(session.get("customer_name", ""))
+    if customer_name:
+        return f"{customer_name} assessment"
+    return f"Assessment {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+
+def _format_assessment_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Not saved"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw[:16]
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _read_saved_assessment(path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def list_saved_assessments() -> list[dict[str, Any]]:
+    saved_dir = _saved_assessments_dir()
+    assessments: list[dict[str, Any]] = []
+    for path in sorted(saved_dir.glob("*.json")):
+        snapshot = _read_saved_assessment(path)
+        assessment_id = _clean_assessment_id(snapshot.get("id") or path.stem)
+        if not snapshot or not assessment_id:
+            continue
+        app_state = snapshot.get("app_state") if isinstance(snapshot.get("app_state"), dict) else {}
+        import_summary = (
+            snapshot.get("rvtools_import_summary") if isinstance(snapshot.get("rvtools_import_summary"), dict) else {}
+        )
+        selected_names = app_state.get("selected_vm_names") if isinstance(app_state.get("selected_vm_names"), list) else []
+        try:
+            vm_count = int(import_summary.get("vm_count") or len(selected_names) or 0)
+        except (TypeError, ValueError):
+            vm_count = len(selected_names)
+        updated_at = str(snapshot.get("updated_at") or snapshot.get("saved_at") or "")
+        assessments.append(
+            {
+                "id": assessment_id,
+                "name": normalize_assessment_name(snapshot.get("name")) or path.stem,
+                "notes": normalize_assessment_notes(snapshot.get("notes")),
+                "customer_name": normalize_customer_name(snapshot.get("customer_name", "")),
+                "saved_at": str(snapshot.get("saved_at") or ""),
+                "updated_at": updated_at,
+                "updated_at_display": _format_assessment_timestamp(updated_at),
+                "selected_currency": str(snapshot.get("selected_currency") or "").upper().strip(),
+                "selected_pricelist_file": str(snapshot.get("selected_pricelist_file") or ""),
+                "selected_rvtools_file": str(snapshot.get("selected_rvtools_file") or ""),
+                "vm_count": vm_count,
+            }
+        )
+    return sorted(assessments, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+
+
+def build_saved_assessment_snapshot(name: Any, notes: Any, assessment_id: str = "") -> dict[str, Any]:
+    assessment_name = normalize_assessment_name(name) or _assessment_default_name()
+    assessment_notes = normalize_assessment_notes(notes)
+    clean_id = _clean_assessment_id(assessment_id)
+    now = datetime.now().isoformat(timespec="seconds")
+    saved_at = now
+    if clean_id:
+        existing_path = _saved_assessment_file_path(clean_id)
+        if existing_path and existing_path.exists():
+            existing = _read_saved_assessment(existing_path)
+            saved_at = str(existing.get("saved_at") or now)
+    else:
+        clean_id = _new_assessment_id(assessment_name)
+
+    return {
+        "schema_version": SAVED_ASSESSMENT_SCHEMA_VERSION,
+        "id": clean_id,
+        "name": assessment_name,
+        "notes": assessment_notes,
+        "saved_at": saved_at,
+        "updated_at": now,
+        "customer_name": normalize_customer_name(session.get("customer_name", "")),
+        "selected_currency": str(session.get("selected_currency", "") or "").upper().strip(),
+        "selected_pricelist_file": str(session.get("selected_pricelist_file", "") or "").strip().replace("\\", "/"),
+        "selected_rvtools_file": str(session.get("selected_rvtools_file", "") or "").strip().replace("\\", "/"),
+        "rvtools_file_info": session.get("rvtools_file_info") if isinstance(session.get("rvtools_file_info"), dict) else {},
+        "rvtools_import_summary": (
+            session.get("rvtools_import_summary") if isinstance(session.get("rvtools_import_summary"), dict) else {}
+        ),
+        "app_state": load_app_state(),
+        "step4_snapshot": load_step4_snapshot(),
+        "last_export_file": str(session.get("last_export_file", "") or ""),
+    }
+
+
+def save_current_assessment(name: Any, notes: Any) -> dict[str, Any]:
+    active_id = _clean_assessment_id(session.get("active_assessment_id", ""))
+    snapshot = build_saved_assessment_snapshot(name, notes, active_id)
+    assessment_id = str(snapshot["id"])
+    file_path = _saved_assessment_file_path(assessment_id)
+    if file_path is None:
+        raise ValueError("Assessment id is not valid.")
+    file_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    session["active_assessment_id"] = assessment_id
+    session["active_assessment_name"] = snapshot["name"]
+    session["active_assessment_notes"] = snapshot["notes"]
+    return snapshot
+
+
+def _restore_price_list_from_assessment(snapshot: dict[str, Any], warnings: list[str]) -> None:
+    price_file = str(snapshot.get("selected_pricelist_file") or "").strip().replace("\\", "/")
+    selected_currency = str(snapshot.get("selected_currency") or "").upper().strip()
+    session.pop("selected_pricelist_file", None)
+    if selected_currency:
+        session["selected_currency"] = selected_currency
+
+    if not price_file:
+        return
+    if price_file in list_downloaded_price_lists():
+        session["selected_pricelist_file"] = price_file
+        remember_price_list_selection(price_file, selected_currency)
+    else:
+        warnings.append("Saved OCI price list is missing. Select or download a current price list before pricing.")
+
+
+def _restore_inventory_from_assessment(snapshot: dict[str, Any], warnings: list[str]) -> None:
+    selected_path = str(snapshot.get("selected_rvtools_file") or "").strip().replace("\\", "/")
+    session.pop("selected_rvtools_file", None)
+    session.pop("rvtools_file_info", None)
+    session.pop("rvtools_import_summary", None)
+    session.pop("rvtools_rejected_info", None)
+
+    if not selected_path:
+        return
+
+    inventory_path = Path(selected_path)
+    if not inventory_path.exists():
+        warnings.append("Saved inventory file is missing. Re-select or recreate the inventory source before continuing.")
+        return
+
+    try:
+        vm_rows, source = load_vms_from_vinfo(selected_path)
+    except Exception as exc:
+        warnings.append(f"Saved inventory file could not be loaded: {exc}")
+        return
+
+    session["selected_rvtools_file"] = selected_path
+    session["rvtools_file_info"] = {
+        "file_path": selected_path,
+        "file_name": inventory_path.name,
+        "size_kb": round(inventory_path.stat().st_size / 1024, 2),
+    }
+    session["rvtools_import_summary"] = build_inventory_import_summary(vm_rows, source)
+
+
+def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
+    file_path = _saved_assessment_file_path(assessment_id)
+    if file_path is None or not file_path.exists():
+        return {"ok": False, "message": "Saved assessment was not found.", "warnings": []}
+
+    snapshot = _read_saved_assessment(file_path)
+    if not snapshot:
+        return {"ok": False, "message": "Saved assessment could not be read.", "warnings": []}
+
+    warnings: list[str] = []
+    assessment_name = normalize_assessment_name(snapshot.get("name")) or file_path.stem
+    assessment_notes = normalize_assessment_notes(snapshot.get("notes"))
+    session["active_assessment_id"] = _clean_assessment_id(snapshot.get("id") or file_path.stem)
+    session["active_assessment_name"] = assessment_name
+    session["active_assessment_notes"] = assessment_notes
+
+    customer_name = normalize_customer_name(snapshot.get("customer_name", ""))
+    if customer_name:
+        session["customer_name"] = customer_name
+    else:
+        session.pop("customer_name", None)
+
+    _restore_price_list_from_assessment(snapshot, warnings)
+    _restore_inventory_from_assessment(snapshot, warnings)
+
+    app_state = snapshot.get("app_state")
+    save_app_state(app_state if isinstance(app_state, dict) else _default_app_state())
+
+    step4_snapshot = snapshot.get("step4_snapshot")
+    if isinstance(step4_snapshot, dict) and step4_snapshot:
+        save_step4_snapshot(step4_snapshot)
+    else:
+        clear_step4_snapshot()
+
+    last_export_file = str(snapshot.get("last_export_file") or "")
+    if last_export_file:
+        session["last_export_file"] = last_export_file
+    else:
+        session.pop("last_export_file", None)
+
+    return {"ok": True, "message": "Assessment loaded.", "name": assessment_name, "warnings": warnings}
+
+
+def delete_saved_assessment(assessment_id: Any) -> dict[str, Any]:
+    file_path = _saved_assessment_file_path(assessment_id)
+    if file_path is None or not file_path.exists():
+        return {"ok": False, "message": "Saved assessment was not found."}
+    snapshot = _read_saved_assessment(file_path)
+    assessment_name = normalize_assessment_name(snapshot.get("name")) or file_path.stem
+    try:
+        file_path.unlink()
+    except OSError as exc:
+        return {"ok": False, "message": f"Saved assessment could not be deleted: {exc}"}
+    if session.get("active_assessment_id") == file_path.stem:
+        session.pop("active_assessment_id", None)
+    return {"ok": True, "message": "Assessment deleted.", "name": assessment_name}
 
 
 def load_supported_os_signatures() -> list[str]:
@@ -5202,6 +5459,9 @@ def index() -> str:
     downloaded_price_lists = list_downloaded_price_lists()
     selected_pricelist_file = str(session.get("selected_pricelist_file", "")).strip().replace("\\", "/")
     customer_name = normalize_customer_name(session.get("customer_name", ""))
+    active_assessment_id = _clean_assessment_id(session.get("active_assessment_id", ""))
+    active_assessment_name = normalize_assessment_name(session.get("active_assessment_name", ""))
+    active_assessment_notes = normalize_assessment_notes(session.get("active_assessment_notes", ""))
 
     if not selected_pricelist_file:
         preferences = load_preferences()
@@ -5283,6 +5543,36 @@ def index() -> str:
                 session.pop("customer_name", None)
                 flash("Customer name cleared.", "customer_success")
 
+        elif action == "save_assessment":
+            try:
+                saved_snapshot = save_current_assessment(
+                    request.form.get("assessment_name", ""),
+                    request.form.get("assessment_notes", ""),
+                )
+            except Exception as exc:
+                flash(f"Assessment could not be saved: {exc}", "error")
+            else:
+                active_assessment_id = str(saved_snapshot.get("id") or "")
+                active_assessment_name = normalize_assessment_name(saved_snapshot.get("name"))
+                active_assessment_notes = normalize_assessment_notes(saved_snapshot.get("notes"))
+                flash("Assessment saved.", "success")
+
+        elif action == "load_assessment":
+            result = load_saved_assessment(request.form.get("assessment_id", ""))
+            if result.get("ok"):
+                flash("Assessment loaded.", "success")
+                for warning in result.get("warnings", []):
+                    flash(str(warning), "info")
+            else:
+                flash(str(result.get("message") or "Saved assessment could not be loaded."), "error")
+
+        elif action == "delete_assessment":
+            result = delete_saved_assessment(request.form.get("assessment_id", ""))
+            if result.get("ok"):
+                flash("Assessment deleted.", "success")
+            else:
+                flash(str(result.get("message") or "Saved assessment could not be deleted."), "error")
+
         elif action == "download_pricing":
             selected_currency = request.form.get("currency_code", "USD").upper().strip()
 
@@ -5305,6 +5595,10 @@ def index() -> str:
                     customer_name=customer_name,
                     manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
                     inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
+                    saved_assessments=list_saved_assessments(),
+                    active_assessment_id=active_assessment_id,
+                    active_assessment_name=active_assessment_name,
+                    active_assessment_notes=active_assessment_notes,
                 )
 
             def use_local_price_list_fallback(reason: str) -> bool:
@@ -5507,6 +5801,15 @@ def index() -> str:
 
         downloaded_price_lists = list_downloaded_price_lists()
         rvtools_files = list_rvtools_export_files()
+        customer_name = normalize_customer_name(session.get("customer_name", ""))
+        selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
+        rvtools_file_info = session.get("rvtools_file_info")
+        rvtools_import_summary = session.get("rvtools_import_summary")
+        rvtools_rejected_info = session.get("rvtools_rejected_info")
+        selected_currency = str(session.get("selected_currency", "")).upper().strip()
+        active_assessment_id = _clean_assessment_id(session.get("active_assessment_id", ""))
+        active_assessment_name = normalize_assessment_name(session.get("active_assessment_name", ""))
+        active_assessment_notes = normalize_assessment_notes(session.get("active_assessment_notes", ""))
         selected_pricelist_file = str(session.get("selected_pricelist_file", "")).strip().replace("\\", "/")
         if selected_pricelist_file and selected_pricelist_file not in downloaded_price_lists:
             selected_pricelist_file = ""
@@ -5541,6 +5844,10 @@ def index() -> str:
         customer_name=customer_name,
         manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
         inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
+        saved_assessments=list_saved_assessments(),
+        active_assessment_id=active_assessment_id,
+        active_assessment_name=active_assessment_name,
+        active_assessment_notes=active_assessment_notes,
     )
 
 
