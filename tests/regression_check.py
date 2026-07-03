@@ -439,6 +439,149 @@ def validate_manual_sizing_input() -> None:
         )
 
 
+def _load_raw_app_state(raw_state: object) -> dict[str, object]:
+    state_id = f"regression_{uuid4().hex}"
+    state_file = app_module.APP_STATE_DIR / f"{state_id}.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(raw_state), encoding="utf-8")
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        return app_module.load_app_state()
+
+
+def validate_app_state_review_inputs() -> None:
+    old_state = _load_raw_app_state(
+        {
+            "selected_vm_names": ["legacy-vm"],
+            "step4_ocvs_commitment_term": "3_year",
+        }
+    )
+    check(
+        "old app state gets review defaults",
+        old_state.get("acknowledged_warning_ids") == []
+        and old_state.get("assessor_recommendation") == ""
+        and old_state.get("assessor_recommendation_rationale") == "",
+        str(old_state),
+    )
+    check(
+        "old app state preserves legacy values",
+        old_state.get("selected_vm_names") == ["legacy-vm"]
+        and old_state.get("step4_ocvs_commitment_term") == "3_year",
+        str(old_state),
+    )
+
+    eighty_character_id = "a" + ("-" * 79)
+    normalized = _load_raw_app_state(
+        {
+            "acknowledged_warning_ids": [
+                "unsupported-native",
+                "hybrid-cost-review",
+                "unsupported-native",
+                eighty_character_id,
+                "Uppercase-invalid",
+                "-leading-hyphen",
+                "a" * 81,
+                17,
+                "",
+            ],
+            "assessor_recommendation": "native",
+            "assessor_recommendation_rationale": (
+                " \r\nFirst line\rSecond line\r\n" + ("x" * 5000) + " \r\n"
+            ),
+        }
+    )
+    check(
+        "warning ids normalize uniquely in first-seen order",
+        normalized.get("acknowledged_warning_ids")
+        == ["unsupported-native", "hybrid-cost-review", eighty_character_id],
+        str(normalized.get("acknowledged_warning_ids")),
+    )
+    rationale = normalized.get("assessor_recommendation_rationale")
+    check(
+        "recommendation rationale normalizes and truncates",
+        isinstance(rationale, str)
+        and len(rationale) == 4000
+        and rationale.startswith("First line\nSecond line\n")
+        and "\r" not in rationale
+        and rationale == rationale.strip(),
+        f"type={type(rationale).__name__}, length={len(rationale) if isinstance(rationale, str) else 'n/a'}",
+    )
+
+    for invalid_ids in ("unsupported-native", {"unsupported-native": True}, None, ["INVALID"]):
+        invalid_collection_state = _load_raw_app_state({"acknowledged_warning_ids": invalid_ids})
+        check(
+            f"invalid warning collection becomes empty ({type(invalid_ids).__name__})",
+            invalid_collection_state.get("acknowledged_warning_ids") == [],
+            str(invalid_collection_state.get("acknowledged_warning_ids")),
+        )
+
+    for valid_recommendation in ("", "native", "ocvs", "hybrid"):
+        valid_recommendation_state = _load_raw_app_state(
+            {"assessor_recommendation": valid_recommendation}
+        )
+        check(
+            f"valid recommendation retained ({valid_recommendation or 'empty'})",
+            valid_recommendation_state.get("assessor_recommendation") == valid_recommendation,
+            str(valid_recommendation_state.get("assessor_recommendation")),
+        )
+
+    for invalid_recommendation in ("NATIVE", "invalid", 17, None, ["native"]):
+        invalid_recommendation_state = _load_raw_app_state(
+            {"assessor_recommendation": invalid_recommendation}
+        )
+        check(
+            f"invalid recommendation becomes empty ({type(invalid_recommendation).__name__})",
+            invalid_recommendation_state.get("assessor_recommendation") == "",
+            str(invalid_recommendation_state.get("assessor_recommendation")),
+        )
+
+    invalid_rationale_state = _load_raw_app_state(
+        {"assessor_recommendation_rationale": {"text": "not a string"}}
+    )
+    check(
+        "non-string recommendation rationale becomes empty",
+        invalid_rationale_state.get("assessor_recommendation_rationale") == "",
+        str(invalid_rationale_state.get("assessor_recommendation_rationale")),
+    )
+
+    snapshot_id = f"normalization_{uuid4().hex[:8]}"
+    snapshot_path = app_module.APP_STATE_DIR / "saved_assessments" / f"{snapshot_id}.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "id": snapshot_id,
+                "name": "Normalization check",
+                "app_state": {
+                    "acknowledged_warning_ids": [
+                        "unsupported-native",
+                        "unsupported-native",
+                        "INVALID",
+                    ],
+                    "assessor_recommendation": "invalid",
+                    "assessor_recommendation_rationale": " \r\nReviewed.\r ",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    restored_state_id = f"regression_{uuid4().hex}"
+    restored_state_path = app_module.APP_STATE_DIR / f"{restored_state_id}.json"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = restored_state_id
+        load_result = app_module.load_saved_assessment(snapshot_id)
+    persisted_state = json.loads(restored_state_path.read_text(encoding="utf-8"))
+    check(
+        "saved assessment writes normalized active state",
+        load_result.get("ok") is True
+        and persisted_state.get("acknowledged_warning_ids") == ["unsupported-native"]
+        and persisted_state.get("assessor_recommendation") == ""
+        and persisted_state.get("assessor_recommendation_rationale") == "Reviewed.",
+        str(persisted_state),
+    )
+    snapshot_path.unlink()
+
+
 def validate_saved_assessments() -> None:
     price_file = find_price_file()
 
@@ -484,6 +627,9 @@ def validate_saved_assessments() -> None:
         state["step4_ocvs_commitment_term"] = "3_year"
         state["step4_iaas_discount_pct"] = 12.5
         state["step4_hybrid_placements"] = {"manual-vm-001": "native", "manual-vm-002": "ocvs"}
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
+        state["assessor_recommendation"] = "native"
+        state["assessor_recommendation_rationale"] = "Remediate legacy guests before migration."
         app_module.save_app_state(state)
 
         response = client.post(
@@ -508,6 +654,19 @@ def validate_saved_assessments() -> None:
             assessment for assessment in saved_assessments if assessment.get("name") == "Alpha Migration Review"
         )
         saved_assessment_id = str(saved_assessment["id"])
+        saved_snapshot_path = app_module.APP_STATE_DIR / "saved_assessments" / f"{saved_assessment_id}.json"
+        saved_snapshot = json.loads(saved_snapshot_path.read_text(encoding="utf-8"))
+        check(
+            "saved assessment nests review decisions in app state",
+            saved_snapshot.get("app_state", {}).get("acknowledged_warning_ids") == ["unsupported-native"]
+            and saved_snapshot.get("app_state", {}).get("assessor_recommendation") == "native"
+            and saved_snapshot.get("app_state", {}).get("assessor_recommendation_rationale")
+            == "Remediate legacy guests before migration."
+            and "acknowledged_warning_ids" not in saved_snapshot
+            and "assessor_recommendation" not in saved_snapshot
+            and "assessor_recommendation_rationale" not in saved_snapshot,
+            str(saved_snapshot),
+        )
 
         client.post(
             "/",
@@ -531,6 +690,9 @@ def validate_saved_assessments() -> None:
         mutated_state["step4_ocvs_commitment_term"] = "payg"
         mutated_state["step4_iaas_discount_pct"] = 0.0
         mutated_state["step4_hybrid_placements"] = {}
+        mutated_state["acknowledged_warning_ids"] = []
+        mutated_state["assessor_recommendation"] = "ocvs"
+        mutated_state["assessor_recommendation_rationale"] = "Changed after saving."
         app_module.save_app_state(mutated_state)
 
         response = client.post(
@@ -571,6 +733,14 @@ def validate_saved_assessments() -> None:
             and loaded_state.get("step4_iaas_discount_pct") == 12.5
             and loaded_state.get("step4_hybrid_placements", {}).get("manual-vm-001") == "native"
             and len(loaded_state.get("selected_vm_names", [])) == 3,
+            str(loaded_state),
+        )
+        check(
+            "saved assessment review decisions restored",
+            loaded_state.get("acknowledged_warning_ids") == ["unsupported-native"]
+            and loaded_state.get("assessor_recommendation") == "native"
+            and loaded_state.get("assessor_recommendation_rationale")
+            == "Remediate legacy guests before migration.",
             str(loaded_state),
         )
 
@@ -1087,6 +1257,7 @@ def main() -> None:
 
     validate_inventory_imports()
     validate_manual_sizing_input()
+    validate_app_state_review_inputs()
     validate_saved_assessments()
     validate_step3_duplicate_removal()
     workbook_path, workflow_state = run_workflow_and_export()

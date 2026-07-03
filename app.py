@@ -319,6 +319,9 @@ def build_export_filename(
 def _default_app_state() -> dict[str, Any]:
     return {
         "selected_vm_names": [],
+        "acknowledged_warning_ids": [],
+        "assessor_recommendation": "",
+        "assessor_recommendation_rationale": "",
         "step4_os_shapes": {},
         "step4_vm_shapes": {},
         "step4_vm_ocpus": {},
@@ -513,24 +516,37 @@ def clear_step4_snapshot() -> None:
         pass
 
 
-def load_app_state() -> dict[str, Any]:
-    """Load server-side app state so large selections don't live in cookies."""
-    state_file = _state_file_path()
-    if not state_file.exists():
-        return _default_app_state()
-
-    try:
-        loaded = json.loads(state_file.read_text(encoding="utf-8"))
-    except Exception:
-        return _default_app_state()
-
-    if not isinstance(loaded, dict):
-        return _default_app_state()
-
+def normalize_app_state(value: Any) -> dict[str, Any]:
+    loaded = value if isinstance(value, dict) else {}
     default = _default_app_state()
     default.update(loaded)
     if not isinstance(default.get("selected_vm_names"), list):
         default["selected_vm_names"] = []
+    warning_ids = default.get("acknowledged_warning_ids")
+    normalized_warning_ids: list[str] = []
+    seen_warning_ids: set[str] = set()
+    if isinstance(warning_ids, list):
+        for warning_id in warning_ids:
+            if (
+                isinstance(warning_id, str)
+                and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", warning_id)
+                and warning_id not in seen_warning_ids
+            ):
+                normalized_warning_ids.append(warning_id)
+                seen_warning_ids.add(warning_id)
+    default["acknowledged_warning_ids"] = normalized_warning_ids
+    recommendation = default.get("assessor_recommendation")
+    default["assessor_recommendation"] = (
+        recommendation
+        if isinstance(recommendation, str) and recommendation in {"", "native", "ocvs", "hybrid"}
+        else ""
+    )
+    rationale = default.get("assessor_recommendation_rationale")
+    default["assessor_recommendation_rationale"] = (
+        rationale.replace("\r\n", "\n").replace("\r", "\n").strip()[:4000]
+        if isinstance(rationale, str)
+        else ""
+    )
     if not isinstance(default.get("step4_os_shapes"), dict):
         default["step4_os_shapes"] = {}
     if not isinstance(default.get("step4_vm_shapes"), dict):
@@ -569,6 +585,19 @@ def load_app_state() -> dict[str, Any]:
     default["step4_ocvs_dr_nodes"] = normalize_ocvs_dr_nodes(default.get("step4_ocvs_dr_nodes", 0))
     default.pop("step4_vmware_license_discount_pct", None)
     return default
+
+
+def load_app_state() -> dict[str, Any]:
+    """Load server-side app state so large selections don't live in cookies."""
+    state_file = _state_file_path()
+    if not state_file.exists():
+        return normalize_app_state({})
+
+    try:
+        loaded = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        loaded = {}
+    return normalize_app_state(loaded)
 
 
 def save_app_state(state: dict[str, Any]) -> None:
@@ -799,8 +828,7 @@ def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
     _restore_price_list_from_assessment(snapshot, warnings)
     _restore_inventory_from_assessment(snapshot, warnings)
 
-    app_state = snapshot.get("app_state")
-    save_app_state(app_state if isinstance(app_state, dict) else _default_app_state())
+    save_app_state(normalize_app_state(snapshot.get("app_state")))
 
     step4_snapshot = snapshot.get("step4_snapshot")
     if isinstance(step4_snapshot, dict) and step4_snapshot:
