@@ -5652,6 +5652,33 @@ def index() -> str:
                 "item_count": len(price_lookup_preview),
             }
 
+    def render_index_response() -> str:
+        return render_template(
+            "index.html",
+            **build_workspace_context(
+                "setup",
+                currencies=SUPPORTED_CURRENCIES,
+                selected_currency=selected_currency,
+                download_info=download_info,
+                downloaded_price_lists=downloaded_price_lists,
+                price_list_options=price_list_options,
+                selected_pricelist_file=selected_pricelist_file,
+                selected_pricelist_info=selected_pricelist_info,
+                rvtools_files=rvtools_files,
+                selected_rvtools_file=selected_rvtools_file,
+                rvtools_file_info=rvtools_file_info,
+                rvtools_import_summary=rvtools_import_summary,
+                rvtools_rejected_info=rvtools_rejected_info,
+                customer_name=customer_name,
+                manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
+                inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
+                saved_assessments=list_saved_assessments(),
+                active_assessment_id=active_assessment_id,
+                active_assessment_name=active_assessment_name,
+                active_assessment_notes=active_assessment_notes,
+            ),
+        )
+
     if request.method == "POST":
         action = request.form.get("action", "")
 
@@ -5741,28 +5768,7 @@ def index() -> str:
 
             if selected_currency not in SUPPORTED_CURRENCIES:
                 flash("Please select a supported currency.", "pricing_error")
-                return render_template(
-                    "index.html",
-                    currencies=SUPPORTED_CURRENCIES,
-                    selected_currency=selected_currency,
-                    download_info=download_info,
-                    downloaded_price_lists=downloaded_price_lists,
-                    price_list_options=price_list_options,
-                    selected_pricelist_file=selected_pricelist_file,
-                    selected_pricelist_info=selected_pricelist_info,
-                    rvtools_files=rvtools_files,
-                    selected_rvtools_file=selected_rvtools_file,
-                    rvtools_file_info=rvtools_file_info,
-                    rvtools_import_summary=rvtools_import_summary,
-                    rvtools_rejected_info=rvtools_rejected_info,
-                    customer_name=customer_name,
-                    manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
-                    inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
-                    saved_assessments=list_saved_assessments(),
-                    active_assessment_id=active_assessment_id,
-                    active_assessment_name=active_assessment_name,
-                    active_assessment_notes=active_assessment_notes,
-                )
+                return render_index_response()
 
             def use_local_price_list_fallback(reason: str) -> bool:
                 nonlocal selected_pricelist_file, selected_pricelist_info
@@ -5990,31 +5996,7 @@ def index() -> str:
                     "item_count": len(price_lookup_preview),
                 }
 
-    return render_template(
-        "index.html",
-        **build_workspace_context(
-            "setup",
-            currencies=SUPPORTED_CURRENCIES,
-            selected_currency=selected_currency,
-            download_info=download_info,
-            downloaded_price_lists=downloaded_price_lists,
-            price_list_options=price_list_options,
-            selected_pricelist_file=selected_pricelist_file,
-            selected_pricelist_info=selected_pricelist_info,
-            rvtools_files=rvtools_files,
-            selected_rvtools_file=selected_rvtools_file,
-            rvtools_file_info=rvtools_file_info,
-            rvtools_import_summary=rvtools_import_summary,
-            rvtools_rejected_info=rvtools_rejected_info,
-            customer_name=customer_name,
-            manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
-            inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
-            saved_assessments=list_saved_assessments(),
-            active_assessment_id=active_assessment_id,
-            active_assessment_name=active_assessment_name,
-            active_assessment_notes=active_assessment_notes,
-        ),
-    )
+    return render_index_response()
 
 
 @app.route("/step3", methods=["GET", "POST"])

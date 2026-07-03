@@ -247,6 +247,26 @@ def validate_shared_workspace_shell() -> None:
             check(f"{route} old color explanation removed", old_color_explanation not in response.data)
 
 
+def validate_unsupported_currency_workspace_shell() -> None:
+    with app_module.app.test_client() as client:
+        response = client.post(
+            "/",
+            data={"action": "download_pricing", "currency_code": "ZZZ"},
+        )
+
+    check(
+        "unsupported currency keeps Stage 1 workspace shell",
+        response.status_code == 200
+        and b'<header class="workspace-header">' in response.data
+        and b'<nav class="stage-nav" aria-label="Assessment stages">' in response.data
+        and b'<main id="main-workspace">' in response.data
+        and b'<div id="workspace-status" role="status" aria-live="polite">' in response.data
+        and b"Step 1 of 4" in response.data
+        and b"Please select a supported currency." in response.data,
+        f"status={response.status_code}",
+    )
+
+
 def validate_price_list_dropdown_policy() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
@@ -1310,6 +1330,7 @@ def main() -> None:
     )
 
     validate_inventory_imports()
+    validate_unsupported_currency_workspace_shell()
     validate_shared_workspace_shell()
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
