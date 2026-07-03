@@ -166,11 +166,12 @@ HYBRID_PLACEMENT_VALUES = {"native", "ocvs", "review"}
 HYBRID_PLACEMENT_LABELS = {
     "native": "OCI Native",
     "ocvs": "OCVS",
-    "review": "Review",
+    "review": "Review (priced as OCVS)",
 }
 HYBRID_PLACEMENT_OPTIONS = [
     {"value": "native", "label": "OCI Native"},
     {"value": "ocvs", "label": "OCVS"},
+    {"value": "review", "label": "Review (priced as OCVS)"},
 ]
 
 OCVS_DEFAULT_SIZING_POLICY = {
@@ -2424,6 +2425,117 @@ def build_inventory_review_issues_from_path(selected_path: Any) -> list[dict[str
     return build_inventory_review_issues(vm_rows)
 
 
+def inventory_placement_field_name(prefix: str, vm_name: str) -> str:
+    return f"{prefix}:{urlencode({'': vm_name})[1:]}"
+
+
+def default_inventory_placement(vm: dict[str, Any], supported_signatures: list[str]) -> str:
+    raw_os = str(vm.get("raw_os") or "")
+    if _is_unknown_os(raw_os) or not supported_signatures:
+        return "review"
+    return "native" if is_oci_supported_os(raw_os, supported_signatures) else "ocvs"
+
+
+def parse_exact_placement_fields(
+    form: Any,
+    prefix: str,
+    expected_vm_names: list[str],
+    known_vm_names: list[str],
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    expected_set = set(expected_vm_names)
+    known_fields = {
+        inventory_placement_field_name(prefix, vm_name): vm_name
+        for vm_name in known_vm_names
+    }
+    submitted_fields = [str(key) for key in form.keys() if str(key).startswith(f"{prefix}:")]
+    parsed: dict[str, str] = {}
+    errors: list[str] = []
+    field_errors: dict[str, str] = {}
+
+    def add_error(message: str) -> None:
+        if message not in errors:
+            errors.append(message)
+
+    for field_name in submitted_fields:
+        vm_name = known_fields.get(field_name)
+        if vm_name is None:
+            add_error("A placement was submitted for an unknown VM.")
+            continue
+        values = form.getlist(field_name)
+        if len(values) != 1:
+            message = "Choose exactly one placement for every included VM."
+            field_errors[vm_name] = message
+            add_error(message)
+            continue
+        placement = str(values[0]).strip().lower()
+        if placement not in HYBRID_PLACEMENT_VALUES:
+            message = "Choose a valid placement: OCI Native, OCVS, or Review."
+            field_errors[vm_name] = message
+            add_error(message)
+            continue
+        parsed[vm_name] = placement
+
+    outside_scope = set(parsed) - expected_set
+    if outside_scope:
+        add_error("Placements may only be submitted for included VMs.")
+    missing = expected_set - set(parsed)
+    if missing:
+        add_error("Choose a valid placement for every included VM.")
+        for vm_name in missing:
+            field_errors.setdefault(vm_name, "Choose a placement for this included VM.")
+
+    return (
+        {vm_name: parsed[vm_name] for vm_name in expected_vm_names if vm_name in parsed},
+        errors,
+        field_errors,
+    )
+
+
+def inventory_review_readiness_errors(
+    all_vms: list[dict[str, Any]],
+    state: dict[str, Any],
+    inventory_issues: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    vm_names = [str(vm.get("name") or "") for vm in all_vms]
+    vm_name_set = set(vm_names)
+    selected_value = state.get("selected_vm_names")
+    selected_names = selected_value if isinstance(selected_value, list) else []
+    errors: list[str] = []
+
+    if not selected_names:
+        errors.append("Include at least one VM before continuing to scenarios.")
+    elif (
+        any(not isinstance(name, str) or name not in vm_name_set for name in selected_names)
+        or len(selected_names) != len(set(selected_names))
+    ):
+        errors.append("Return to Inventory Review and save a valid VM selection before continuing.")
+
+    placements = state.get("step4_hybrid_placements")
+    if not isinstance(placements, dict):
+        placements = {}
+    selected_set = set(selected_names)
+    if (
+        set(placements) != selected_set
+        or any(str(value).strip().lower() not in HYBRID_PLACEMENT_VALUES for value in placements.values())
+    ):
+        errors.append("Choose a valid placement for every included VM before continuing.")
+
+    issues = inventory_issues if inventory_issues is not None else build_inventory_review_issues(all_vms)
+    if any(issue.get("severity") == "critical" for issue in issues):
+        errors.append("Resolve critical inventory issues in Setup or the source inventory before continuing.")
+    advisory_ids = {
+        str(issue.get("id"))
+        for issue in issues
+        if issue.get("severity") == "advisory"
+    }
+    acknowledged_value = state.get("acknowledged_warning_ids")
+    acknowledged_ids = set(acknowledged_value) if isinstance(acknowledged_value, list) else set()
+    if advisory_ids - acknowledged_ids:
+        errors.append("Acknowledge advisory warnings before continuing to scenarios.")
+
+    return errors
+
+
 class SetupFieldError(ValueError):
     def __init__(self, field_id: str, message: str) -> None:
         super().__init__(message)
@@ -2835,7 +2947,10 @@ def build_hybrid_placement_plan(
         placement = normalize_hybrid_placement(selection.get(vm_name), recommended)
         effective_target = "native" if placement == "native" else "ocvs"
 
-        if placement == recommended:
+        if placement == "review":
+            reason = "Pending placement review; conservatively priced as OCVS"
+            manual_override = placement != recommended
+        elif placement == recommended:
             if recommended == "native":
                 reason = "OCI-supported OS"
             elif support_source_available:
@@ -2851,6 +2966,10 @@ def build_hybrid_placement_plan(
             {
                 **source_row,
                 "hybrid_placement": placement,
+                "hybrid_placement_field_name": inventory_placement_field_name(
+                    "hybrid_placement",
+                    vm_name,
+                ),
                 "hybrid_placement_label": HYBRID_PLACEMENT_LABELS.get(placement, placement),
                 "hybrid_effective_target": effective_target,
                 "hybrid_recommended_placement": recommended,
@@ -2863,7 +2982,7 @@ def build_hybrid_placement_plan(
 
     native_rows = [row for row in rows if row["hybrid_effective_target"] == "native"]
     ocvs_rows = [row for row in rows if row["hybrid_effective_target"] == "ocvs"]
-    review_rows: list[dict[str, Any]] = []
+    review_rows = [row for row in rows if row["hybrid_placement"] == "review"]
     explicit_ocvs_rows = [row for row in rows if row["hybrid_placement"] == "ocvs"]
     manual_override_rows = [row for row in rows if row["hybrid_manual_override"]]
 
@@ -6417,16 +6536,8 @@ def step3() -> str:
     inventory_errors: list[str] = []
     placement_errors: dict[str, str] = {}
 
-    def default_placement(vm: dict[str, Any]) -> str:
-        raw_os = str(vm.get("raw_os") or "")
-        if _is_unknown_os(raw_os) or not supported_signatures:
-            return "review"
-        if is_oci_supported_os(raw_os, supported_signatures):
-            return "native"
-        return "ocvs"
-
     placement_field_names = {
-        vm_name: f"placement:{urlencode({'': vm_name})[1:]}"
+        vm_name: inventory_placement_field_name("placement", vm_name)
         for vm_name in vm_index
     }
 
@@ -6435,7 +6546,7 @@ def step3() -> str:
         redirect_to = str(request.form.get("redirect_to", "")).strip()
         if action == "save_inventory_review":
             submitted_names = request.form.getlist("included_vm_names")
-            submitted_name_set = {name for name in submitted_names if name in vm_index}
+            submitted_name_set = set(submitted_names)
             invalid_names = sorted({name for name in submitted_names if name not in vm_index})
             candidate_names = [str(vm["name"]) for vm in all_vms if str(vm["name"]) in submitted_name_set]
 
@@ -6443,57 +6554,46 @@ def step3() -> str:
                 inventory_errors.append(
                     "Some submitted VMs are no longer present in the current inventory. Review the refreshed list."
                 )
+            if len(submitted_names) != len(submitted_name_set):
+                inventory_errors.append("The submitted inventory contains duplicate VM selections.")
             if not candidate_names:
                 inventory_errors.append("Include at least one VM before saving Inventory Review.")
-            else:
-                existing_placements = app_state.get("step4_hybrid_placements", {})
-                if not isinstance(existing_placements, dict):
-                    existing_placements = {}
-                candidate_placements: dict[str, str] = {}
-                for vm_name in candidate_names:
-                    vm = vm_index[vm_name]
-                    field_name = placement_field_names[vm_name]
-                    if field_name in request.form:
-                        submitted_placement = str(request.form.get(field_name, "")).strip().lower()
-                        if submitted_placement not in {"native", "ocvs", "review"}:
-                            placement_errors[vm_name] = "Choose a valid placement: OCI Native, OCVS, or Review."
-                            continue
-                        candidate_placements[vm_name] = submitted_placement
-                    else:
-                        saved_placement = str(existing_placements.get(vm_name, "")).strip().lower()
-                        candidate_placements[vm_name] = (
-                            saved_placement
-                            if saved_placement in {"native", "ocvs", "review"}
-                            else default_placement(vm)
-                        )
+            candidate_placements, keyed_errors, placement_errors = parse_exact_placement_fields(
+                request.form,
+                "placement",
+                candidate_names,
+                list(vm_index),
+            )
+            inventory_errors.extend(keyed_errors)
 
-                submitted_acknowledgments = set(request.form.getlist("acknowledged_warning_ids"))
-                acknowledged_warning_ids = [
-                    issue_id
-                    for issue_id in advisory_issue_ids
-                    if issue_id in submitted_acknowledgments
-                ]
-                selected_vm_names = candidate_names
-                app_state["selected_vm_names"] = selected_vm_names
-                app_state["step4_hybrid_placements"] = candidate_placements
-                app_state["acknowledged_warning_ids"] = acknowledged_warning_ids
-                save_app_state(app_state)
+            submitted_acknowledgments = set(request.form.getlist("acknowledged_warning_ids"))
+            acknowledged_warning_ids = [
+                issue_id
+                for issue_id in advisory_issue_ids
+                if issue_id in submitted_acknowledgments
+            ]
+            candidate_state = copy.deepcopy(app_state)
+            candidate_state["selected_vm_names"] = candidate_names
+            candidate_state["step4_hybrid_placements"] = candidate_placements
+            candidate_state["acknowledged_warning_ids"] = acknowledged_warning_ids
+            continue_to_scenarios = request.form.get("continue_to_scenarios") == "1"
+            if continue_to_scenarios and not inventory_errors:
+                inventory_errors.extend(
+                    inventory_review_readiness_errors(all_vms, candidate_state, inventory_issues)
+                )
 
-                if request.form.get("continue_to_scenarios") == "1":
-                    if critical_issues:
-                        inventory_errors.append(
-                            "Resolve critical inventory issues in Setup or the source inventory before continuing."
-                        )
-                    unacknowledged_ids = [
-                        issue_id
-                        for issue_id in advisory_issue_ids
-                        if issue_id not in acknowledged_warning_ids
-                    ]
-                    if unacknowledged_ids:
-                        inventory_errors.append("Acknowledge advisory warnings before continuing to scenarios.")
-                    if placement_errors or any(name not in candidate_placements for name in candidate_names):
-                        inventory_errors.append("Choose a valid placement for every included VM before continuing.")
-                    if not inventory_errors:
+            if not inventory_errors:
+                try:
+                    save_app_state(candidate_state)
+                except Exception:
+                    app.logger.exception("Inventory Review persistence failed")
+                    inventory_errors.append(
+                        "Inventory Review could not be saved. Your previous selections were preserved."
+                    )
+                else:
+                    app_state = candidate_state
+                    selected_vm_names = candidate_names
+                    if continue_to_scenarios:
                         return redirect(url_for("step4", tab="native"))
         else:
             chosen_vm_names = request.form.getlist("vm_names")
@@ -6501,12 +6601,14 @@ def step3() -> str:
             if single_vm_name:
                 chosen_vm_names = [single_vm_name]
 
+            legacy_action_handled = action in {"add", "remove", "remove_duplicates"}
             if action == "add":
-                selected_vm_names = list(
-                    dict.fromkeys(selected_vm_names + [name for name in chosen_vm_names if name in vm_index])
-                )
+                selected_set = set(selected_vm_names)
+                selected_set.update(name for name in chosen_vm_names if name in vm_index)
+                selected_vm_names = [str(vm["name"]) for vm in all_vms if str(vm["name"]) in selected_set]
             elif action == "remove":
-                selected_vm_names = [name for name in selected_vm_names if name not in set(chosen_vm_names)]
+                removed_names = set(chosen_vm_names)
+                selected_vm_names = [name for name in selected_vm_names if name not in removed_names]
             elif action == "remove_unsupported":
                 flash(
                     "The remove unsupported action is no longer supported. Use the inventory inclusion controls instead.",
@@ -6537,12 +6639,48 @@ def step3() -> str:
                 else:
                     flash("No duplicate VM names were found in the selected workload.", "info")
 
-            app_state["selected_vm_names"] = selected_vm_names
-            save_app_state(app_state)
-            if redirect_to == "step4":
-                if selected_vm_names:
-                    return redirect(step4_tab_redirect("paths"))
-                flash("Select at least one VM before continuing to Migration Paths.", "error")
+            if legacy_action_handled:
+                existing_placements = app_state.get("step4_hybrid_placements", {})
+                if not isinstance(existing_placements, dict):
+                    existing_placements = {}
+                candidate_placements = {}
+                for vm_name in selected_vm_names:
+                    saved_placement = str(existing_placements.get(vm_name, "")).strip().lower()
+                    candidate_placements[vm_name] = (
+                        saved_placement
+                        if saved_placement in HYBRID_PLACEMENT_VALUES
+                        else default_inventory_placement(vm_index[vm_name], supported_signatures)
+                    )
+                current_acknowledgments = app_state.get("acknowledged_warning_ids", [])
+                acknowledged_set = set(current_acknowledgments) if isinstance(current_acknowledgments, list) else set()
+                candidate_state = copy.deepcopy(app_state)
+                candidate_state["selected_vm_names"] = selected_vm_names
+                candidate_state["step4_hybrid_placements"] = candidate_placements
+                candidate_state["acknowledged_warning_ids"] = [
+                    issue_id for issue_id in advisory_issue_ids if issue_id in acknowledged_set
+                ]
+                try:
+                    save_app_state(candidate_state)
+                except Exception:
+                    app.logger.exception("Legacy Inventory Review action persistence failed")
+                    inventory_errors.append(
+                        "Inventory Review could not be saved. Your previous selections were preserved."
+                    )
+                    selected_vm_names = [
+                        name for name in app_state.get("selected_vm_names", []) if name in vm_index
+                    ]
+                else:
+                    app_state = candidate_state
+                    if redirect_to == "step4":
+                        readiness_errors = inventory_review_readiness_errors(
+                            all_vms,
+                            candidate_state,
+                            inventory_issues,
+                        )
+                        if readiness_errors:
+                            inventory_errors.extend(readiness_errors)
+                        else:
+                            return redirect(step4_tab_redirect("paths"))
 
     selected_set = set(selected_vm_names)
     saved_placements = app_state.get("step4_hybrid_placements", {})
@@ -6580,9 +6718,9 @@ def step3() -> str:
             review_vm_names.add(vm_name)
         placement = str(saved_placements.get(vm_name, "")).strip().lower()
         if placement not in {"native", "ocvs", "review"}:
-            placement = default_placement(vm)
+            placement = default_inventory_placement(vm, supported_signatures)
         if vm_name in placement_errors:
-            placement = default_placement(vm)
+            placement = default_inventory_placement(vm, supported_signatures)
         power_state = str(vm.get("power_state") or "Unknown")
         power_key = power_state.strip().lower().replace("powered", "")
         if power_key not in {"on", "off"}:
@@ -6659,7 +6797,35 @@ def step4() -> str:
     selected_vm_names = app_state.get("selected_vm_names", [])
     if not isinstance(selected_vm_names, list):
         selected_vm_names = []
-    selected_vm_names = [n for n in selected_vm_names if n in vm_index]
+    boundary_errors = inventory_review_readiness_errors(
+        all_vms,
+        app_state,
+        build_inventory_review_issues(all_vms),
+    )
+    if boundary_errors:
+        flash(
+            "Complete Inventory Review before opening scenarios. " + " ".join(boundary_errors),
+            "error",
+        )
+        return redirect(url_for("step3"))
+
+    submitted_hybrid_placements: dict[str, str] | None = None
+    if request.method == "POST":
+        submitted_hybrid_placements, hybrid_field_errors, _field_errors = parse_exact_placement_fields(
+            request.form,
+            "hybrid_placement",
+            selected_vm_names,
+            selected_vm_names,
+        )
+        if "hybrid_vm_name" in request.form or "hybrid_placement" in request.form:
+            hybrid_field_errors.append("Legacy positional Hybrid placement fields are not accepted.")
+        if hybrid_field_errors:
+            active_tab = normalize_step4_scenario_tab(request.form.get("active_scenario", "paths"))
+            flash(
+                "Choose a valid placement for every included VM. No scenario settings were saved.",
+                "error",
+            )
+            return redirect(step4_tab_redirect(active_tab))
 
     shape_options = load_oci_target_shapes()
     shape_pricing_map = load_oci_price_mapping_details()
@@ -6731,7 +6897,6 @@ def step4() -> str:
         restored_bursts = dict(vm_burst_selection)
         restored_vpus = dict(vm_vpu_selection)
         restored_license = dict(vm_os_license_selection)
-        restored_hybrid_placements = dict(hybrid_placement_selection)
         restored_ocvs_profile = normalize_ocvs_profile(snapshot.get("ocvs_profile", ocvs_profile_choice))
         restored_ocvs_policy = normalize_ocvs_policy(snapshot.get("ocvs_policy", ocvs_policy))
         restored_ocvs_commitment_term = normalize_ocvs_commitment_term(
@@ -6777,16 +6942,11 @@ def step4() -> str:
             if license_val in {"BYOL", "Lic Include"}:
                 restored_license[vm_name] = license_val
 
-            placement_val = normalize_hybrid_placement(cfg.get("hybrid_placement"), "")
-            if placement_val:
-                restored_hybrid_placements[vm_name] = placement_val
-
         vm_shape_selection = restored_shapes
         vm_ocpu_selection = restored_ocpus
         vm_burst_selection = restored_bursts
         vm_vpu_selection = restored_vpus
         vm_os_license_selection = restored_license
-        hybrid_placement_selection = restored_hybrid_placements
         ocvs_profile_choice = restored_ocvs_profile
         ocvs_policy = restored_ocvs_policy
         ocvs_commitment_term = restored_ocvs_commitment_term
@@ -6798,7 +6958,6 @@ def step4() -> str:
         app_state["step4_vm_bursts"] = vm_burst_selection
         app_state["step4_vm_vpus"] = vm_vpu_selection
         app_state["step4_vm_os_license"] = vm_os_license_selection
-        app_state["step4_hybrid_placements"] = hybrid_placement_selection
         app_state["step4_ocvs_profile"] = ocvs_profile_choice
         app_state["step4_ocvs_policy"] = ocvs_policy
         app_state["step4_ocvs_commitment_term"] = ocvs_commitment_term
@@ -6827,8 +6986,6 @@ def step4() -> str:
         selected_bursts = request.form.getlist("vm_burst")
         selected_vpus = request.form.getlist("vm_vpu")
         selected_os_license = request.form.getlist("vm_os_license")
-        hybrid_vm_names = request.form.getlist("hybrid_vm_name")
-        selected_hybrid_placements = request.form.getlist("hybrid_placement")
         bulk_apply_shape = str(request.form.get("bulk_apply_oci_shape", "")).strip()
         bulk_apply_burst = str(request.form.get("bulk_apply_burst", "")).strip()
         bulk_apply_vpu_raw = str(request.form.get("bulk_apply_vpu", "")).strip()
@@ -6873,7 +7030,7 @@ def step4() -> str:
         updated_bursts = dict(vm_burst_selection)
         updated_vpus = dict(vm_vpu_selection)
         updated_os_license = dict(vm_os_license_selection)
-        updated_hybrid_placements = dict(hybrid_placement_selection)
+        updated_hybrid_placements = dict(submitted_hybrid_placements or {})
         for vm_name, shape in zip(vm_names, selected_shapes):
             clean_vm = str(vm_name).strip()
             clean_shape = str(shape).strip()
@@ -6968,18 +7125,6 @@ def step4() -> str:
                 raw_os = str(vm.get("raw_os") or "").lower()
                 if vm_name and "windows server" in raw_os:
                     updated_os_license[vm_name] = bulk_apply_os_license
-
-        for vm_name, placement_raw in zip(hybrid_vm_names, selected_hybrid_placements):
-            clean_vm = str(vm_name).strip()
-            placement_val = normalize_hybrid_placement(placement_raw, "")
-            if clean_vm and clean_vm in vm_index and placement_val:
-                updated_hybrid_placements[clean_vm] = placement_val
-
-        updated_hybrid_placements = {
-            str(vm_name): normalize_hybrid_placement(value, "ocvs")
-            for vm_name, value in updated_hybrid_placements.items()
-            if str(vm_name) in vm_index
-        }
 
         app_state["step4_vm_shapes"] = updated_shapes
         app_state["step4_vm_ocpus"] = updated_ocpus

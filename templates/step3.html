@@ -10,7 +10,7 @@
         <p class="inventory-review__eyebrow">Workload scope and initial placement</p>
         <h1 id="inventory-review-title">Inventory Review</h1>
       </div>
-      <span class="inventory-review__selection-status" data-selection-status>
+      <span class="inventory-review__selection-status" data-selection-status role="status" aria-live="polite" aria-atomic="true">
         {{ selected_vm_count }} of {{ inventory_summary.vm_count }} included
       </span>
     </header>

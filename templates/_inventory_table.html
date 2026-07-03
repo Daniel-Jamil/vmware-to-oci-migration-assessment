@@ -10,32 +10,32 @@
           <th class="inventory-col-include" scope="col">
             <span class="visually-hidden">Include</span>
           </th>
-          <th class="inventory-col-name" scope="col">
-            <button type="button" class="inventory-sort" data-sort="name" aria-sort="none">VM name</button>
+          <th class="inventory-col-name" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="name">VM name</button>
           </th>
-          <th class="inventory-col-power" scope="col">
-            <button type="button" class="inventory-sort" data-sort="power" aria-sort="none">Power</button>
+          <th class="inventory-col-power" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="power">Power</button>
           </th>
-          <th class="inventory-col-os" scope="col">
-            <button type="button" class="inventory-sort" data-sort="os" aria-sort="none">OS</button>
+          <th class="inventory-col-os" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="os">OS</button>
           </th>
-          <th class="inventory-col-support" scope="col">
-            <button type="button" class="inventory-sort" data-sort="support" aria-sort="none">Native support</button>
+          <th class="inventory-col-support" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="support">Native support</button>
           </th>
-          <th class="inventory-col-number" scope="col">
-            <button type="button" class="inventory-sort" data-sort="cpu" data-sort-type="number" aria-sort="none">vCPU</button>
+          <th class="inventory-col-number" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="cpu" data-sort-type="number">vCPU</button>
           </th>
-          <th class="inventory-col-number" scope="col">
-            <button type="button" class="inventory-sort" data-sort="memory" data-sort-type="number" aria-sort="none">RAM</button>
+          <th class="inventory-col-number" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="memory" data-sort-type="number">RAM</button>
           </th>
-          <th class="inventory-col-number" scope="col">
-            <button type="button" class="inventory-sort" data-sort="storage" data-sort-type="number" aria-sort="none">Storage</button>
+          <th class="inventory-col-number" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="storage" data-sort-type="number">Storage</button>
           </th>
-          <th class="inventory-col-placement" scope="col">
-            <button type="button" class="inventory-sort" data-sort="placement" aria-sort="none">Suggested placement</button>
+          <th class="inventory-col-placement" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="placement">Suggested placement</button>
           </th>
-          <th class="inventory-col-warning" scope="col">
-            <button type="button" class="inventory-sort" data-sort="warning" aria-sort="none">Warning</button>
+          <th class="inventory-col-warning" scope="col" aria-sort="none">
+            <button type="button" class="inventory-sort" data-sort="warning">Warning</button>
           </th>
           <th class="inventory-col-details" scope="col">Details</th>
         </tr>
@@ -117,6 +117,7 @@
                       id="inventory-placement-{{ vm.row_index }}"
                       name="{{ vm.placement_field_name }}"
                       data-row-placement="{{ vm.row_index }}"
+                      {% if not vm.included %}disabled{% endif %}
                       {% if vm.placement_error %}aria-invalid="true" aria-describedby="inventory-placement-error-{{ vm.row_index }}"{% endif %}
                     >
                       <option value="native" {% if vm.placement == 'native' %}selected{% endif %}>OCI Native</option>

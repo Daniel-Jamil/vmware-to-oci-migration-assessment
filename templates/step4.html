@@ -1938,15 +1938,15 @@
                         >
                           <td>
                             <strong>{{ row.vm_name }}</strong>
-                            <input type="hidden" name="hybrid_vm_name" value="{{ row.vm_name }}" form="step4-form" />
                           </td>
                           <td>
                             <select
-                              name="hybrid_placement"
+                              name="{{ row.hybrid_placement_field_name }}"
                               form="step4-form"
                               data-hybrid-placement-select
                               data-recommended="{{ row.hybrid_recommended_placement }}"
                               data-default-reason="{{ row.hybrid_reason }}"
+                              aria-label="Hybrid target for {{ row.vm_name }}"
                             >
                               {% for option in hybrid_placement_options %}
                                 <option value="{{ option.value }}" {% if row.hybrid_placement == option.value %}selected{% endif %}>

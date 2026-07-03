@@ -343,6 +343,13 @@ def validate_shared_workspace_shell() -> None:
         app_module.session["state_id"] = state_id
         state = app_module.load_app_state()
         state["selected_vm_names"] = [str(row["name"]) for row in inventory_rows]
+        state["step4_hybrid_placements"] = {
+            "vm-app-01": "native",
+            "vm-db-01": "native",
+            "vm-web-01": "native",
+            "vm-legacy-01": "ocvs",
+        }
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
         app_module.save_app_state(state)
 
     shell_fragments = [
@@ -1353,6 +1360,13 @@ def validate_workspace_shell_behavior() -> None:
         app_module.session["state_id"] = state_id
         state = app_module.load_app_state()
         state["selected_vm_names"] = [str(row["name"]) for row in inventory_rows]
+        state["step4_hybrid_placements"] = {
+            "vm-app-01": "native",
+            "vm-db-01": "native",
+            "vm-web-01": "native",
+            "vm-legacy-01": "ocvs",
+        }
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
         app_module.save_app_state(state)
 
     with app_module.app.test_client() as client:
@@ -2088,9 +2102,11 @@ def validate_guided_inventory_review() -> None:
                 [
                     ("action", "save_inventory_review"),
                     ("included_vm_names", "review-unknown"),
-                    ("included_vm_names", "not-in-inventory"),
                     ("included_vm_names", "review-unsupported"),
                     ("included_vm_names", "review-supported"),
+                    ("placement:review-unknown", "review"),
+                    ("placement:review-unsupported", "ocvs"),
+                    ("placement:review-supported", "native"),
                     ("acknowledged_warning_ids", "unknown-os"),
                     ("acknowledged_warning_ids", "unsupported-native"),
                     ("acknowledged_warning_ids", "missing-storage"),
@@ -2149,10 +2165,11 @@ def validate_guided_inventory_review() -> None:
             and 'id="inventory-bulk-placement"' in html
             and 'data-select-all' in html
             and 'name="included_vm_names" type="checkbox"' in html
-            and 'aria-sort="none"' in html
+            and re.search(r'<th[^>]+aria-sort="none"[^>]*>\s*<button[^>]+data-sort=', html)
+            and not re.search(r'<button[^>]+data-sort=[^>]+aria-sort=', html)
             and 'data-warning-filter="unsupported-native"' in html
             and 'id="inventory-undo"' in html
-            and 'aria-live="polite"' in html,
+            and re.search(r'data-selection-status[^>]+role="status"[^>]+aria-live="polite"', html),
         )
         check(
             "Stage 2 removes legacy transfer and unsupported-image controls",
@@ -2229,6 +2246,7 @@ def validate_guided_inventory_review() -> None:
                 [
                     ("action", "save_inventory_review"),
                     ("included_vm_names", "unknown-only-vm"),
+                    ("placement:unknown-only-vm", "review"),
                     ("acknowledged_warning_ids", "unknown-os"),
                 ]
             ),
@@ -2271,6 +2289,7 @@ def validate_guided_inventory_review() -> None:
                 ("action", "save_inventory_review"),
                 ("continue_to_scenarios", "1"),
                 ("included_vm_names", "review-supported"),
+                ("placement:review-supported", "native"),
                 ("acknowledged_warning_ids", "unsupported-native"),
                 ("acknowledged_warning_ids", "unknown-os"),
             ]
@@ -2290,6 +2309,7 @@ def validate_guided_inventory_review() -> None:
                 ("action", "save_inventory_review"),
                 ("continue_to_scenarios", "1"),
                 ("included_vm_names", "vm-app-01"),
+                ("placement:vm-app-01", "native"),
             ]
         ),
     )
@@ -2337,6 +2357,296 @@ def validate_guided_inventory_review() -> None:
         and response.headers.get("Location", "").endswith("/step4?tab=native"),
         f"status={response.status_code}, location={response.headers.get('Location')}",
     )
+
+    inventory_js = (ROOT / "static" / "js" / "inventory-review.js").read_text(encoding="utf-8")
+    check(
+        "inventory controller uses bounded cached interactions",
+        "const rowRecords" in inventory_js
+        and "clearTimeout(searchTimer)" in inventory_js
+        and "setTimeout" in inventory_js
+        and "changedRecords" in inventory_js
+        and "placementsByIndex" in inventory_js
+        and "Object.prototype.hasOwnProperty.call(saved" in inventory_js
+        and "snapshotState" not in inventory_js
+        and '.closest("th")' in inventory_js,
+    )
+
+
+def validate_inventory_review_transactions_and_step4_boundary() -> None:
+    def new_client(inventory_path: Path = CSV_INVENTORY) -> tuple[object, str]:
+        local_client = app_module.app.test_client()
+        local_state_id = f"guided_adversarial_{uuid4().hex}"
+        with local_client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = local_state_id
+            sess["selected_rvtools_file"] = str(inventory_path)
+        return local_client, local_state_id
+
+    def write_state(state_id: str, selected: list[str], placements: dict[str, str], acknowledgments: list[str]) -> dict[str, object]:
+        with app_module.app.test_request_context("/"):
+            app_module.session["state_id"] = state_id
+            state = app_module.load_app_state()
+            state["selected_vm_names"] = selected
+            state["step4_hybrid_placements"] = placements
+            state["acknowledged_warning_ids"] = acknowledgments
+            app_module.save_app_state(state)
+            return app_module.load_app_state()
+
+    def read_state(state_id: str) -> dict[str, object]:
+        with app_module.app.test_request_context("/"):
+            app_module.session["state_id"] = state_id
+            return app_module.load_app_state()
+
+    client, state_id = new_client()
+    prior_state = write_state(
+        state_id,
+        ["vm-app-01"],
+        {"vm-app-01": "native"},
+        ["unsupported-native"],
+    )
+    invalid_forms = {
+        "unknown included VM": [
+            ("included_vm_names", "vm-app-01"),
+            ("included_vm_names", "missing-vm"),
+            ("placement:vm-app-01", "native"),
+        ],
+        "duplicate included VM": [
+            ("included_vm_names", "vm-app-01"),
+            ("included_vm_names", "vm-app-01"),
+            ("placement:vm-app-01", "native"),
+        ],
+        "duplicate placement field": [
+            ("included_vm_names", "vm-app-01"),
+            ("placement:vm-app-01", "native"),
+            ("placement:vm-app-01", "ocvs"),
+        ],
+        "unknown placement field": [
+            ("included_vm_names", "vm-app-01"),
+            ("placement:vm-app-01", "native"),
+            ("placement:not-in-inventory", "ocvs"),
+        ],
+        "invalid placement value": [
+            ("included_vm_names", "vm-app-01"),
+            ("placement:vm-app-01", "elsewhere"),
+        ],
+        "missing included placement": [("included_vm_names", "vm-app-01")],
+        "placement outside included scope": [
+            ("included_vm_names", "vm-app-01"),
+            ("placement:vm-app-01", "native"),
+            ("placement:vm-db-01", "ocvs"),
+        ],
+    }
+    for label, fields in invalid_forms.items():
+        response = client.post(
+            "/step3",
+            data=MultiDict(
+                [("action", "save_inventory_review"), *fields, ("acknowledged_warning_ids", "unsupported-native")]
+            ),
+        )
+        state_after = read_state(state_id)
+        check(
+            f"inventory review rejects {label} transactionally",
+            response.status_code == 200
+            and b'id="inventory-errors"' in response.data
+            and state_after == prior_state,
+            str(state_after),
+        )
+
+    response = client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "save_inventory_review"),
+                ("continue_to_scenarios", "1"),
+                ("included_vm_names", "vm-db-01"),
+                ("placement:vm-db-01", "native"),
+            ]
+        ),
+    )
+    state_after_not_ready = read_state(state_id)
+    check(
+        "inventory review unready Continue preserves prior state",
+        response.status_code == 200
+        and b"Acknowledge advisory warnings" in response.data
+        and state_after_not_ready == prior_state,
+        str(state_after_not_ready),
+    )
+
+    original_save_app_state = app_module.save_app_state
+
+    def reject_inventory_review_save(_state: dict[str, object]) -> None:
+        raise OSError("/private/tmp/private-stage2-state.json")
+
+    app_module.save_app_state = reject_inventory_review_save
+    try:
+        response = client.post(
+            "/step3",
+            data=MultiDict(
+                [
+                    ("action", "save_inventory_review"),
+                    ("included_vm_names", "vm-db-01"),
+                    ("placement:vm-db-01", "native"),
+                    ("acknowledged_warning_ids", "unsupported-native"),
+                ]
+            ),
+        )
+    finally:
+        app_module.save_app_state = original_save_app_state
+    state_after_failure = read_state(state_id)
+    check(
+        "inventory review save failure renders safely without mutation",
+        response.status_code == 200
+        and b"could not be saved" in response.data.lower()
+        and b"private-stage2-state" not in response.data
+        and state_after_failure == prior_state,
+        str(state_after_failure),
+    )
+
+    legacy_client, legacy_state_id = new_client()
+    legacy_prior = write_state(legacy_state_id, [], {}, [])
+    response = legacy_client.post(
+        "/step3",
+        data=MultiDict(
+            [
+                ("action", "add"),
+                ("redirect_to", "step4"),
+                ("vm_names", "vm-app-01"),
+            ]
+        ),
+        follow_redirects=False,
+    )
+    legacy_state = read_state(legacy_state_id)
+    check(
+        "legacy inventory action cannot bypass review readiness",
+        response.status_code == 200
+        and b"Acknowledge advisory warnings" in response.data
+        and legacy_state != legacy_prior
+        and legacy_state.get("selected_vm_names") == ["vm-app-01"]
+        and legacy_state.get("step4_hybrid_placements") == {"vm-app-01": "native"},
+        f"status={response.status_code}, state={legacy_state}",
+    )
+
+    boundary_client, boundary_state_id = new_client()
+    boundary_prior = write_state(
+        boundary_state_id,
+        ["vm-app-01"],
+        {},
+        ["unsupported-native"],
+    )
+    response = boundary_client.get("/step4", follow_redirects=False)
+    check(
+        "Step 4 boundary rejects incomplete inventory review",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step3")
+        and read_state(boundary_state_id) == boundary_prior,
+        f"status={response.status_code}, location={response.headers.get('Location')}",
+    )
+
+    hybrid_client, hybrid_state_id = new_client()
+    ready_state = write_state(
+        hybrid_state_id,
+        ["vm-app-01", "vm-legacy-01"],
+        {"vm-app-01": "native", "vm-legacy-01": "ocvs"},
+        ["unsupported-native"],
+    )
+    _rows, source_vinfo_csv = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = hybrid_state_id
+        app_module.save_step4_snapshot(
+            {
+                "saved_at": "2026-01-02T03:04:05",
+                "source_vinfo_csv": source_vinfo_csv,
+                "vm_settings": {
+                    "vm-app-01": {"hybrid_placement": "ocvs"},
+                    "vm-legacy-01": {"hybrid_placement": "native"},
+                },
+            }
+        )
+    response = hybrid_client.get("/step4")
+    state_after_snapshot = read_state(hybrid_state_id)
+    check(
+        "Step 4 snapshot cannot overwrite Stage 2 placements",
+        response.status_code == 200
+        and state_after_snapshot.get("step4_hybrid_placements")
+        == ready_state.get("step4_hybrid_placements"),
+        str(state_after_snapshot.get("step4_hybrid_placements")),
+    )
+
+    response = hybrid_client.post(
+        "/step4",
+        data=MultiDict(
+            [
+                ("action", "save"),
+                ("active_scenario", "hybrid"),
+                ("hybrid_placement:vm-app-01", "review"),
+                ("hybrid_placement:vm-legacy-01", "native"),
+            ]
+        ),
+        follow_redirects=True,
+    )
+    reviewed_state = read_state(hybrid_state_id)
+    html = response.data.decode("utf-8", errors="replace")
+    check(
+        "Hybrid Review placement round-trips with explicit OCVS pricing",
+        response.status_code == 200
+        and reviewed_state.get("step4_hybrid_placements")
+        == {"vm-app-01": "review", "vm-legacy-01": "native"}
+        and 'name="hybrid_placement:vm-app-01"' in html
+        and 'value="review" selected' in html
+        and "Review (priced as OCVS)" in html,
+        str(reviewed_state.get("step4_hybrid_placements")),
+    )
+    review_plan = app_module.build_hybrid_placement_plan(
+        [{"vm_name": "vm-app-01", "os_name": "Microsoft Windows Server 2019 (64-bit)"}],
+        {"vm-app-01": "review"},
+        app_module.load_supported_os_signatures(),
+    )
+    check(
+        "Review placement uses conservative OCVS pricing semantics",
+        review_plan.get("review_count") == 1
+        and review_plan.get("ocvs_priced_count") == 1
+        and review_plan.get("rows", [{}])[0].get("hybrid_effective_target") == "ocvs",
+        str(review_plan),
+    )
+
+    keyed_prior = read_state(hybrid_state_id)
+    invalid_hybrid_forms = {
+        "missing key": [("hybrid_placement:vm-app-01", "review")],
+        "duplicate key": [
+            ("hybrid_placement:vm-app-01", "review"),
+            ("hybrid_placement:vm-app-01", "native"),
+            ("hybrid_placement:vm-legacy-01", "native"),
+        ],
+        "unknown key": [
+            ("hybrid_placement:vm-app-01", "review"),
+            ("hybrid_placement:vm-legacy-01", "native"),
+            ("hybrid_placement:not-selected", "ocvs"),
+        ],
+        "invalid value": [
+            ("hybrid_placement:vm-app-01", "elsewhere"),
+            ("hybrid_placement:vm-legacy-01", "native"),
+        ],
+        "legacy positional pairing": [
+            ("hybrid_vm_name", "vm-app-01"),
+            ("hybrid_placement", "review"),
+            ("hybrid_vm_name", "vm-legacy-01"),
+            ("hybrid_placement", "native"),
+        ],
+    }
+    for label, fields in invalid_hybrid_forms.items():
+        response = hybrid_client.post(
+            "/step4",
+            data=MultiDict([("action", "save"), ("active_scenario", "hybrid"), *fields]),
+            follow_redirects=True,
+        )
+        state_after = read_state(hybrid_state_id)
+        check(
+            f"Hybrid keyed placements reject {label} without mutation",
+            response.status_code == 200
+            and b"valid placement for every included VM" in response.data
+            and state_after == keyed_prior,
+            f"status={response.status_code}, state={state_after}",
+        )
 
 
 def validate_large_inventory_review_containment() -> None:
@@ -2875,9 +3185,26 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
 
         rows, _ = app_module.load_vms_from_vinfo(str(inventory))
         vm_names = [row["name"] for row in rows]
+        workflow_placements = {
+            "vm-app-01": "native",
+            "vm-db-01": "native",
+            "vm-web-01": "native",
+            "vm-legacy-01": "ocvs",
+        }
         response = client.post(
             "/step3",
-            data=MultiDict([("action", "add"), ("redirect_to", "step4")] + [("vm_names", name) for name in vm_names]),
+            data=MultiDict(
+                [
+                    ("action", "save_inventory_review"),
+                    ("continue_to_scenarios", "1"),
+                    ("acknowledged_warning_ids", "unsupported-native"),
+                    *[("included_vm_names", name) for name in vm_names],
+                    *[
+                        (f"placement:{name}", workflow_placements[name])
+                        for name in vm_names
+                    ],
+                ]
+            ),
             follow_redirects=False,
         )
         check("step3 continue redirect", response.status_code in {302, 303} and "/step4" in response.headers.get("Location", ""))
@@ -2942,6 +3269,8 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                 )
 
         first_vm, second_vm = vm_names[0], vm_names[1]
+        workflow_placements[first_vm] = "ocvs"
+        workflow_placements[second_vm] = "native"
         save_data = MultiDict(
             [
                 ("action", "save"),
@@ -2956,10 +3285,10 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                 ("ocvs_dr_nodes", "1"),
                 ("ocvs_commitment_term", "3_year"),
                 ("vmware_license_price_per_core_yearly", "400"),
-                ("hybrid_vm_name", first_vm),
-                ("hybrid_placement", "ocvs"),
-                ("hybrid_vm_name", second_vm),
-                ("hybrid_placement", "native"),
+                *[
+                    (f"hybrid_placement:{name}", workflow_placements[name])
+                    for name in vm_names
+                ],
             ]
         )
         response = client.post("/step4", data=save_data, follow_redirects=True)
@@ -2983,6 +3312,10 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                 "bulk_apply_burst": "50%",
                 "bulk_apply_vpu": "20",
                 "bulk_apply_os_license": "Lic Include",
+                **{
+                    f"hybrid_placement:{name}": workflow_placements[name]
+                    for name in vm_names
+                },
             },
             follow_redirects=True,
         )
@@ -3014,6 +3347,10 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                     ("native_strategy_os", "Red Hat Enterprise Linux 8 (64-bit)"),
                     ("native_strategy_shape", "E6"),
                     ("native_strategy_burst", "100%"),
+                    *[
+                        (f"hybrid_placement:{name}", workflow_placements[name])
+                        for name in vm_names
+                    ],
                 ]
             ),
             follow_redirects=True,
@@ -3038,7 +3375,14 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
 
         response = client.post(
             "/step4",
-            data={"action": "export_excel", "active_scenario": "price"},
+            data={
+                "action": "export_excel",
+                "active_scenario": "price",
+                **{
+                    f"hybrid_placement:{name}": workflow_placements[name]
+                    for name in vm_names
+                },
+            },
             follow_redirects=False,
         )
         content_disposition = response.headers.get("Content-Disposition", "")
@@ -3354,6 +3698,7 @@ def main() -> None:
     validate_saved_assessments()
     validate_step3_duplicate_removal()
     validate_guided_inventory_review()
+    validate_inventory_review_transactions_and_step4_boundary()
     validate_large_inventory_review_containment()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)

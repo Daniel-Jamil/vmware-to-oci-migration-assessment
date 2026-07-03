@@ -5,7 +5,6 @@
   if (!table) return;
 
   const tbody = table.querySelector("tbody");
-  const rows = Array.from(table.querySelectorAll("[data-inventory-row]"));
   const searchInput = document.getElementById("inventory-search");
   const supportFilter = document.getElementById("inventory-support-filter");
   const powerFilter = document.getElementById("inventory-power-filter");
@@ -19,20 +18,37 @@
   const undoMessage = undoRegion ? undoRegion.querySelector("[data-undo-message]") : null;
   const undoButton = undoRegion ? undoRegion.querySelector("[data-undo]") : null;
   const warningButtons = Array.from(document.querySelectorAll("[data-warning-filter]"));
+  const warningItems = Array.from(document.querySelectorAll("[data-warning-item]"));
+  const detailRowsByIndex = new Map(
+    Array.from(table.querySelectorAll("[data-inventory-detail]")).map((row) => [row.dataset.inventoryDetail, row])
+  );
+  const placementsByIndex = new Map(
+    Array.from(table.querySelectorAll("[data-row-placement]")).map((control) => [control.dataset.rowPlacement, control])
+  );
+  const rowRecords = Array.from(table.querySelectorAll("[data-inventory-row]")).map((row) => {
+    const rowIndex = row.dataset.inventoryRow;
+    const detailsButton = row.querySelector("[data-details-target]");
+    return {
+      row,
+      rowIndex,
+      detailRow: detailRowsByIndex.get(rowIndex),
+      inclusion: row.querySelector('input[name="included_vm_names"]'),
+      placement: placementsByIndex.get(rowIndex),
+      placementLabel: row.querySelector("[data-placement-label]"),
+      detailsButton,
+      details: document.getElementById(detailsButton ? detailsButton.dataset.detailsTarget : ""),
+      warningIds: (row.dataset.warningIds || "").split(/\s+/).filter(Boolean),
+      searchText: (row.dataset.search || "").toLowerCase(),
+    };
+  });
+  const recordByIndex = new Map(rowRecords.map((record) => [record.rowIndex, record]));
+  const sortControls = Array.from(table.querySelectorAll("[data-sort]")).map((button) => ({
+    button,
+    header: button.closest("th"),
+  }));
   let activeWarning = "all";
   let undoSnapshot = null;
-
-  function detailRow(row) {
-    return table.querySelector(`[data-inventory-detail="${row.dataset.inventoryRow}"]`);
-  }
-
-  function placementControl(row) {
-    return table.querySelector(`[data-row-placement="${row.dataset.inventoryRow}"]`);
-  }
-
-  function inclusionControl(row) {
-    return row.querySelector('input[name="included_vm_names"]');
-  }
+  let searchTimer = null;
 
   function isFilterActive() {
     return Boolean(
@@ -44,41 +60,41 @@
     );
   }
 
-  function rowMatches(row) {
+  function rowMatches(record) {
     const query = searchInput ? searchInput.value.trim().toLowerCase() : "";
     const support = supportFilter ? supportFilter.value : "all";
     const power = powerFilter ? powerFilter.value : "all";
     const placement = placementFilter ? placementFilter.value : "all";
-    const warnings = (row.dataset.warningIds || "").split(/\s+/).filter(Boolean);
-    const control = placementControl(row);
 
-    return (!query || (row.dataset.search || "").toLowerCase().includes(query)) &&
-      (support === "all" || row.dataset.support === support) &&
-      (power === "all" || row.dataset.power === power) &&
-      (placement === "all" || (control && control.value === placement)) &&
-      (activeWarning === "all" || warnings.includes(activeWarning));
+    return (!query || record.searchText.includes(query)) &&
+      (support === "all" || record.row.dataset.support === support) &&
+      (power === "all" || record.row.dataset.power === power) &&
+      (placement === "all" || (record.placement && record.placement.value === placement)) &&
+      (activeWarning === "all" || record.warningIds.includes(activeWarning));
   }
 
-  function visibleRows() {
-    return rows.filter((row) => !row.hidden);
+  function visibleRecords() {
+    return rowRecords.filter((record) => !record.row.hidden);
+  }
+
+  function syncInclusion(record) {
+    if (record.placement && record.inclusion) {
+      record.placement.disabled = !record.inclusion.checked;
+    }
   }
 
   function updateSelectionStatus() {
     if (!selectionStatus) return;
-    const selectedCount = rows.filter((row) => {
-      const control = inclusionControl(row);
-      return control && control.checked;
-    }).length;
-    selectionStatus.textContent = `${selectedCount} of ${rows.length} included`;
+    const selectedCount = rowRecords.filter((record) => record.inclusion && record.inclusion.checked).length;
+    selectionStatus.textContent = `${selectedCount} of ${rowRecords.length} included`;
   }
 
   function updateFilters() {
     let count = 0;
-    rows.forEach((row) => {
-      const visible = rowMatches(row);
-      row.hidden = !visible;
-      const pairedDetail = detailRow(row);
-      if (pairedDetail) pairedDetail.hidden = !visible;
+    rowRecords.forEach((record) => {
+      const visible = rowMatches(record);
+      record.row.hidden = !visible;
+      if (record.detailRow) record.detailRow.hidden = !visible;
       if (visible) count += 1;
     });
 
@@ -86,51 +102,47 @@
     if (emptyFilter) emptyFilter.hidden = count !== 0;
     if (scopeOutput) {
       scopeOutput.textContent = isFilterActive()
-        ? `Bulk scope: ${count} filtered of ${rows.length} loaded VMs.`
-        : `Bulk scope: all ${rows.length} loaded VMs.`;
+        ? `Bulk scope: ${count} filtered of ${rowRecords.length} loaded VMs.`
+        : `Bulk scope: all ${rowRecords.length} loaded VMs.`;
     }
   }
 
-  function snapshotState() {
-    return rows.map((row) => {
-      const inclusion = inclusionControl(row);
-      const placement = placementControl(row);
-      return {
-        rowIndex: row.dataset.inventoryRow,
-        included: Boolean(inclusion && inclusion.checked),
-        placement: placement ? placement.value : "review",
-      };
-    });
+  function syncPlacement(record, value) {
+    if (!record.placement) return;
+    record.placement.value = value;
+    record.row.dataset.placement = value;
+    const selectedOption = record.placement.options[record.placement.selectedIndex];
+    const label = selectedOption ? selectedOption.text : value;
+    record.row.dataset.sortPlacement = label;
+    if (record.placementLabel) record.placementLabel.textContent = label;
   }
 
-  function syncPlacement(row, value) {
-    const placement = placementControl(row);
-    if (!placement) return;
-    placement.value = value;
-    row.dataset.placement = value;
-    row.dataset.sortPlacement = placement.options[placement.selectedIndex].text;
-    const label = row.querySelector("[data-placement-label]");
-    if (label) label.textContent = placement.options[placement.selectedIndex].text;
-  }
-
-  function showUndo(message, snapshot) {
-    undoSnapshot = snapshot;
+  function showUndo(message, changedRecords) {
+    undoSnapshot = changedRecords.length ? changedRecords : null;
     if (!undoRegion || !undoMessage) return;
     undoMessage.textContent = message;
-    undoRegion.hidden = false;
+    undoRegion.hidden = !undoSnapshot;
   }
 
   function runBulk(message, rowScope, change) {
-    const snapshot = snapshotState();
-    rowScope.forEach(change);
+    const changedRecords = [];
+    rowScope.forEach((record) => {
+      const changedState = change(record);
+      if (changedState) changedRecords.push({ rowIndex: record.rowIndex, ...changedState });
+    });
     updateSelectionStatus();
     updateFilters();
-    showUndo(message, snapshot);
+    showUndo(message(changedRecords.length, rowScope.length), changedRecords);
   }
 
-  [searchInput, supportFilter, powerFilter, placementFilter].forEach((control) => {
-    if (!control) return;
-    control.addEventListener(control === searchInput ? "input" : "change", updateFilters);
+  if (searchInput) {
+    searchInput.addEventListener("input", () => {
+      if (searchTimer) clearTimeout(searchTimer);
+      searchTimer = window.setTimeout(updateFilters, 150);
+    });
+  }
+  [supportFilter, powerFilter, placementFilter].forEach((control) => {
+    if (control) control.addEventListener("change", updateFilters);
   });
 
   warningButtons.forEach((button) => {
@@ -141,7 +153,7 @@
         candidate.classList.toggle("is-active", active);
         candidate.setAttribute("aria-pressed", String(active));
       });
-      document.querySelectorAll("[data-warning-item]").forEach((item) => {
+      warningItems.forEach((item) => {
         item.hidden = activeWarning !== "all" && item.dataset.warningItem !== activeWarning;
       });
       updateFilters();
@@ -151,32 +163,51 @@
   const selectAll = document.querySelector("[data-select-all]");
   if (selectAll) {
     selectAll.addEventListener("click", () => {
-      runBulk(`Included all ${rows.length} loaded VMs.`, rows, (row) => {
-        const control = inclusionControl(row);
-        if (control) control.checked = true;
-      });
+      runBulk(
+        (changed) => `Included ${changed} VMs.`,
+        rowRecords,
+        (record) => {
+          if (!record.inclusion || record.inclusion.checked) return null;
+          const previous = record.inclusion.checked;
+          record.inclusion.checked = true;
+          syncInclusion(record);
+          return { included: previous };
+        }
+      );
     });
   }
 
   const includeFiltered = document.querySelector("[data-include-filtered]");
   if (includeFiltered) {
     includeFiltered.addEventListener("click", () => {
-      const scopedRows = visibleRows();
-      runBulk(`Included ${scopedRows.length} VMs in the current filter.`, scopedRows, (row) => {
-        const control = inclusionControl(row);
-        if (control) control.checked = true;
-      });
+      runBulk(
+        (changed, scoped) => `Included ${changed} of ${scoped} VMs in the current filter.`,
+        visibleRecords(),
+        (record) => {
+          if (!record.inclusion || record.inclusion.checked) return null;
+          const previous = record.inclusion.checked;
+          record.inclusion.checked = true;
+          syncInclusion(record);
+          return { included: previous };
+        }
+      );
     });
   }
 
   const excludeFiltered = document.querySelector("[data-exclude-filtered]");
   if (excludeFiltered) {
     excludeFiltered.addEventListener("click", () => {
-      const scopedRows = visibleRows();
-      runBulk(`Excluded ${scopedRows.length} VMs in the current filter.`, scopedRows, (row) => {
-        const control = inclusionControl(row);
-        if (control) control.checked = false;
-      });
+      runBulk(
+        (changed, scoped) => `Excluded ${changed} of ${scoped} VMs in the current filter.`,
+        visibleRecords(),
+        (record) => {
+          if (!record.inclusion || !record.inclusion.checked) return null;
+          const previous = record.inclusion.checked;
+          record.inclusion.checked = false;
+          syncInclusion(record);
+          return { included: previous };
+        }
+      );
     });
   }
 
@@ -187,11 +218,17 @@
         bulkPlacement.focus();
         return;
       }
-      const scopedRows = visibleRows();
       const selectedLabel = bulkPlacement.options[bulkPlacement.selectedIndex].text;
-      runBulk(`Applied ${selectedLabel} to ${scopedRows.length} VMs in the current filter.`, scopedRows, (row) => {
-        syncPlacement(row, bulkPlacement.value);
-      });
+      runBulk(
+        (changed, scoped) => `Applied ${selectedLabel} to ${changed} of ${scoped} VMs in the current filter.`,
+        visibleRecords(),
+        (record) => {
+          if (!record.placement || record.placement.value === bulkPlacement.value) return null;
+          const previous = record.placement.value;
+          syncPlacement(record, bulkPlacement.value);
+          return { placement: previous };
+        }
+      );
     });
   }
 
@@ -199,53 +236,60 @@
     undoButton.addEventListener("click", () => {
       if (!undoSnapshot) return;
       undoSnapshot.forEach((saved) => {
-        const row = table.querySelector(`[data-inventory-row="${saved.rowIndex}"]`);
-        if (!row) return;
-        const inclusion = inclusionControl(row);
-        if (inclusion) inclusion.checked = saved.included;
-        syncPlacement(row, saved.placement);
+        const record = recordByIndex.get(saved.rowIndex);
+        if (!record) return;
+        if (Object.prototype.hasOwnProperty.call(saved, "included") && record.inclusion) {
+          record.inclusion.checked = saved.included;
+          syncInclusion(record);
+        }
+        if (Object.prototype.hasOwnProperty.call(saved, "placement")) {
+          syncPlacement(record, saved.placement);
+        }
       });
       undoSnapshot = null;
       if (undoRegion) undoRegion.hidden = true;
       updateSelectionStatus();
       updateFilters();
+      undoButton.focus({ preventScroll: true });
     });
   }
 
-  rows.forEach((row) => {
-    const inclusion = inclusionControl(row);
-    const placement = placementControl(row);
-    if (inclusion) inclusion.addEventListener("change", updateSelectionStatus);
-    if (placement) {
-      placement.addEventListener("change", () => {
-        syncPlacement(row, placement.value);
+  rowRecords.forEach((record) => {
+    if (record.inclusion) {
+      record.inclusion.addEventListener("change", () => {
+        syncInclusion(record);
+        updateSelectionStatus();
+      });
+      syncInclusion(record);
+    }
+    if (record.placement) {
+      record.placement.addEventListener("change", () => {
+        syncPlacement(record, record.placement.value);
         updateFilters();
       });
-      syncPlacement(row, placement.value);
+      syncPlacement(record, record.placement.value);
     }
 
-    const detailsButton = row.querySelector("[data-details-target]");
-    const details = document.getElementById(detailsButton ? detailsButton.dataset.detailsTarget : "");
-    if (detailsButton && details) {
-      detailsButton.addEventListener("click", () => {
-        details.open = !details.open;
-        detailsButton.setAttribute("aria-expanded", String(details.open));
-        if (details.open) details.querySelector("summary").focus();
+    if (record.detailsButton && record.details) {
+      record.detailsButton.addEventListener("click", () => {
+        record.details.open = !record.details.open;
+        record.detailsButton.setAttribute("aria-expanded", String(record.details.open));
       });
-      details.addEventListener("toggle", () => {
-        detailsButton.setAttribute("aria-expanded", String(details.open));
+      record.details.addEventListener("toggle", () => {
+        record.detailsButton.setAttribute("aria-expanded", String(record.details.open));
       });
     }
   });
 
-  table.querySelectorAll("[data-sort]").forEach((button) => {
+  sortControls.forEach(({ button, header }) => {
     button.addEventListener("click", () => {
       const sortKey = button.dataset.sort;
       const numberSort = button.dataset.sortType === "number";
-      const ascending = button.getAttribute("aria-sort") !== "ascending";
-      const sortedRows = [...rows].sort((left, right) => {
-        const leftValue = left.dataset[`sort${sortKey.charAt(0).toUpperCase()}${sortKey.slice(1)}`] || "";
-        const rightValue = right.dataset[`sort${sortKey.charAt(0).toUpperCase()}${sortKey.slice(1)}`] || "";
+      const ascending = !header || header.getAttribute("aria-sort") !== "ascending";
+      const dataKey = `sort${sortKey.charAt(0).toUpperCase()}${sortKey.slice(1)}`;
+      const sortedRecords = [...rowRecords].sort((left, right) => {
+        const leftValue = left.row.dataset[dataKey] || "";
+        const rightValue = right.row.dataset[dataKey] || "";
         if (numberSort) {
           const difference = (Number.parseFloat(leftValue) || 0) - (Number.parseFloat(rightValue) || 0);
           return ascending ? difference : -difference;
@@ -254,13 +298,15 @@
         return ascending ? difference : -difference;
       });
 
-      table.querySelectorAll("[data-sort]").forEach((candidate) => candidate.setAttribute("aria-sort", "none"));
-      button.setAttribute("aria-sort", ascending ? "ascending" : "descending");
-      sortedRows.forEach((row) => {
-        tbody.appendChild(row);
-        const pairedDetail = detailRow(row);
-        if (pairedDetail) tbody.appendChild(pairedDetail);
+      sortControls.forEach((control) => {
+        if (control.header) control.header.setAttribute("aria-sort", "none");
       });
+      if (header) header.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+      sortedRecords.forEach((record) => {
+        tbody.appendChild(record.row);
+        if (record.detailRow) tbody.appendChild(record.detailRow);
+      });
+      button.focus({ preventScroll: true });
     });
   });
 
