@@ -96,13 +96,13 @@
       border-top: 1px solid var(--line);
     }
     label { font-weight: 600; font-size: .92rem; }
-    select, input[type="text"], input[type="file"], button {
+    select, input[type="text"], input[type="file"], input[type="number"], button {
       padding: .62rem .72rem;
       font-size: .92rem;
       border-radius: var(--radius);
       border: 1px solid var(--line-strong);
     }
-    select, input[type="text"], input[type="file"] { background: #fff; color: var(--text); }
+    select, input[type="text"], input[type="file"], input[type="number"] { background: #fff; color: var(--text); }
     button {
       cursor: pointer;
       background: var(--accent);
@@ -310,6 +310,34 @@
       </div>
       <code>rvtools/</code>
     </div>
+
+    <h3>Manual Workload Summary</h3>
+    <form method="post">
+      <input type="hidden" name="action" value="create_manual_inventory" />
+      <label for="manual_vm_count">VM count:</label>
+      <input id="manual_vm_count" name="manual_vm_count" type="number" min="1" step="1" value="{{ manual_sizing_form.vm_count }}" required />
+      <button type="submit">{{ manual_sizing_form.submit_label }}</button>
+
+      <label for="manual_total_vcpus">Total vCPU:</label>
+      <input id="manual_total_vcpus" name="manual_total_vcpus" type="number" min="1" step="1" value="{{ manual_sizing_form.total_vcpus }}" required />
+      <div class="field-hint">Generated VM rows are balanced as evenly as possible while preserving the entered total.</div>
+
+      <label for="manual_total_memory_gb">Total RAM GB:</label>
+      <input id="manual_total_memory_gb" name="manual_total_memory_gb" type="number" min="1" step="1" value="{{ manual_sizing_form.total_memory_gb }}" required />
+      <div></div>
+
+      <label for="manual_total_storage_gb">Total storage GB:</label>
+      <input id="manual_total_storage_gb" name="manual_total_storage_gb" type="number" min="1" step="1" value="{{ manual_sizing_form.total_storage_gb }}" required />
+      <div></div>
+
+      <label for="manual_supported_vm_count">OCI-supported VMs:</label>
+      <input id="manual_supported_vm_count" name="manual_supported_vm_count" type="number" min="0" step="1" value="{{ manual_sizing_form.supported_vm_count }}" required />
+      <div></div>
+
+      <label for="manual_unsupported_vm_count">Unsupported/legacy VMs:</label>
+      <input id="manual_unsupported_vm_count" name="manual_unsupported_vm_count" type="number" min="0" step="1" value="{{ manual_sizing_form.unsupported_vm_count }}" required />
+      <div class="field-hint">Supported and unsupported counts must add up to VM count.</div>
+    </form>
 
     <form method="post" enctype="multipart/form-data">
       <input type="hidden" name="action" value="upload_rvtools_file" />

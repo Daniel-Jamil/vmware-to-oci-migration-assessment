@@ -2112,6 +2112,14 @@
                           </select>
                         </div>
                         <div class="control-field">
+                          <label for="hybrid_ocvs_commitment_term">OCVS term</label>
+                          <select id="hybrid_ocvs_commitment_term" data-sync-control="ocvs_commitment_term">
+                            {% for option in ocvs_commitment_options %}
+                              <option value="{{ option.value }}" {% if ocvs_commitment_term == option.value %}selected{% endif %}>{{ option.label }}</option>
+                            {% endfor %}
+                          </select>
+                        </div>
+                        <div class="control-field">
                           <label for="hybrid_ocvs_vcpu_per_ocpu">vCPU/OCPU</label>
                           <input id="hybrid_ocvs_vcpu_per_ocpu" data-sync-control="ocvs_vcpu_per_ocpu" type="number" min="1" max="16" step="0.1" value="{{ '%.1f'|format(ocvs_policy.vcpu_per_ocpu) }}" />
                         </div>
@@ -2256,6 +2264,14 @@
                           <option value="{{ profile.shape }}" {% if ocvs_profile_choice == profile.shape %}selected{% endif %}>
                             {{ profile.label }} - {{ profile.shape }}
                           </option>
+                        {% endfor %}
+                      </select>
+                    </div>
+                    <div class="control-field">
+                      <label for="ocvs_commitment_term">OCVS term</label>
+                      <select id="ocvs_commitment_term" name="ocvs_commitment_term" form="step4-form" data-sync-control="ocvs_commitment_term">
+                        {% for option in ocvs_commitment_options %}
+                          <option value="{{ option.value }}" {% if ocvs_commitment_term == option.value %}selected{% endif %}>{{ option.label }}</option>
                         {% endfor %}
                       </select>
                     </div>
