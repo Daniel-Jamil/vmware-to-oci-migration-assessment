@@ -2829,6 +2829,149 @@ def _readiness_vm_name(row: dict[str, Any]) -> str:
     return str(row.get("name") or row.get("vm_name") or "").strip()
 
 
+def _readiness_hybrid_partition_complete(
+    *,
+    selected_names: list[str],
+    scenario_row: Any,
+    supported_native_rows: Any,
+    unsupported_ocvs_rows: Any,
+    placement_plan: Any,
+) -> bool:
+    if (
+        not selected_names
+        or not isinstance(scenario_row, dict)
+        or not isinstance(placement_plan, dict)
+    ):
+        return False
+    selected_set = set(selected_names)
+    if len(selected_set) != len(selected_names):
+        return False
+
+    def row_names(value: Any) -> tuple[list[str], set[str]] | None:
+        if not isinstance(value, list):
+            return None
+        names: list[str] = []
+        for row in value:
+            if not isinstance(row, dict):
+                return None
+            name = _readiness_vm_name(row)
+            if not name:
+                return None
+            names.append(name)
+        name_set = set(names)
+        if len(name_set) != len(names) or not name_set <= selected_set:
+            return None
+        return names, name_set
+
+    top_native = row_names(supported_native_rows)
+    top_ocvs = row_names(unsupported_ocvs_rows)
+    plan_native = row_names(placement_plan.get("native_rows"))
+    plan_ocvs = row_names(placement_plan.get("ocvs_rows"))
+    if None in (top_native, top_ocvs, plan_native, plan_ocvs):
+        return False
+    assert top_native is not None and top_ocvs is not None
+    assert plan_native is not None and plan_ocvs is not None
+    native_names, native_set = top_native
+    ocvs_names, ocvs_set = top_ocvs
+    if (
+        native_set & ocvs_set
+        or native_set | ocvs_set != selected_set
+        or plan_native[1] != native_set
+        or plan_ocvs[1] != ocvs_set
+    ):
+        return False
+
+    def exact_count(mapping: dict[str, Any], key: str, expected: int) -> bool:
+        return _readiness_nonnegative_count(mapping.get(key)) == expected
+
+    if not (
+        exact_count(scenario_row, "native_vm_count", len(native_names))
+        and exact_count(scenario_row, "ocvs_vm_count", len(ocvs_names))
+        and exact_count(placement_plan, "native_count", len(native_names))
+        and exact_count(placement_plan, "ocvs_priced_count", len(ocvs_names))
+    ):
+        return False
+
+    plan_rows_present = "rows" in placement_plan
+    plan_review_set: set[str] | None = None
+    plan_explicit_ocvs_set: set[str] | None = None
+    if plan_rows_present:
+        plan_rows = placement_plan.get("rows")
+        parsed_plan_rows = row_names(plan_rows)
+        if parsed_plan_rows is None or parsed_plan_rows[1] != selected_set:
+            return False
+        target_native_set: set[str] = set()
+        target_ocvs_set: set[str] = set()
+        plan_review_set = set()
+        plan_explicit_ocvs_set = set()
+        assert isinstance(plan_rows, list)
+        for row in plan_rows:
+            name = _readiness_vm_name(row)
+            placement = str(row.get("hybrid_placement") or "").strip().lower()
+            effective_target = str(
+                row.get("hybrid_effective_target") or ""
+            ).strip().lower()
+            expected_target = (
+                "native"
+                if placement == "native"
+                else "ocvs"
+                if placement in {"ocvs", "review"}
+                else ""
+            )
+            if not expected_target or effective_target != expected_target:
+                return False
+            if effective_target == "native":
+                target_native_set.add(name)
+            else:
+                target_ocvs_set.add(name)
+            if placement == "review":
+                plan_review_set.add(name)
+            elif placement == "ocvs":
+                plan_explicit_ocvs_set.add(name)
+        if target_native_set != native_set or target_ocvs_set != ocvs_set:
+            return False
+
+    review_rows = (
+        row_names(placement_plan.get("review_rows"))
+        if "review_rows" in placement_plan
+        else None
+    )
+    explicit_ocvs_rows = (
+        row_names(placement_plan.get("explicit_ocvs_rows"))
+        if "explicit_ocvs_rows" in placement_plan
+        else None
+    )
+    if "review_rows" in placement_plan and review_rows is None:
+        return False
+    if "explicit_ocvs_rows" in placement_plan and explicit_ocvs_rows is None:
+        return False
+    review_set = review_rows[1] if review_rows is not None else plan_review_set
+    explicit_ocvs_set = (
+        explicit_ocvs_rows[1]
+        if explicit_ocvs_rows is not None
+        else plan_explicit_ocvs_set
+    )
+    if review_set is None or explicit_ocvs_set is None:
+        return False
+    if (
+        not review_set <= ocvs_set
+        or not explicit_ocvs_set <= ocvs_set
+        or review_set & explicit_ocvs_set
+        or review_set | explicit_ocvs_set != ocvs_set
+        or (plan_review_set is not None and review_set != plan_review_set)
+        or (
+            plan_explicit_ocvs_set is not None
+            and explicit_ocvs_set != plan_explicit_ocvs_set
+        )
+        or not exact_count(placement_plan, "review_count", len(review_set))
+        or not exact_count(
+            placement_plan, "ocvs_count", len(explicit_ocvs_set)
+        )
+    ):
+        return False
+    return True
+
+
 def _readiness_item(
     item: dict[str, Any],
     *,
@@ -3259,94 +3402,15 @@ def build_current_readiness_context(
 
     hybrid_scenario_row = scenario_rows.get("hybrid", {})
     placement_plan_value = analysis.get("hybrid_placement_plan")
-    placement_plan_present = "hybrid_placement_plan" in analysis
-    placement_plan_valid = not placement_plan_present or isinstance(
-        placement_plan_value, dict
+    hybrid_ocvs_workload_count = _readiness_nonnegative_count(
+        hybrid_scenario_row.get("ocvs_vm_count")
     )
-    placement_plan = placement_plan_value if isinstance(placement_plan_value, dict) else {}
-
-    def reconciled_partition_count(
-        scenario_key: str,
-        placement_key: str,
-    ) -> int | None:
-        values: list[int] = []
-        if scenario_key in hybrid_scenario_row:
-            scenario_count = _readiness_nonnegative_count(
-                hybrid_scenario_row.get(scenario_key)
-            )
-            if scenario_count is None:
-                return None
-            values.append(scenario_count)
-        if placement_key in placement_plan:
-            placement_count = _readiness_nonnegative_count(
-                placement_plan.get(placement_key)
-            )
-            if placement_count is None:
-                return None
-            values.append(placement_count)
-        if not values or any(value != values[0] for value in values[1:]):
-            return None
-        return values[0]
-
-    hybrid_native_workload_count = reconciled_partition_count(
-        "native_vm_count", "native_count"
-    )
-    hybrid_ocvs_workload_count = reconciled_partition_count(
-        "ocvs_vm_count", "ocvs_priced_count"
-    )
-
-    hybrid_native_names = [
-        _readiness_vm_name(row) for row in hybrid_native_rows
-    ]
-    hybrid_ocvs_names_available = False
-    hybrid_ocvs_names_valid = True
-    hybrid_ocvs_names: list[str] = []
-    if "unsupported_ocvs_rows" in analysis:
-        hybrid_ocvs_names_available = True
-        hybrid_ocvs_value = analysis.get("unsupported_ocvs_rows")
-    elif "ocvs_rows" in placement_plan:
-        hybrid_ocvs_names_available = True
-        hybrid_ocvs_value = placement_plan.get("ocvs_rows")
-    else:
-        hybrid_ocvs_value = []
-    if hybrid_ocvs_names_available:
-        hybrid_ocvs_names_valid = bool(
-            isinstance(hybrid_ocvs_value, list)
-            and all(
-                isinstance(row, dict) and bool(_readiness_vm_name(row))
-                for row in hybrid_ocvs_value
-            )
-        )
-        if hybrid_ocvs_names_valid:
-            hybrid_ocvs_names = [
-                _readiness_vm_name(row) for row in hybrid_ocvs_value
-            ]
-
-    selected_name_set = set(selected_names)
-    hybrid_native_name_set = set(hybrid_native_names)
-    hybrid_ocvs_name_set = set(hybrid_ocvs_names)
-    hybrid_partition_complete = bool(
-        placement_plan_valid
-        and hybrid_native_rows_valid
-        and hybrid_native_workload_count is not None
-        and hybrid_ocvs_workload_count is not None
-        and hybrid_native_workload_count + hybrid_ocvs_workload_count
-        == len(selected_names)
-        and len(hybrid_native_names) == hybrid_native_workload_count
-        and len(hybrid_native_name_set) == len(hybrid_native_names)
-        and hybrid_native_name_set <= selected_name_set
-        and (
-            not hybrid_ocvs_names_available
-            or (
-                hybrid_ocvs_names_valid
-                and len(hybrid_ocvs_names) == hybrid_ocvs_workload_count
-                and len(hybrid_ocvs_name_set) == len(hybrid_ocvs_names)
-                and hybrid_ocvs_name_set <= selected_name_set
-                and not hybrid_native_name_set & hybrid_ocvs_name_set
-                and hybrid_native_name_set | hybrid_ocvs_name_set
-                == selected_name_set
-            )
-        )
+    hybrid_partition_complete = _readiness_hybrid_partition_complete(
+        selected_names=selected_names,
+        scenario_row=hybrid_scenario_row,
+        supported_native_rows=hybrid_native_value,
+        unsupported_ocvs_rows=analysis.get("unsupported_ocvs_rows"),
+        placement_plan=placement_plan_value,
     )
 
     fit_warning_values = analysis.get("fit_warnings", [])

@@ -121,10 +121,32 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
         },
     ]
     physical_cores = {"ocvs": 384, "hybrid": 128}
+    native_plan_row = {
+        **modeled_vm_rows[0],
+        "hybrid_placement": "native",
+        "hybrid_effective_target": "native",
+    }
+    ocvs_plan_row = {
+        **modeled_vm_rows[1],
+        "hybrid_placement": "ocvs",
+        "hybrid_effective_target": "ocvs",
+    }
     analysis = {
         "scenario_comparison": {"rows": scenario_rows},
         "oci_unsupported_rows": [{"vm_name": "legacy-01"}],
         "supported_native_rows": [modeled_vm_rows[0]],
+        "unsupported_ocvs_rows": [modeled_vm_rows[1]],
+        "hybrid_placement_plan": {
+            "rows": [native_plan_row, ocvs_plan_row],
+            "native_rows": [native_plan_row],
+            "ocvs_rows": [ocvs_plan_row],
+            "review_rows": [],
+            "explicit_ocvs_rows": [ocvs_plan_row],
+            "native_count": 1,
+            "ocvs_count": 1,
+            "review_count": 0,
+            "ocvs_priced_count": 1,
+        },
         "ocvs_price": {
             "selected": {
                 "host_count": 3,
@@ -200,6 +222,14 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
 
 def configure_all_native_hybrid(inputs: dict) -> None:
     modeled_rows = copy.deepcopy(inputs["pricing_inputs"]["modeled_vm_rows"])
+    native_plan_rows = [
+        {
+            **row,
+            "hybrid_placement": "native",
+            "hybrid_effective_target": "native",
+        }
+        for row in modeled_rows
+    ]
     hybrid_row = next(
         row
         for row in inputs["scenario_analysis"]["scenario_comparison"]["rows"]
@@ -209,10 +239,15 @@ def configure_all_native_hybrid(inputs: dict) -> None:
     inputs["scenario_analysis"]["supported_native_rows"] = modeled_rows
     inputs["scenario_analysis"]["unsupported_ocvs_rows"] = []
     inputs["scenario_analysis"]["hybrid_placement_plan"] = {
+        "rows": copy.deepcopy(native_plan_rows),
         "native_count": 2,
+        "ocvs_count": 0,
+        "review_count": 0,
         "ocvs_priced_count": 0,
-        "native_rows": copy.deepcopy(modeled_rows),
+        "native_rows": copy.deepcopy(native_plan_rows),
         "ocvs_rows": [],
+        "review_rows": [],
+        "explicit_ocvs_rows": [],
     }
     inputs["scenario_analysis"]["hybrid_ocvs_price"] = None
     inputs["scenario_analysis"]["vmware_license_summary"]["hybrid"] = {}
@@ -752,6 +787,145 @@ class ReadinessTests(unittest.TestCase):
                 )
                 self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
                 self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_plan_native_rows_must_match_top_level_partition(self) -> None:
+        def duplicate_native_rows(values: dict) -> None:
+            native_row = copy.deepcopy(
+                values["scenario_analysis"]["hybrid_placement_plan"]["native_rows"][0]
+            )
+            values["scenario_analysis"]["hybrid_placement_plan"]["native_rows"] = [
+                native_row,
+                copy.deepcopy(native_row),
+            ]
+
+        def excluded_native_row(values: dict) -> None:
+            excluded_row = copy.deepcopy(
+                values["scenario_analysis"]["hybrid_placement_plan"]["native_rows"][0]
+            )
+            excluded_row["vm_name"] = "excluded-01"
+            values["scenario_analysis"]["hybrid_placement_plan"]["native_rows"] = [
+                excluded_row
+            ]
+
+        def conflicting_native_row(values: dict) -> None:
+            values["scenario_analysis"]["hybrid_placement_plan"]["native_rows"] = [
+                copy.deepcopy(
+                    values["scenario_analysis"]["hybrid_placement_plan"]["ocvs_rows"][0]
+                )
+            ]
+
+        for label, mutate in {
+            "duplicate": duplicate_native_rows,
+            "excluded": excluded_native_row,
+            "conflicting": conflicting_native_row,
+        }.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                inputs["app_state"]["assessor_recommendation"] = "hybrid"
+                mutate(inputs)
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+                self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_plan_ocvs_rows_must_match_top_level_partition(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["app_state"]["assessor_recommendation"] = "hybrid"
+        plan = inputs["scenario_analysis"]["hybrid_placement_plan"]
+        plan["ocvs_rows"] = [copy.deepcopy(plan["native_rows"][0])]
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertEqual(
+            "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+        self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_plan_rows_fail_closed_when_malformed_or_inconsistent(self) -> None:
+        def duplicate_rows(values: dict) -> None:
+            plan = values["scenario_analysis"]["hybrid_placement_plan"]
+            plan["rows"] = [
+                copy.deepcopy(plan["rows"][0]),
+                copy.deepcopy(plan["rows"][0]),
+            ]
+
+        def missing_row(values: dict) -> None:
+            plan = values["scenario_analysis"]["hybrid_placement_plan"]
+            plan["rows"] = [copy.deepcopy(plan["rows"][0])]
+
+        def conflicting_target(values: dict) -> None:
+            plan = values["scenario_analysis"]["hybrid_placement_plan"]
+            plan["rows"][1]["hybrid_effective_target"] = "native"
+
+        mutations = {
+            "scalar rows": lambda values: values["scenario_analysis"][
+                "hybrid_placement_plan"
+            ].update(rows="not-a-list"),
+            "duplicate rows": duplicate_rows,
+            "missing selected row": missing_row,
+            "conflicting effective target": conflicting_target,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                inputs["app_state"]["assessor_recommendation"] = "hybrid"
+                mutate(inputs)
+
+                try:
+                    result = app_module.build_current_readiness_context(**inputs)
+                except (TypeError, ValueError) as exc:
+                    self.fail(f"malformed Hybrid plan rows escaped the adapter: {exc}")
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+                self.assertFalse(result["customer_ready_export"])
+
+    def test_modeled_hybrid_analysis_requires_placement_plan(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["app_state"]["assessor_recommendation"] = "hybrid"
+        inputs["scenario_analysis"].pop("hybrid_placement_plan")
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertEqual(
+            "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+        self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_real_shaped_review_plan_remains_complete(self) -> None:
+        inputs = current_adapter_inputs()
+        inputs["app_state"]["assessor_recommendation"] = "hybrid"
+        plan = inputs["scenario_analysis"]["hybrid_placement_plan"]
+        review_row = copy.deepcopy(plan["rows"][1])
+        review_row["hybrid_placement"] = "review"
+        review_row["hybrid_effective_target"] = "ocvs"
+        plan.update(
+            rows=[copy.deepcopy(plan["rows"][0]), review_row],
+            native_rows=[copy.deepcopy(plan["native_rows"][0])],
+            ocvs_rows=[copy.deepcopy(review_row)],
+            review_rows=[copy.deepcopy(review_row)],
+            explicit_ocvs_rows=[],
+            native_count=1,
+            ocvs_count=0,
+            review_count=1,
+            ocvs_priced_count=1,
+        )
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertEqual(
+            "complete", result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertTrue(result["scenarios"]["hybrid"]["rankable"])
+        self.assertTrue(result["customer_ready_export"])
 
     def test_hybrid_positive_ocvs_subset_requires_hosts_pricing_cores_and_vcf(self) -> None:
         mutations = {
