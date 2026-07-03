@@ -15,7 +15,7 @@
     }
     .setup-intro h1,
     .setup-section h2,
-    .saved-assessments h2,
+    .saved-assessments > h3,
     .setup-error-summary h2 {
       margin: 0;
       letter-spacing: 0;
@@ -27,9 +27,13 @@
       color: var(--workspace-muted);
       line-height: 1.5;
     }
-    .setup-section,
-    .saved-assessments {
+    .setup-section {
       padding: 22px 0 24px;
+      border-top: 1px solid var(--workspace-line);
+    }
+    .saved-assessments {
+      margin-top: 22px;
+      padding-top: 18px;
       border-top: 1px solid var(--workspace-line);
     }
     .setup-section__header {
@@ -40,7 +44,7 @@
       margin-bottom: 16px;
     }
     .setup-section__header h2,
-    .saved-assessments h2 { font-size: 19px; }
+    .saved-assessments > h3 { font-size: 16px; }
     .setup-section__header p,
     .saved-assessments__intro {
       margin: 0;
@@ -368,9 +372,10 @@
     }
     .saved-assessments__layout {
       display: grid;
-      grid-template-columns: minmax(0, .8fr) minmax(0, 1.4fr);
+      grid-template-columns: minmax(0, 1fr);
       gap: 24px;
       margin-top: 14px;
+      max-width: 720px;
     }
     .saved-assessments form {
       min-width: 0;
@@ -378,7 +383,7 @@
       gap: 10px;
       margin: 0;
     }
-    .saved-assessments h3 {
+    .saved-assessments h4 {
       margin: 0;
       font-size: 14px;
     }
@@ -456,7 +461,6 @@
         <p>Keep the assessment title distinct from the customer or project it covers.</p>
       </div>
       <form method="post" class="setup-form setup-form--identity">
-        <input type="hidden" name="action" value="save_identity" />
         <div class="setup-field">
           <label for="assessment_name">Assessment name</label>
           <input
@@ -489,9 +493,37 @@
           >{{ active_assessment_notes or '' }}</textarea>
         </div>
         <div class="setup-actions">
-          <button type="submit" class="setup-button">Save Identity</button>
+          <button type="submit" name="action" value="save_assessment" class="setup-button">Save Assessment</button>
         </div>
       </form>
+
+      <div id="saved-assessments" class="saved-assessments" aria-labelledby="saved-assessments-title">
+        <h3 id="saved-assessments-title">Saved Assessments</h3>
+        <p class="saved-assessments__intro">Reopen or remove a locally saved workspace.</p>
+        <div class="saved-assessments__layout">
+          <form method="post">
+            <h4>Load Previous Assessment</h4>
+            <div class="setup-field">
+              <label for="assessment_id">Previously saved</label>
+              <select id="assessment_id" name="assessment_id" {% if saved_assessments %}required{% else %}disabled{% endif %}>
+                {% if saved_assessments %}
+                  {% for assessment in saved_assessments %}
+                    <option value="{{ assessment.id }}" {% if assessment.id == active_assessment_id %}selected{% endif %}>
+                      {{ assessment.name }} - {{ assessment.updated_at_display }} - {{ "{:,}".format(assessment.vm_count) }} VM(s)
+                    </option>
+                  {% endfor %}
+                {% else %}
+                  <option selected>No saved assessments yet</option>
+                {% endif %}
+              </select>
+            </div>
+            <div class="setup-actions">
+              <button type="submit" name="action" value="load_assessment" class="setup-button setup-button--secondary btn-secondary" {% if not saved_assessments %}disabled{% endif %}>Load</button>
+              <button type="submit" name="action" value="delete_assessment" class="setup-button setup-button--secondary setup-button--danger btn-secondary" {% if not saved_assessments %}disabled{% endif %}>Delete</button>
+            </div>
+          </form>
+        </div>
+      </div>
     </section>
 
     <section id="oci-pricing" class="setup-section" aria-labelledby="oci-pricing-title">
@@ -504,7 +536,7 @@
         <dl class="status-summary" aria-label="Active OCI pricing summary">
           <div class="status-summary__title">
             <span class="status-badge">Active</span>
-            <h3>Active Price List: {{ selected_pricelist_info.file_name }}</h3>
+            <h3>Active Price List</h3>
           </div>
           <div class="status-metric">
             <dt>Currency</dt>
@@ -574,7 +606,7 @@
               {% if price_list_choices %}
                 <option value="">Select a saved price list</option>
                 {% for choice in price_list_choices %}
-                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_pricelist_file %}selected{% endif %}>{{ choice.file_name }}</option>
+                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_pricelist_file %}selected{% endif %}>{{ choice.label }}</option>
                 {% endfor %}
               {% else %}
                 <option selected>No local price lists available</option>
@@ -633,7 +665,7 @@
               >
                 <option value="">Select a catalog file</option>
                 {% for choice in rvtools_file_choices %}
-                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.file_name }}</option>
+                  <option value="{{ choice.file_name }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.label }}</option>
                 {% endfor %}
               </select>
               <p class="setup-field__hint" id="rvtools_file-hint">Choose a previously stored .xlsx, .xlsm, or .csv inventory.</p>
@@ -721,7 +753,7 @@
           <dl class="status-summary" aria-label="Selected inventory summary">
             <div class="status-summary__title">
               <span class="status-badge">Active</span>
-              <h3>Selected VM Inventory File: {{ rvtools_file_info.file_name }}</h3>
+              <h3>Selected VM Inventory</h3>
             </div>
             {% if rvtools_import_summary %}
               <div class="status-metric"><dt>VMs</dt><dd>{{ "{:,}".format(rvtools_import_summary.vm_count) }}</dd></div>
@@ -771,39 +803,6 @@
       {% include "_source_details.html" %}
     </section>
 
-    <section id="saved-assessments" class="saved-assessments" aria-labelledby="saved-assessments-title">
-      <h2 id="saved-assessments-title">Saved Assessments</h2>
-      <p class="saved-assessments__intro">Store the current assessment locally or reopen an earlier workspace.</p>
-      <div class="saved-assessments__layout">
-        <form method="post">
-          <h3>Current assessment</h3>
-          <p class="setup-field__hint">{{ active_assessment_name or "Untitled assessment" }}{% if customer_name %} for {{ customer_name }}{% endif %}</p>
-          <button type="submit" name="action" value="save_assessment" class="setup-button">Save Current Assessment</button>
-        </form>
-
-        <form method="post">
-          <h3>Load Previous Assessment</h3>
-          <div class="setup-field">
-            <label for="assessment_id">Previously saved</label>
-            <select id="assessment_id" name="assessment_id" {% if saved_assessments %}required{% else %}disabled{% endif %}>
-              {% if saved_assessments %}
-                {% for assessment in saved_assessments %}
-                  <option value="{{ assessment.id }}" {% if assessment.id == active_assessment_id %}selected{% endif %}>
-                    {{ assessment.name }} - {{ assessment.updated_at_display }} - {{ "{:,}".format(assessment.vm_count) }} VM(s)
-                  </option>
-                {% endfor %}
-              {% else %}
-                <option selected>No saved assessments yet</option>
-              {% endif %}
-            </select>
-          </div>
-          <div class="setup-actions">
-            <button type="submit" name="action" value="load_assessment" class="setup-button setup-button--secondary btn-secondary" {% if not saved_assessments %}disabled{% endif %}>Load</button>
-            <button type="submit" name="action" value="delete_assessment" class="setup-button setup-button--secondary setup-button--danger btn-secondary" {% if not saved_assessments %}disabled{% endif %}>Delete</button>
-          </div>
-        </form>
-      </div>
-    </section>
   </div>
 {% endblock %}
 {% block scripts %}

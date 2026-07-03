@@ -29,6 +29,7 @@ app_module.APP_STATE_DIR = REGRESSION_ROOT / "app_state"
 app_module.EXPORTS_DIR = REGRESSION_ROOT / "exports"
 CSV_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.csv"
 XLSX_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.xlsx"
+XLSM_INVENTORY = app_module.RVTOOLS_DIR / "regression_inventory.xlsm"
 MOB_ID_INVENTORY = app_module.RVTOOLS_DIR / "mob_id_inventory.xlsx"
 DUPLICATE_INVENTORY = app_module.RVTOOLS_DIR / "duplicate_inventory.csv"
 OFFICE_LOCK_INVENTORY = app_module.RVTOOLS_DIR / "~$regression_inventory.xlsx"
@@ -107,6 +108,39 @@ def parse_workspace_markup(response_data: bytes) -> WorkspaceMarkupParser:
     parser.feed(response_data.decode("utf-8", errors="replace"))
     parser.close()
     return parser
+
+
+class VisibleTextOutsideDetailsParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text_parts: list[str] = []
+        self._details_depth = 0
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "details":
+            self._details_depth += 1
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "details" and self._details_depth:
+            self._details_depth -= 1
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._details_depth and not self._ignored_depth:
+            clean_text = " ".join(data.split())
+            if clean_text:
+                self.text_parts.append(clean_text)
+
+
+def visible_text_outside_details(response_data: bytes) -> str:
+    parser = VisibleTextOutsideDetailsParser()
+    parser.feed(response_data.decode("utf-8", errors="replace"))
+    parser.close()
+    return " ".join(parser.text_parts)
 
 
 def sheet_text_and_numbers(zf: zipfile.ZipFile, sheet_path: str) -> tuple[str, list[float], int]:
@@ -209,6 +243,7 @@ def create_regression_fixtures() -> None:
         currency_fmt_code='€#,##0.00',
     )
     XLSX_INVENTORY.write_bytes(xlsx_bytes)
+    XLSM_INVENTORY.write_bytes(xlsx_bytes)
     mob_id_rows = [
         [
             "MOB ID",
@@ -602,6 +637,36 @@ def validate_stage1_setup_redesign() -> None:
             and "Customer / project name" in assessment_html
             and ">Notes<" in assessment_html,
         )
+        identity_form = re.search(
+            r'<form[^>]*>(?:(?!</form>).)*id="assessment_name".*?</form>',
+            assessment_html,
+            re.S,
+        )
+        identity_form_html = identity_form.group(0) if identity_form else ""
+        check(
+            "Assessment Identity form is the direct save authority",
+            'name="assessment_name"' in identity_form_html
+            and 'name="customer_name"' in identity_form_html
+            and 'name="assessment_notes"' in identity_form_html
+            and re.search(
+                r'<button[^>]+name="action"[^>]+value="save_assessment"',
+                identity_form_html,
+            )
+            and 'value="save_identity"' not in identity_form_html,
+        )
+        setup_section_ids = re.findall(
+            r'<section[^>]+id="(assessment-identity|oci-pricing|inventory-source|saved-assessments)"',
+            html,
+        )
+        check(
+            "Stage 1 has exactly three top-level setup sections",
+            setup_section_ids == ["assessment-identity", "oci-pricing", "inventory-source"]
+            and 'id="saved-assessments"' in assessment_html
+            and '<section id="saved-assessments"' not in html
+            and assessment_html.count('value="save_assessment"') == 1
+            and "Current assessment" not in assessment_html,
+            str(setup_section_ids),
+        )
 
         pricing_html = pricing_section.group(0) if pricing_section else ""
         source_details = re.findall(
@@ -638,6 +703,20 @@ def validate_stage1_setup_redesign() -> None:
             str(app_module.DOWNLOADS_DIR) not in html_outside_source_details
             and str(app_module.RVTOOLS_DIR) not in html_outside_source_details,
         )
+        initial_visible_text = visible_text_outside_details(response.data)
+        known_inventory_filenames = [Path(path_text).name for path_text in app_module.list_rvtools_export_files()]
+        check(
+            "Stage 1 hides local filenames outside Source Details",
+            Path(price_file).name not in initial_visible_text
+            and all(file_name not in initial_visible_text for file_name in known_inventory_filenames),
+            initial_visible_text,
+        )
+        check(
+            "Stage 1 catalog options use friendly source labels",
+            re.search(r"Saved price list 1 - \d{4}-\d{2}-\d{2}", initial_visible_text) is not None
+            and "Saved inventory 1 - " in initial_visible_text,
+            initial_visible_text,
+        )
 
         response = client.post(
             "/",
@@ -666,9 +745,31 @@ def validate_stage1_setup_redesign() -> None:
         )
 
         with client.session_transaction() as sess:
+            sess["active_assessment_id"] = "preserved-assessment"
+            sess["active_assessment_name"] = "Preserved assessment"
+            sess["active_assessment_notes"] = "Keep these notes after a failed replacement."
             prior_selected_file = str(sess.get("selected_rvtools_file", ""))
             prior_file_info = dict(sess.get("rvtools_file_info", {}))
             prior_import_summary = dict(sess.get("rvtools_import_summary", {}))
+            preserved_session_keys = [
+                "active_assessment_id",
+                "active_assessment_name",
+                "active_assessment_notes",
+                "selected_pricelist_file",
+                "selected_currency",
+                "selected_rvtools_file",
+                "rvtools_file_info",
+                "rvtools_import_summary",
+            ]
+            prior_session_state = json.loads(
+                json.dumps({key: sess.get(key) for key in preserved_session_keys})
+            )
+        manual_visible_text = visible_text_outside_details(response.data)
+        check(
+            "active inventory filename stays inside Source Details",
+            Path(prior_selected_file).name not in manual_visible_text,
+            manual_visible_text,
+        )
         prior_inventory_bytes = Path(prior_selected_file).read_bytes()
         prior_state = app_module.load_app_state()
         prior_state["selected_vm_names"] = ["manual-vm-001", "manual-vm-003", "manual-vm-006"]
@@ -699,6 +800,9 @@ def validate_stage1_setup_redesign() -> None:
             selected_file_after_error = str(sess.get("selected_rvtools_file", ""))
             file_info_after_error = dict(sess.get("rvtools_file_info", {}))
             import_summary_after_error = dict(sess.get("rvtools_import_summary", {}))
+            session_state_after_error = json.loads(
+                json.dumps({key: sess.get(key) for key in preserved_session_keys})
+            )
         state_after_error = app_module.load_app_state()
 
         check(
@@ -707,6 +811,7 @@ def validate_stage1_setup_redesign() -> None:
             and selected_file_after_error == prior_selected_file
             and file_info_after_error == prior_file_info
             and import_summary_after_error == prior_import_summary
+            and session_state_after_error == prior_session_state
             and state_after_error.get("selected_vm_names") == prior_state.get("selected_vm_names")
             and state_after_error.get("step4_hybrid_placements") == prior_state.get("step4_hybrid_placements"),
             f"selected={selected_file_after_error}, state={state_after_error}",
@@ -726,6 +831,52 @@ def validate_stage1_setup_redesign() -> None:
             and 'href="#rvtools_upload"' in error_html
             and re.search(r'id="rvtools_upload"[^>]+aria-describedby="[^"]*rvtools_upload-error', error_html)
             and 'id="rvtools_upload-error"' in error_html,
+        )
+
+        manual_candidates_before = set((app_module.RVTOOLS_DIR / "manual").glob("manual_inventory_*.csv"))
+        original_summary_builder = app_module.build_inventory_import_summary
+
+        def reject_generated_manual_summary(vm_rows: list[dict[str, object]], source: str) -> dict[str, object]:
+            if str(source).replace("\\", "/") != prior_selected_file:
+                raise ValueError("Regression rejection after manual candidate generation.")
+            return original_summary_builder(vm_rows, source)
+
+        app_module.build_inventory_import_summary = reject_generated_manual_summary
+        try:
+            response = client.post(
+                "/",
+                data={
+                    "action": "create_manual_inventory",
+                    "inventory_mode": "manual",
+                    "manual_vm_count": "7",
+                    "manual_total_vcpus": "28",
+                    "manual_total_memory_gb": "112",
+                    "manual_total_storage_gb": "1400",
+                    "manual_supported_vm_count": "6",
+                    "manual_unsupported_vm_count": "1",
+                },
+            )
+        finally:
+            app_module.build_inventory_import_summary = original_summary_builder
+
+        with client.session_transaction() as sess:
+            session_state_after_manual_error = json.loads(
+                json.dumps({key: sess.get(key) for key in preserved_session_keys})
+            )
+        state_after_manual_error = app_module.load_app_state()
+        manual_candidates_after = set((app_module.RVTOOLS_DIR / "manual").glob("manual_inventory_*.csv"))
+        check(
+            "invalid manual update preserves complete active state",
+            response.status_code == 200
+            and session_state_after_manual_error == prior_session_state
+            and state_after_manual_error == prior_state
+            and Path(prior_selected_file).read_bytes() == prior_inventory_bytes,
+            f"session={session_state_after_manual_error}, state={state_after_manual_error}",
+        )
+        check(
+            "invalid manual update deletes its generated candidate",
+            manual_candidates_after == manual_candidates_before,
+            f"before={manual_candidates_before}, after={manual_candidates_after}",
         )
 
         response = client.post(
@@ -763,8 +914,150 @@ def validate_stage1_setup_redesign() -> None:
         'input[name="inventory_mode"]' in setup_js_text
         and ".hidden =" in setup_js_text
         and 'setAttribute("aria-hidden"' in setup_js_text
+        and "errorSummary.focus(" in setup_js_text
         and ".value =" not in setup_js_text,
     )
+
+
+def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
+    price_file = find_price_file()
+    assessment_name = "Direct Identity Assessment"
+    customer_name = "Direct Identity Customer"
+    assessment_notes = "Saved from the visible identity form in one request."
+
+    with app_module.app.test_client() as client:
+        response = client.get("/")
+        html = response.data.decode("utf-8")
+        assessment_section = re.search(
+            r'<section[^>]+id="assessment-identity".*?</section>',
+            html,
+            re.S,
+        )
+        assessment_html = assessment_section.group(0) if assessment_section else ""
+        identity_form = re.search(
+            r'<form[^>]*>(?:(?!</form>).)*id="assessment_name".*?</form>',
+            assessment_html,
+            re.S,
+        )
+        identity_form_html = identity_form.group(0) if identity_form else ""
+        save_button = re.search(
+            r'<button[^>]+name="action"[^>]+value="([^"]+)"[^>]*>\s*Save Assessment\s*</button>',
+            identity_form_html,
+            re.S,
+        )
+        submitted_action = save_button.group(1) if save_button else ""
+
+        response = client.post(
+            "/",
+            data={
+                "action": submitted_action,
+                "assessment_name": assessment_name,
+                "customer_name": customer_name,
+                "assessment_notes": assessment_notes,
+            },
+        )
+        with client.session_transaction() as sess:
+            saved_assessment_id = str(sess.get("active_assessment_id", ""))
+            saved_session_identity = {
+                "name": str(sess.get("active_assessment_name", "")),
+                "customer": str(sess.get("customer_name", "")),
+                "notes": str(sess.get("active_assessment_notes", "")),
+            }
+        saved_snapshot_path = app_module.APP_STATE_DIR / "saved_assessments" / f"{saved_assessment_id}.json"
+        saved_snapshot = (
+            json.loads(saved_snapshot_path.read_text(encoding="utf-8"))
+            if saved_snapshot_path.is_file()
+            else {}
+        )
+        check(
+            "identity Save Assessment button persists all visible values in one POST",
+            response.status_code == 200
+            and submitted_action == "save_assessment"
+            and saved_session_identity
+            == {"name": assessment_name, "customer": customer_name, "notes": assessment_notes}
+            and saved_snapshot.get("name") == assessment_name
+            and saved_snapshot.get("customer_name") == customer_name
+            and saved_snapshot.get("notes") == assessment_notes,
+            f"action={submitted_action}, session={saved_session_identity}, snapshot={saved_snapshot}",
+        )
+
+        client.post(
+            "/",
+            data={
+                "action": "select_pricelist",
+                "price_list_file": price_file,
+            },
+        )
+        client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "3",
+                "manual_total_vcpus": "12",
+                "manual_total_memory_gb": "48",
+                "manual_total_storage_gb": "600",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "1",
+            },
+        )
+        client.post(
+            "/",
+            data={
+                "action": "save_assessment",
+                "assessment_name": assessment_name,
+                "customer_name": customer_name,
+                "assessment_notes": assessment_notes,
+            },
+        )
+        with client.session_transaction() as sess:
+            saved_manual_path = str(sess.get("selected_rvtools_file", ""))
+
+        response = client.post(
+            "/",
+            data={"action": "select_rvtools_file", "inventory_mode": "upload", "rvtools_file": str(CSV_INVENTORY)},
+        )
+        check(
+            "upload mode active before loading saved manual assessment",
+            response.status_code == 200
+            and re.search(
+                r'<input(?=[^>]*id="inventory-mode-upload")(?=[^>]*checked)[^>]*>',
+                response.data.decode("utf-8"),
+            )
+            is not None,
+        )
+
+        response = client.post(
+            "/",
+            data={"action": "load_assessment", "assessment_id": saved_assessment_id},
+        )
+        loaded_html = response.data.decode("utf-8")
+        manual_radio = re.search(
+            r'<input(?=[^>]*id="inventory-mode-manual")(?=[^>]*checked)[^>]*>',
+            loaded_html,
+        )
+        manual_panel = re.search(
+            r'<div(?=[^>]*data-inventory-mode-panel="manual")[^>]*>',
+            loaded_html,
+            re.S,
+        )
+        manual_panel_tag = manual_panel.group(0) if manual_panel else ""
+        with client.session_transaction() as sess:
+            loaded_manual_path = str(sess.get("selected_rvtools_file", ""))
+        check(
+            "loading saved manual assessment recomputes visible inventory mode",
+            response.status_code == 200
+            and loaded_manual_path == saved_manual_path
+            and manual_radio is not None
+            and 'aria-hidden="false"' in manual_panel_tag
+            and re.search(r"\shidden(?:\s|>)", manual_panel_tag) is None,
+            f"loaded={loaded_manual_path}, panel={manual_panel_tag}",
+        )
+
+        client.post(
+            "/",
+            data={"action": "delete_assessment", "assessment_id": saved_assessment_id},
+        )
 
 
 def validate_inventory_imports() -> None:
@@ -775,7 +1068,7 @@ def validate_inventory_imports() -> None:
         str(discovered_files),
     )
 
-    accepted_files = [CSV_INVENTORY, XLSX_INVENTORY, MOB_ID_INVENTORY]
+    accepted_files = [CSV_INVENTORY, XLSX_INVENTORY, XLSM_INVENTORY, MOB_ID_INVENTORY]
     for inventory_path in accepted_files:
         check("inventory fixture exists", inventory_path.exists(), str(inventory_path))
         rows, source = app_module.load_vms_from_vinfo(str(inventory_path))
@@ -885,7 +1178,7 @@ def validate_manual_sizing_input() -> None:
             "manual sizing creates inventory",
             response.status_code == 200
             and b"Manual workload summary created" in response.data
-            and b"Selected VM Inventory File" in response.data,
+            and b"Selected VM Inventory" in response.data,
         )
         check(
             "manual sizing form prefilled after create",
@@ -1816,6 +2109,7 @@ def main() -> None:
     validate_unsupported_currency_workspace_shell()
     validate_shared_workspace_shell()
     validate_stage1_setup_redesign()
+    validate_stage1_identity_save_and_loaded_manual_mode()
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
     validate_saved_assessments()

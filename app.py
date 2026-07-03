@@ -970,14 +970,25 @@ def build_source_file_info(path_text: Any) -> dict[str, Any]:
     return info
 
 
-def build_catalog_choices(paths: list[str]) -> list[dict[str, str]]:
-    return [
-        {
-            "file_name": Path(path_text).name,
-            "file_path": str(path_text).replace("\\", "/"),
-        }
-        for path_text in paths
-    ]
+def build_catalog_choices(paths: list[str], source_kind: str) -> list[dict[str, str]]:
+    choices: list[dict[str, str]] = []
+    for index, path_text in enumerate(paths, start=1):
+        source_info = build_source_file_info(path_text)
+        updated_at = str(source_info.get("updated_at") or "Date unavailable")
+        if source_kind == "pricing":
+            label = f"Saved price list {index} - {updated_at}"
+        else:
+            size_kb = source_info.get("size_kb")
+            size_label = f"{size_kb} KB" if size_kb != "" else "Size unavailable"
+            label = f"Saved inventory {index} - {updated_at} - {size_label}"
+        choices.append(
+            {
+                "file_name": str(source_info.get("file_name") or ""),
+                "file_path": str(source_info.get("file_path") or ""),
+                "label": label,
+            }
+        )
+    return choices
 
 
 def resolve_catalog_selection(submitted_value: Any, paths: list[str]) -> str:
@@ -5774,11 +5785,11 @@ def index() -> str:
                 download_info=download_info,
                 downloaded_price_lists=downloaded_price_lists,
                 price_list_options=price_list_options,
-                price_list_choices=build_catalog_choices(price_list_options),
+                price_list_choices=build_catalog_choices(price_list_options, "pricing"),
                 selected_pricelist_file=selected_pricelist_file,
                 selected_pricelist_info=selected_pricelist_info,
                 rvtools_files=rvtools_files,
-                rvtools_file_choices=build_catalog_choices(rvtools_files),
+                rvtools_file_choices=build_catalog_choices(rvtools_files, "inventory"),
                 selected_rvtools_file=selected_rvtools_file,
                 rvtools_file_info=rvtools_file_info,
                 rvtools_import_summary=rvtools_import_summary,
@@ -5897,6 +5908,12 @@ def index() -> str:
             flash("Assessment identity updated.", "success")
 
         elif action == "save_assessment":
+            if "customer_name" in request.form:
+                customer_name = normalize_customer_name(request.form.get("customer_name", ""))
+                if customer_name:
+                    session["customer_name"] = customer_name
+                else:
+                    session.pop("customer_name", None)
             try:
                 saved_snapshot = save_current_assessment(
                     request.form.get("assessment_name", active_assessment_name),
@@ -5913,6 +5930,8 @@ def index() -> str:
         elif action == "load_assessment":
             result = load_saved_assessment(request.form.get("assessment_id", ""))
             if result.get("ok"):
+                restored_inventory_path = str(session.get("selected_rvtools_file", ""))
+                inventory_mode = "manual" if is_manual_inventory_path(restored_inventory_path) else "upload"
                 flash("Assessment loaded.", "success")
                 for warning in result.get("warnings", []):
                     flash(str(warning), "info")

@@ -16,6 +16,18 @@
           <dd>{{ selected_pricelist_info.file_name }}</dd>
         </div>
       {% endif %}
+      {% if price_list_choices %}
+        <div>
+          <dt>Available local files</dt>
+          <dd>
+            <ul>
+              {% for choice in price_list_choices %}
+                <li>{{ choice.label }}: {{ choice.file_name }}<br /><code>{{ choice.file_path }}</code></li>
+              {% endfor %}
+            </ul>
+          </dd>
+        </div>
+      {% endif %}
       {% if download_info %}
         <div>
           <dt>Latest saved file</dt>
@@ -44,6 +56,18 @@
         <div>
           <dt>File size</dt>
           <dd>{{ rvtools_file_info.size_kb }} KB</dd>
+        </div>
+      {% endif %}
+      {% if rvtools_file_choices %}
+        <div>
+          <dt>Available inventory files</dt>
+          <dd>
+            <ul>
+              {% for choice in rvtools_file_choices %}
+                <li>{{ choice.label }}: {{ choice.file_name }}<br /><code>{{ choice.file_path }}</code></li>
+              {% endfor %}
+            </ul>
+          </dd>
         </div>
       {% endif %}
       {% if rvtools_import_summary %}
