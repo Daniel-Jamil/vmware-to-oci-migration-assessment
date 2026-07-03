@@ -506,6 +506,14 @@ def validate_app_state_review_inputs() -> None:
         and rationale == rationale.strip(),
         f"type={type(rationale).__name__}, length={len(rationale) if isinstance(rationale, str) else 'n/a'}",
     )
+    boundary_rationale = _load_raw_app_state(
+        {"assessor_recommendation_rationale": ("x" * 3999) + " " + "tail"}
+    ).get("assessor_recommendation_rationale")
+    check(
+        "recommendation rationale strips whitespace exposed by truncation",
+        boundary_rationale == ("x" * 3999),
+        f"type={type(boundary_rationale).__name__}, length={len(boundary_rationale) if isinstance(boundary_rationale, str) else 'n/a'}, tail={repr(boundary_rationale[-5:]) if isinstance(boundary_rationale, str) else 'n/a'}",
+    )
 
     for invalid_ids in ("unsupported-native", {"unsupported-native": True}, None, ["INVALID"]):
         invalid_collection_state = _load_raw_app_state({"acknowledged_warning_ids": invalid_ids})

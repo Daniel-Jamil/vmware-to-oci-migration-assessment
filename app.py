@@ -543,7 +543,7 @@ def normalize_app_state(value: Any) -> dict[str, Any]:
     )
     rationale = default.get("assessor_recommendation_rationale")
     default["assessor_recommendation_rationale"] = (
-        rationale.replace("\r\n", "\n").replace("\r", "\n").strip()[:4000]
+        rationale.replace("\r\n", "\n").replace("\r", "\n").strip()[:4000].strip()
         if isinstance(rationale, str)
         else ""
     )
