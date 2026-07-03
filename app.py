@@ -27,6 +27,8 @@ from flask import Flask, flash, redirect, render_template, request, send_file, s
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
+from assessment_readiness import build_assessment_readiness
+
 
 def _first_env(*names: str) -> str | None:
     for name in names:
@@ -2792,6 +2794,369 @@ WORKSPACE_STAGE_MAP = {
 }
 
 
+def _readiness_finite_cost(value: Any) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _readiness_positive_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > 0.0
+
+
+def _readiness_nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _readiness_vm_name(row: dict[str, Any]) -> str:
+    return str(row.get("name") or row.get("vm_name") or "").strip()
+
+
+def _readiness_item(
+    item: dict[str, Any],
+    *,
+    stage: str,
+    acknowledged_ids: set[str],
+    default_id: str = "",
+) -> dict[str, Any]:
+    item_id = str(item.get("id") or default_id).strip()
+    title = str(item.get("title") or item_id.replace("-", " ").title()).strip()
+    detail = str(item.get("detail") or "").strip()
+    raw_names = item.get("affected_vm_names", item.get("vm_names", []))
+    affected_vm_names = (
+        [str(name).strip() for name in raw_names if str(name).strip()]
+        if isinstance(raw_names, (list, tuple, set, frozenset))
+        else []
+    )
+    severity = str(item.get("severity") or "advisory").strip().lower()
+    return {
+        "id": item_id,
+        "title": title,
+        "detail": detail,
+        "message": detail or title,
+        "stage": stage,
+        "affected_vm_names": affected_vm_names,
+        "severity": severity,
+        "acknowledged": item_id in acknowledged_ids,
+    }
+
+
+def build_current_readiness_context(
+    inventory_rows: list[dict[str, Any]] | None,
+    selected_vm_names: list[str] | None,
+    scenario_analysis: dict[str, Any] | None = None,
+    scenario_views: list[dict[str, Any]] | None = None,
+    app_state: dict[str, Any] | None = None,
+    setup_metadata: dict[str, Any] | None = None,
+    has_unsaved_scenario_changes: bool = False,
+    inventory_issues: list[dict[str, Any]] | None = None,
+    pricing_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Adapt already-loaded assessment data to the central readiness model."""
+    rows = [row for row in (inventory_rows or []) if isinstance(row, dict)]
+    row_by_name = {
+        _readiness_vm_name(row): row
+        for row in rows
+        if _readiness_vm_name(row)
+    }
+    selected_names: list[str] = []
+    selected_seen: set[str] = set()
+    for name in selected_vm_names or []:
+        clean_name = str(name).strip()
+        if clean_name in row_by_name and clean_name not in selected_seen:
+            selected_names.append(clean_name)
+            selected_seen.add(clean_name)
+
+    state = app_state if isinstance(app_state, dict) else {}
+    setup = setup_metadata if isinstance(setup_metadata, dict) else {}
+    analysis = scenario_analysis if isinstance(scenario_analysis, dict) else {}
+    pricing = pricing_inputs if isinstance(pricing_inputs, dict) else {}
+    acknowledged_value = state.get("acknowledged_warning_ids", [])
+    acknowledged_ids = {
+        str(item).strip()
+        for item in acknowledged_value
+        if str(item).strip()
+    } if isinstance(acknowledged_value, list) else set()
+
+    source_issues = (
+        inventory_issues
+        if isinstance(inventory_issues, list)
+        else build_inventory_review_issues(rows)
+    )
+    mapped_inventory_issues = [
+        _readiness_item(
+            issue,
+            stage="inventory",
+            acknowledged_ids=acknowledged_ids,
+        )
+        for issue in source_issues
+        if isinstance(issue, dict)
+    ]
+
+    unsupported_native_names: list[str] = []
+    if "oci_unsupported_rows" in analysis:
+        unsupported_source = analysis.get("oci_unsupported_rows", [])
+        if isinstance(unsupported_source, list):
+            unsupported_set = {
+                _readiness_vm_name(row)
+                for row in unsupported_source
+                if isinstance(row, dict) and _readiness_vm_name(row)
+            }
+            unsupported_native_names = [
+                name for name in selected_names if name in unsupported_set
+            ]
+    else:
+        supported_signatures = load_supported_os_signatures()
+        unsupported_native_names = [
+            name
+            for name in selected_names
+            if not supported_signatures
+            or not is_oci_supported_os(
+                str(
+                    row_by_name[name].get("raw_os")
+                    or row_by_name[name].get("os_name")
+                    or ""
+                ),
+                supported_signatures,
+            )
+        ]
+
+    comparison = analysis.get("scenario_comparison", {})
+    comparison_rows = comparison.get("rows", []) if isinstance(comparison, dict) else []
+    scenario_rows = {
+        str(row.get("id") or "").strip().lower(): row
+        for row in comparison_rows
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    } if isinstance(comparison_rows, list) else {}
+    for view in scenario_views or []:
+        if not isinstance(view, dict):
+            continue
+        scenario_id = str(view.get("id") or "").strip().lower()
+        view_scenario = view.get("scenario", {})
+        if scenario_id and scenario_id not in scenario_rows and isinstance(view_scenario, dict):
+            scenario_rows[scenario_id] = view_scenario
+
+    price_lookup = pricing.get("price_lookup", {})
+    price_source_available = bool(
+        str(pricing.get("source_pricelist_file") or "").strip()
+        and isinstance(price_lookup, dict)
+        and price_lookup
+    )
+    modeled_rows_value = pricing.get("modeled_vm_rows", [])
+    modeled_rows = (
+        [row for row in modeled_rows_value if isinstance(row, dict)]
+        if isinstance(modeled_rows_value, list)
+        else []
+    )
+    modeled_by_name = {
+        _readiness_vm_name(row): row
+        for row in modeled_rows
+        if _readiness_vm_name(row)
+    }
+
+    def native_prices_complete(required_rows: list[dict[str, Any]]) -> bool:
+        required_names = [_readiness_vm_name(row) for row in required_rows]
+        required_names = [name for name in required_names if name]
+        if not required_names:
+            return True
+        if not price_source_available:
+            return False
+        if any(name not in modeled_by_name for name in required_names):
+            return False
+        if any(
+            not _readiness_positive_number(
+                modeled_by_name[name].get("ocpu_unit_price", 0.0)
+            )
+            or not _readiness_positive_number(
+                modeled_by_name[name].get("memory_unit_price", 0.0)
+            )
+            for name in required_names
+        ):
+            return False
+        if (
+            not _readiness_positive_number(
+                pricing.get("block_storage_unit_price", 0.0)
+            )
+            or not _readiness_positive_number(
+                pricing.get("block_perf_unit_price", 0.0)
+            )
+        ):
+            return False
+        return not any(
+            bool(modeled_by_name[name].get("is_windows_server"))
+            and str(modeled_by_name[name].get("os_license") or "") == "Lic Include"
+            and not _readiness_positive_number(
+                pricing.get("windows_os_unit_price", 0.0)
+            )
+            for name in required_names
+        )
+
+    def ocvs_infrastructure_complete(summary: Any) -> bool:
+        selected = summary.get("selected", {}) if isinstance(summary, dict) else {}
+        if not isinstance(selected, dict):
+            return False
+        host_count = _readiness_nonnegative_int(selected.get("host_count", 0))
+        if host_count == 0:
+            return True
+        return bool(price_source_available and selected.get("pricing_available") is True)
+
+    full_selected_rows = [row_by_name[name] for name in selected_names]
+    hybrid_native_value = analysis.get("supported_native_rows", [])
+    hybrid_native_rows = (
+        [row for row in hybrid_native_value if isinstance(row, dict)]
+        if isinstance(hybrid_native_value, list)
+        else []
+    )
+    vmware_summary = analysis.get("vmware_license_summary", {})
+    if not isinstance(vmware_summary, dict):
+        vmware_summary = {}
+    raw_vcf_price = state.get(
+        "step4_vmware_license_price_per_core_yearly",
+        vmware_summary.get("price_per_core_yearly", 0.0),
+    )
+    try:
+        vcf_price_per_core_yearly = float(raw_vcf_price or 0.0)
+    except (TypeError, ValueError):
+        vcf_price_per_core_yearly = 0.0
+    if not math.isfinite(vcf_price_per_core_yearly):
+        vcf_price_per_core_yearly = 0.0
+
+    scenario_inputs: dict[str, dict[str, Any]] = {}
+    for scenario_id in ("native", "ocvs", "hybrid"):
+        scenario_row = scenario_rows.get(scenario_id, {})
+        monthly_cost = _readiness_finite_cost(scenario_row.get("monthly_cost"))
+        modeled = bool(selected_names and scenario_row and monthly_cost is not None)
+        if scenario_id == "native":
+            pricing_complete = bool(
+                modeled and native_prices_complete(full_selected_rows)
+            )
+        else:
+            summary_key = "ocvs_price" if scenario_id == "ocvs" else "hybrid_ocvs_price"
+            license_item = vmware_summary.get(scenario_id, {})
+            if not isinstance(license_item, dict):
+                license_item = {}
+            physical_cores = _readiness_nonnegative_int(
+                license_item.get("physical_cores", 0)
+            )
+            vcf_complete = physical_cores == 0 or vcf_price_per_core_yearly > 0.0
+            native_subset_complete = (
+                True
+                if scenario_id == "ocvs"
+                else native_prices_complete(hybrid_native_rows)
+            )
+            pricing_complete = bool(
+                modeled
+                and native_subset_complete
+                and ocvs_infrastructure_complete(analysis.get(summary_key, {}))
+                and vcf_complete
+            )
+        scenario_inputs[scenario_id] = {
+            "technically_eligible": modeled,
+            "pricing_complete": pricing_complete,
+            "monthly_cost": monthly_cost,
+            "unsupported_vm_names": (
+                unsupported_native_names if scenario_id == "native" else []
+            ),
+        }
+
+    placements_value = state.get("step4_hybrid_placements", {})
+    placements = placements_value if isinstance(placements_value, dict) else {}
+    readiness = build_assessment_readiness(
+        {
+            "setup": {
+                "assessment_name": setup.get("assessment_name", ""),
+                "customer_name": setup.get("customer_name", ""),
+                "has_price_list": setup.get("has_price_list") is True,
+                "has_inventory": setup.get("has_inventory") is True,
+            },
+            "inventory": {
+                "included_vm_names": selected_names,
+                "placements": {
+                    name: placements.get(name) for name in selected_names
+                },
+                "issues": mapped_inventory_issues,
+                "acknowledged_warning_ids": list(acknowledged_ids),
+            },
+            "scenarios": scenario_inputs,
+            "has_unsaved_scenario_changes": has_unsaved_scenario_changes,
+            "recommendation": state.get("assessor_recommendation", ""),
+            "recommendation_rationale": state.get(
+                "assessor_recommendation_rationale", ""
+            ),
+        }
+    )
+
+    source_by_id = {item["id"]: item for item in mapped_inventory_issues}
+
+    def enrich_model_item(item: dict[str, Any]) -> dict[str, Any]:
+        enriched = {**source_by_id.get(str(item.get("id") or ""), {}), **item}
+        enriched["message"] = str(
+            enriched.get("detail") or enriched.get("title") or enriched.get("id") or ""
+        )
+        enriched.setdefault("acknowledged", False)
+        return enriched
+
+    inventory_blockers = [
+        enrich_model_item(item) for item in readiness.get("blocking_items", [])
+    ]
+    blocker_ids = {item["id"] for item in inventory_blockers}
+    inventory_source_advisories = [
+        item for item in mapped_inventory_issues if item["id"] not in blocker_ids
+    ]
+    readiness["blocking_items"] = inventory_blockers
+    readiness["advisory_items"] = [
+        enrich_model_item(item) for item in readiness.get("advisory_items", [])
+    ]
+    readiness["stages"]["inventory"]["blockers"] = inventory_blockers
+    readiness["stages"]["inventory"]["advisories"] = inventory_source_advisories
+
+    fit_blockers: list[dict[str, Any]] = []
+    fit_advisories: list[dict[str, Any]] = []
+    fit_warning_values = analysis.get("fit_warnings", [])
+    used_fit_ids: dict[str, int] = {}
+    if isinstance(fit_warning_values, list):
+        for index, warning in enumerate(fit_warning_values):
+            if not isinstance(warning, dict):
+                continue
+            title = str(warning.get("title") or "Scenario review item").strip()
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            base_id = str(warning.get("id") or f"fit-{slug or index + 1}").strip()
+            used_fit_ids[base_id] = used_fit_ids.get(base_id, 0) + 1
+            item_id = (
+                base_id
+                if used_fit_ids[base_id] == 1
+                else f"{base_id}-{used_fit_ids[base_id]}"
+            )
+            fit_item = _readiness_item(
+                {**warning, "id": item_id, "title": title},
+                stage="scenarios",
+                acknowledged_ids=set(),
+            )
+            if fit_item["severity"] == "critical":
+                fit_blockers.append(fit_item)
+            else:
+                fit_advisories.append(fit_item)
+
+    readiness["blocking_items"].extend(fit_blockers)
+    readiness["advisory_items"].extend(fit_advisories)
+    readiness["stages"]["scenarios"]["blockers"].extend(fit_blockers)
+    readiness["stages"]["scenarios"]["advisories"].extend(fit_advisories)
+    return readiness
+
+
 def build_workspace_context(
     stage_id: str,
     readiness: dict[str, Any] | None = None,
@@ -2809,6 +3174,12 @@ def build_workspace_context(
     }
     if isinstance(readiness, dict):
         workspace_readiness.update(readiness)
+        workspace_readiness["blockers"] = list(
+            readiness.get("blocking_items", readiness.get("blockers", []))
+        )
+        workspace_readiness["advisories"] = list(
+            readiness.get("advisory_items", readiness.get("advisories", []))
+        )
     for collection_name in ("blockers", "advisories"):
         if not isinstance(workspace_readiness.get(collection_name), (list, tuple)):
             workspace_readiness[collection_name] = []
@@ -2912,6 +3283,7 @@ def build_workspace_context(
             "workspace_stage_name": stage["name"],
             "workspace_stages": workspace_stages,
             "workspace_readiness": workspace_readiness,
+            "readiness": workspace_readiness,
             "workspace_assessment_name": assessment_name or "Untitled assessment",
             "workspace_customer_name": customer_name or "Customer not set",
             "workspace_is_saved": bool(active_assessment_id),
@@ -3081,9 +3453,22 @@ def build_ocvs_price_summary(
         cluster_count = _ceil_div_positive(host_count, max_hosts) if max_hosts > 0 else (1 if host_count else 0)
         cluster_split_required = bool(max_hosts > 0 and host_count > max_hosts)
 
-        ocpu_unit_price = float(price_lookup.get(str(profile.get("ocpu_display_name", "")).strip(), 0.0))
-        memory_unit_price = float(price_lookup.get(str(profile.get("memory_display_name", "")).strip(), 0.0))
-        nvme_unit_price = float(price_lookup.get(str(profile.get("nvme_display_name", "")).strip(), 0.0))
+        ocpu_display_name = str(profile.get("ocpu_display_name", "")).strip()
+        memory_display_name = str(profile.get("memory_display_name", "")).strip()
+        nvme_display_name = str(profile.get("nvme_display_name", "")).strip()
+        ocpu_unit_price = float(price_lookup.get(ocpu_display_name, 0.0))
+        memory_unit_price = float(price_lookup.get(memory_display_name, 0.0))
+        nvme_unit_price = float(price_lookup.get(nvme_display_name, 0.0))
+        required_host_prices_available = bool(
+            ocpu_unit_price > 0.0
+            and memory_unit_price > 0.0
+            and (nvme_tb <= 0.0 or (nvme_display_name and nvme_unit_price > 0.0))
+        )
+        required_storage_prices_available = bool(
+            host_type != "Standard"
+            or total_storage_gb <= 0
+            or (block_storage_unit_price > 0.0 and block_perf_unit_price > 0.0)
+        )
         commitment_discount_pct = ocvs_term_discount_pct(profile.get("shape", ""), ocvs_commitment_term)
         commitment_discount_factor = max(0.0, min(1.0, 1.0 - (commitment_discount_pct / 100.0)))
         host_monthly_cost = (
@@ -3147,7 +3532,10 @@ def build_ocvs_price_summary(
                 "cpu_utilization_pct": min(999.0, (total_vcpus / total_cpu_capacity) * 100.0),
                 "memory_utilization_pct": min(999.0, (total_memory_gb / total_memory_capacity) * 100.0),
                 "storage_utilization_pct": min(999.0, (total_storage_gb / total_storage_capacity) * 100.0),
-                "pricing_available": host_monthly_cost > 0,
+                "pricing_available": (
+                    required_host_prices_available
+                    and required_storage_prices_available
+                ),
                 "standard_storage_vpu": standard_storage_vpu,
             }
         )
@@ -6011,10 +6399,45 @@ def index() -> str:
             }
 
     def render_index_response() -> str:
+        current_inventory_rows: list[dict[str, Any]] = []
+        current_inventory_issues: list[dict[str, Any]] = []
+        if selected_rvtools_file:
+            try:
+                current_inventory_rows, _ = load_vms_from_vinfo(selected_rvtools_file)
+            except Exception:
+                current_inventory_rows = []
+            else:
+                current_inventory_issues = build_inventory_review_issues(
+                    current_inventory_rows
+                )
+        current_state = load_app_state()
+        current_selected_names = current_state.get("selected_vm_names", [])
+        if not isinstance(current_selected_names, list):
+            current_selected_names = []
+        readiness = build_current_readiness_context(
+            inventory_rows=current_inventory_rows,
+            selected_vm_names=current_selected_names,
+            scenario_analysis=None,
+            scenario_views=None,
+            app_state=current_state,
+            setup_metadata={
+                "assessment_name": active_assessment_name,
+                "customer_name": customer_name,
+                "has_price_list": bool(
+                    selected_pricelist_info
+                    and int(selected_pricelist_info.get("item_count", 0) or 0) > 0
+                ),
+                "has_inventory": bool(current_inventory_rows),
+            },
+            has_unsaved_scenario_changes=False,
+            inventory_issues=current_inventory_issues,
+            pricing_inputs=None,
+        )
         return render_template(
             "index.html",
             **build_workspace_context(
                 "setup",
+                readiness=readiness,
                 currencies=SUPPORTED_CURRENCIES,
                 selected_currency=selected_currency,
                 download_info=download_info,
@@ -6034,7 +6457,7 @@ def index() -> str:
                 inventory_mode=inventory_mode,
                 field_errors=field_errors,
                 rvtools_catalog_path=str(RVTOOLS_DIR).replace("\\", "/"),
-                inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
+                inventory_review_issues=current_inventory_issues,
                 saved_assessments=list_saved_assessments(),
                 active_assessment_id=active_assessment_id,
                 active_assessment_name=active_assessment_name,
@@ -6771,11 +7194,34 @@ def step3() -> str:
         "native_supported_count": supported_count,
         "review_count": len(review_vm_names),
     }
+    readiness = build_current_readiness_context(
+        inventory_rows=all_vms,
+        selected_vm_names=selected_vm_names,
+        scenario_analysis=None,
+        scenario_views=None,
+        app_state=app_state,
+        setup_metadata={
+            "assessment_name": normalize_assessment_name(
+                session.get("active_assessment_name", "")
+            ),
+            "customer_name": normalize_customer_name(
+                session.get("customer_name", "")
+            ),
+            "has_price_list": bool(
+                str(session.get("selected_pricelist_file", "")).strip()
+            ),
+            "has_inventory": bool(all_vms),
+        },
+        has_unsaved_scenario_changes=False,
+        inventory_issues=inventory_issues,
+        pricing_inputs=None,
+    )
 
     return render_template(
         "step3.html",
         **build_workspace_context(
             "inventory",
+            readiness=readiness,
             selected_rvtools_file=selected_rvtools_file,
             source_vinfo_csv=source_vinfo_csv,
             inventory_rows=inventory_rows,
@@ -6811,10 +7257,11 @@ def step4() -> str:
     selected_vm_names = app_state.get("selected_vm_names", [])
     if not isinstance(selected_vm_names, list):
         selected_vm_names = []
+    inventory_issues = build_inventory_review_issues(all_vms)
     boundary_errors = inventory_review_readiness_errors(
         all_vms,
         app_state,
-        build_inventory_review_issues(all_vms),
+        inventory_issues,
     )
     if boundary_errors:
         flash(
@@ -7339,12 +7786,37 @@ def step4() -> str:
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             max_age=0,
         )
-
+    readiness = build_current_readiness_context(
+        inventory_rows=all_vms,
+        selected_vm_names=selected_vm_names,
+        scenario_analysis=analysis,
+        scenario_views=scenario_views,
+        app_state=app_state,
+        setup_metadata={
+            "assessment_name": normalize_assessment_name(
+                session.get("active_assessment_name", "")
+            ),
+            "customer_name": customer_name,
+            "has_price_list": bool(source_pricelist_file and price_lookup),
+            "has_inventory": bool(all_vms),
+        },
+        has_unsaved_scenario_changes=False,
+        inventory_issues=inventory_issues,
+        pricing_inputs={
+            "source_pricelist_file": source_pricelist_file,
+            "price_lookup": price_lookup,
+            "modeled_vm_rows": vm_rows,
+            "block_storage_unit_price": block_storage_unit_price,
+            "block_perf_unit_price": block_perf_unit_price,
+            "windows_os_unit_price": windows_os_unit_price,
+        },
+    )
 
     return render_template(
         "step4.html",
         **build_workspace_context(
             "results" if active_scenario == "price" else "scenarios",
+            readiness=readiness,
             selected_rvtools_file=selected_rvtools_file,
             source_vinfo_csv=source_vinfo_csv,
             vm_rows=vm_rows,

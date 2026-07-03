@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+import app as app_module
 from assessment_readiness import build_assessment_readiness
 
 
@@ -49,7 +51,226 @@ def complete_context() -> dict:
     }
 
 
+def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
+    inventory_rows = [
+        {
+            "name": "app-01",
+            "source_name": "app-01",
+            "raw_os": "Oracle Linux 8 (64-bit)",
+            "cpus": 4,
+            "memory_mb": 8192,
+            "provisioned_mib": 102400,
+        },
+        {
+            "name": "legacy-01",
+            "source_name": "legacy-01",
+            "raw_os": "Microsoft Windows Server 2008 (64-bit)",
+            "cpus": 2,
+            "memory_mb": 4096,
+            "provisioned_mib": 51200,
+        },
+        {
+            "name": "excluded-01",
+            "source_name": "excluded-01",
+            "raw_os": "Oracle Linux 8 (64-bit)",
+            "cpus": 2,
+            "memory_mb": 4096,
+            "provisioned_mib": 51200,
+        },
+    ]
+    modeled_vm_rows = [
+        {
+            "vm_name": "app-01",
+            "os_name": "Oracle Linux 8 (64-bit)",
+            "ocpu_unit_price": 0.03,
+            "memory_unit_price": 0.002,
+            "is_windows_server": False,
+            "os_license": "",
+        },
+        {
+            "vm_name": "legacy-01",
+            "os_name": "Microsoft Windows Server 2008 (64-bit)",
+            "ocpu_unit_price": 0.03,
+            "memory_unit_price": 0.002,
+            "is_windows_server": True,
+            "os_license": "BYOL",
+        },
+    ]
+    scenario_rows = [
+        {"id": "native", "monthly_cost": 125.0},
+        {"id": "ocvs", "monthly_cost": 825.0},
+        {"id": "hybrid", "monthly_cost": 475.0},
+    ]
+    physical_cores = {"ocvs": 384, "hybrid": 128}
+    analysis = {
+        "scenario_comparison": {"rows": scenario_rows},
+        "oci_unsupported_rows": [{"vm_name": "legacy-01"}],
+        "supported_native_rows": [modeled_vm_rows[0]],
+        "ocvs_price": {
+            "selected": {
+                "host_count": 3,
+                "host_type": "Dense",
+                "pricing_available": True,
+            }
+        },
+        "hybrid_ocvs_price": {
+            "selected": {
+                "host_count": 1,
+                "host_type": "Dense",
+                "pricing_available": True,
+            }
+        },
+        "vmware_license_summary": {
+            "is_priced": vcf_price_per_core_yearly > 0,
+            "price_per_core_yearly": vcf_price_per_core_yearly,
+            "ocvs": {"physical_cores": physical_cores["ocvs"]},
+            "hybrid": {"physical_cores": physical_cores["hybrid"]},
+        },
+        "fit_warnings": [
+            {
+                "severity": "warning" if vcf_price_per_core_yearly == 0 else "info",
+                "title": (
+                    "VCF license price not set"
+                    if vcf_price_per_core_yearly == 0
+                    else "VCF license cost included"
+                ),
+                "detail": (
+                    "OCVS and Hybrid costs exclude VCF license cost until a list price per physical core is entered."
+                    if vcf_price_per_core_yearly == 0
+                    else "VCF license cost is included in the modeled scenarios."
+                ),
+            }
+        ],
+    }
+    return {
+        "inventory_rows": inventory_rows,
+        "selected_vm_names": ["app-01", "legacy-01"],
+        "scenario_analysis": analysis,
+        "scenario_views": [
+            {"id": row["id"], "scenario": dict(row)} for row in scenario_rows
+        ],
+        "app_state": {
+            "selected_vm_names": ["app-01", "legacy-01"],
+            "step4_hybrid_placements": {
+                "app-01": "native",
+                "legacy-01": "ocvs",
+                "excluded-01": "invalid",
+            },
+            "acknowledged_warning_ids": ["unsupported-native"],
+            "assessor_recommendation": "",
+            "assessor_recommendation_rationale": "",
+            "step4_vmware_license_price_per_core_yearly": vcf_price_per_core_yearly,
+        },
+        "setup_metadata": {
+            "assessment_name": "Current assessment",
+            "customer_name": "Example Customer",
+            "has_price_list": True,
+            "has_inventory": True,
+        },
+        "pricing_inputs": {
+            "source_pricelist_file": "prices.json",
+            "price_lookup": {"available-sku": 1.0},
+            "modeled_vm_rows": modeled_vm_rows,
+            "block_storage_unit_price": 0.02,
+            "block_perf_unit_price": 0.001,
+            "windows_os_unit_price": 0.09,
+        },
+        "has_unsaved_scenario_changes": False,
+    }
+
+
 class ReadinessTests(unittest.TestCase):
+    def test_current_adapter_keeps_unsupported_native_eligible_and_visible(self) -> None:
+        adapter = getattr(app_module, "build_current_readiness_context", None)
+        self.assertTrue(callable(adapter), "current readiness adapter is missing")
+
+        with patch.object(
+            app_module,
+            "build_assessment_readiness",
+            wraps=build_assessment_readiness,
+        ) as readiness_builder:
+            result = adapter(**current_adapter_inputs())
+
+        native = result["scenarios"]["native"]
+        self.assertEqual(1, readiness_builder.call_count)
+        self.assertEqual("eligible", native["technical_eligibility"])
+        self.assertEqual("needs_attention", native["state"])
+        self.assertTrue(native["rankable"])
+        self.assertEqual(["legacy-01"], native["affected_vm_names"])
+        source_advisories = result["stages"]["inventory"]["advisories"]
+        unsupported = next(
+            item for item in source_advisories if item["id"] == "unsupported-native"
+        )
+        self.assertTrue(unsupported["acknowledged"])
+        self.assertEqual(["legacy-01"], unsupported["affected_vm_names"])
+        self.assertEqual("complete", result["stages"]["inventory"]["state"])
+
+    def test_current_adapter_blocks_ocvs_ranking_without_vcf_unit_price(self) -> None:
+        adapter = getattr(app_module, "build_current_readiness_context", None)
+        self.assertTrue(callable(adapter), "current readiness adapter is missing")
+
+        result = adapter(**current_adapter_inputs(vcf_price_per_core_yearly=0.0))
+
+        for scenario_id in ("ocvs", "hybrid"):
+            with self.subTest(scenario=scenario_id):
+                scenario = result["scenarios"][scenario_id]
+                self.assertEqual("incomplete", scenario["pricing_state"])
+                self.assertFalse(scenario["rankable"])
+        self.assertIn(
+            "VCF license price not set",
+            {item["title"] for item in result["advisory_items"]},
+        )
+        self.assertIn(
+            "VCF license price not set",
+            {
+                item["title"]
+                for item in result["stages"]["scenarios"]["advisories"]
+            },
+        )
+
+    def test_current_adapter_uses_explicit_incomplete_early_scenarios(self) -> None:
+        adapter = getattr(app_module, "build_current_readiness_context", None)
+        self.assertTrue(callable(adapter), "current readiness adapter is missing")
+        inputs = current_adapter_inputs()
+        inputs["scenario_analysis"] = None
+        inputs["scenario_views"] = None
+        inputs["pricing_inputs"] = None
+
+        result = adapter(**inputs)
+
+        for scenario_id in ("native", "ocvs", "hybrid"):
+            with self.subTest(scenario=scenario_id):
+                scenario = result["scenarios"][scenario_id]
+                self.assertEqual("incomplete", scenario["pricing_state"])
+                self.assertFalse(scenario["rankable"])
+                self.assertIsNone(scenario["monthly_cost"])
+
+    def test_current_adapter_fails_closed_for_malformed_pricing_inputs(self) -> None:
+        adapter = getattr(app_module, "build_current_readiness_context", None)
+        self.assertTrue(callable(adapter), "current readiness adapter is missing")
+        inputs = current_adapter_inputs()
+        inputs["pricing_inputs"]["block_storage_unit_price"] = "not-a-price"
+
+        try:
+            result = adapter(**inputs)
+        except (TypeError, ValueError) as exc:
+            self.fail(f"malformed pricing input escaped the adapter: {exc}")
+
+        self.assertEqual("incomplete", result["scenarios"]["native"]["pricing_state"])
+        self.assertFalse(result["scenarios"]["native"]["rankable"])
+
+    def test_ocvs_infrastructure_pricing_requires_every_selected_rate(self) -> None:
+        summary = app_module.build_ocvs_price_summary(
+            vm_rows=[{"cpus": 4, "memory_gb": 8, "provisioned_gb": 100}],
+            price_lookup={"Compute - Standard - E4 - OCPU": 0.03},
+            block_storage_unit_price=0.02,
+            block_perf_unit_price=0.001,
+            iaas_discount_pct=0.0,
+            selected_profile="BM.Standard.E4.128",
+        )
+
+        self.assertFalse(summary["selected"]["pricing_available"])
+
     def test_native_stays_eligible_and_rankable_with_unsupported_vms(self) -> None:
         result = build_assessment_readiness(complete_context())
         native = result["scenarios"]["native"]

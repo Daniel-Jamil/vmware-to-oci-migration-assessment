@@ -388,6 +388,118 @@ def validate_shared_workspace_shell() -> None:
             check(f"{route} old color explanation removed", old_color_explanation not in response.data)
 
 
+def validate_current_readiness_routes() -> None:
+    adapter = getattr(app_module, "build_current_readiness_context", None)
+    check("current readiness adapter exists", callable(adapter))
+
+    price_file = find_price_file()
+    inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
+    selected_names = [str(row["name"]) for row in inventory_rows]
+    state_id = f"current_readiness_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = selected_names
+        state["step4_hybrid_placements"] = {
+            "vm-app-01": "native",
+            "vm-db-01": "native",
+            "vm-web-01": "native",
+            "vm-legacy-01": "ocvs",
+        }
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
+        state["step4_vmware_license_price_per_core_yearly"] = 0.0
+        app_module.save_app_state(state)
+
+    original_builder = app_module.build_assessment_readiness
+    readiness_results: list[dict[str, object]] = []
+
+    def tracked_builder(context: dict[str, object]) -> dict[str, object]:
+        result = original_builder(context)
+        readiness_results.append(result)
+        return result
+
+    app_module.build_assessment_readiness = tracked_builder
+    try:
+        with app_module.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+                sess["state_id"] = state_id
+                sess["selected_rvtools_file"] = str(CSV_INVENTORY)
+                sess["selected_pricelist_file"] = price_file
+                sess["selected_currency"] = "EUR"
+                sess["customer_name"] = "Readiness Customer"
+                sess["active_assessment_name"] = "Readiness assessment"
+
+            for route in ("/", "/step3"):
+                prior_calls = len(readiness_results)
+                response = client.get(route)
+                check(
+                    f"{route} builds readiness once",
+                    response.status_code == 200
+                    and len(readiness_results) == prior_calls + 1,
+                    f"status={response.status_code}, calls={len(readiness_results) - prior_calls}",
+                )
+                readiness = readiness_results[-1]
+                check(
+                    f"{route} scenarios stay explicitly incomplete",
+                    all(
+                        scenario.get("pricing_state") == "incomplete"
+                        and scenario.get("rankable") is False
+                        and scenario.get("monthly_cost") is None
+                        for scenario in readiness.get("scenarios", {}).values()
+                    ),
+                    str(readiness.get("scenarios")),
+                )
+
+            prior_calls = len(readiness_results)
+            response = client.get("/step4?tab=native")
+            check(
+                "/step4 builds readiness once",
+                response.status_code == 200
+                and len(readiness_results) == prior_calls + 1,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}",
+            )
+            readiness = readiness_results[-1]
+            native = readiness.get("scenarios", {}).get("native", {})
+            check(
+                "acknowledged Native remediation stays visible and rankable",
+                native.get("technical_eligibility") == "eligible"
+                and native.get("state") == "needs_attention"
+                and native.get("rankable") is True
+                and native.get("affected_vm_names") == ["vm-legacy-01"]
+                and any(
+                    item.get("id") == "unsupported-native"
+                    and item.get("acknowledged") is True
+                    for item in readiness.get("stages", {})
+                    .get("inventory", {})
+                    .get("advisories", [])
+                ),
+                str(readiness),
+            )
+            check(
+                "zero VCF price excludes OCVS scenarios from ranking",
+                all(
+                    readiness.get("scenarios", {}).get(scenario_id, {}).get("pricing_state")
+                    == "incomplete"
+                    and readiness.get("scenarios", {}).get(scenario_id, {}).get("rankable")
+                    is False
+                    for scenario_id in ("ocvs", "hybrid")
+                ),
+                str(readiness.get("scenarios")),
+            )
+            check(
+                "fit warnings reach readiness payload and shell",
+                any(
+                    item.get("title") == "VCF license price not set"
+                    for item in readiness.get("advisory_items", [])
+                )
+                and b"OCVS and Hybrid costs exclude VCF license cost" in response.data,
+                str(readiness.get("advisory_items")),
+            )
+    finally:
+        app_module.build_assessment_readiness = original_builder
+
+
 def validate_unsupported_currency_workspace_shell() -> None:
     with app_module.app.test_client() as client:
         response = client.post(
@@ -3696,6 +3808,7 @@ def main() -> None:
     validate_saved_assessment_load_step4_failure()
     validate_atomic_step4_snapshot_write()
     validate_shared_workspace_shell()
+    validate_current_readiness_routes()
     validate_stage1_setup_redesign()
     validate_stage1_identity_save_and_loaded_manual_mode()
     validate_manual_sizing_input()
