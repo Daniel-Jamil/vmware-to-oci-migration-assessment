@@ -464,6 +464,18 @@ def _preferences_file_path() -> Path:
     return APP_STATE_DIR / "preferences.json"
 
 
+def _write_json_atomically(file_path: Path, payload: Any) -> None:
+    temporary_file = file_path.with_name(f".{file_path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary_file, file_path)
+    finally:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("Temporary JSON cleanup failed")
+
+
 def load_preferences() -> dict[str, Any]:
     preferences_file = _preferences_file_path()
     if not preferences_file.exists():
@@ -476,8 +488,7 @@ def load_preferences() -> dict[str, Any]:
 
 
 def save_preferences(preferences: dict[str, Any]) -> None:
-    preferences_file = _preferences_file_path()
-    preferences_file.write_text(json.dumps(preferences, indent=2), encoding="utf-8")
+    _write_json_atomically(_preferences_file_path(), preferences)
 
 
 def remember_price_list_selection(file_path: str, currency: str = "") -> None:
@@ -503,8 +514,7 @@ def load_step4_snapshot() -> dict[str, Any]:
 
 
 def save_step4_snapshot(snapshot: dict[str, Any]) -> None:
-    snapshot_file = _step4_snapshot_file_path()
-    snapshot_file.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    _write_json_atomically(_step4_snapshot_file_path(), snapshot)
 
 
 def clear_step4_snapshot() -> None:
@@ -602,16 +612,7 @@ def load_app_state() -> dict[str, Any]:
 
 
 def save_app_state(state: dict[str, Any]) -> None:
-    state_file = _state_file_path()
-    temporary_file = state_file.with_name(f".{state_file.name}.{uuid4().hex}.tmp")
-    try:
-        temporary_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        os.replace(temporary_file, state_file)
-    finally:
-        try:
-            temporary_file.unlink(missing_ok=True)
-        except OSError:
-            app.logger.exception("Temporary app state cleanup failed")
+    _write_json_atomically(_state_file_path(), state)
 
 
 def _saved_assessments_dir() -> Path:
@@ -766,51 +767,86 @@ def save_current_assessment(name: Any, notes: Any) -> dict[str, Any]:
     return snapshot
 
 
-def _restore_price_list_from_assessment(snapshot: dict[str, Any], warnings: list[str]) -> None:
+def stage_saved_assessment_load(
+    snapshot: dict[str, Any],
+    file_path: Path,
+    prior_session: dict[str, Any],
+    prior_preferences: dict[str, Any],
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    staged_session = copy.deepcopy(prior_session)
+    assessment_name = normalize_assessment_name(snapshot.get("name")) or file_path.stem
+    assessment_notes = normalize_assessment_notes(snapshot.get("notes"))
+    staged_session["active_assessment_id"] = _clean_assessment_id(snapshot.get("id") or file_path.stem)
+    staged_session["active_assessment_name"] = assessment_name
+    staged_session["active_assessment_notes"] = assessment_notes
+
+    customer_name = normalize_customer_name(snapshot.get("customer_name", ""))
+    if customer_name:
+        staged_session["customer_name"] = customer_name
+    else:
+        staged_session.pop("customer_name", None)
+
     price_file = str(snapshot.get("selected_pricelist_file") or "").strip().replace("\\", "/")
     selected_currency = str(snapshot.get("selected_currency") or "").upper().strip()
-    session.pop("selected_pricelist_file", None)
+    staged_session.pop("selected_pricelist_file", None)
     if selected_currency:
-        session["selected_currency"] = selected_currency
+        staged_session["selected_currency"] = selected_currency
 
-    if not price_file:
-        return
-    if price_file in list_downloaded_price_lists():
-        session["selected_pricelist_file"] = price_file
-        remember_price_list_selection(price_file, selected_currency)
-    else:
-        warnings.append("Saved OCI price list is missing. Select or download a current price list before pricing.")
+    staged_preferences = copy.deepcopy(prior_preferences)
+    apply_price_preference = False
+    if price_file:
+        if price_file in list_downloaded_price_lists():
+            staged_session["selected_pricelist_file"] = price_file
+            staged_preferences["last_selected_pricelist_file"] = price_file
+            if selected_currency:
+                staged_preferences["last_selected_currency"] = selected_currency
+            apply_price_preference = True
+        else:
+            warnings.append("Saved OCI price list is missing. Select or download a current price list before pricing.")
 
-
-def _restore_inventory_from_assessment(snapshot: dict[str, Any], warnings: list[str]) -> None:
     selected_path = str(snapshot.get("selected_rvtools_file") or "").strip().replace("\\", "/")
-    session.pop("selected_rvtools_file", None)
-    session.pop("rvtools_file_info", None)
-    session.pop("rvtools_import_summary", None)
-    session.pop("rvtools_rejected_info", None)
+    staged_session.pop("selected_rvtools_file", None)
+    staged_session.pop("rvtools_file_info", None)
+    staged_session.pop("rvtools_import_summary", None)
+    staged_session.pop("rvtools_rejected_info", None)
+    if selected_path:
+        inventory_path = Path(selected_path)
+        if not inventory_path.exists():
+            warnings.append("Saved inventory file is missing. Re-select or recreate the inventory source before continuing.")
+        else:
+            try:
+                vm_rows, source = load_vms_from_vinfo(selected_path)
+                inventory_info = build_source_file_info(selected_path)
+                inventory_summary = build_inventory_import_summary(vm_rows, source)
+            except Exception:
+                app.logger.exception("Saved assessment inventory staging failed")
+                warnings.append("Saved inventory file could not be loaded. Re-select or recreate the inventory source.")
+            else:
+                staged_session["selected_rvtools_file"] = selected_path
+                staged_session["rvtools_file_info"] = {
+                    "file_path": selected_path,
+                    "file_name": inventory_path.name,
+                    "size_kb": inventory_info.get("size_kb", ""),
+                }
+                staged_session["rvtools_import_summary"] = inventory_summary
 
-    if not selected_path:
-        return
+    last_export_file = str(snapshot.get("last_export_file") or "")
+    if last_export_file:
+        staged_session["last_export_file"] = last_export_file
+    else:
+        staged_session.pop("last_export_file", None)
 
-    inventory_path = Path(selected_path)
-    if not inventory_path.exists():
-        warnings.append("Saved inventory file is missing. Re-select or recreate the inventory source before continuing.")
-        return
-
-    try:
-        vm_rows, source = load_vms_from_vinfo(selected_path)
-    except Exception:
-        app.logger.exception("Saved assessment inventory restore failed")
-        warnings.append("Saved inventory file could not be loaded. Re-select or recreate the inventory source.")
-        return
-
-    session["selected_rvtools_file"] = selected_path
-    session["rvtools_file_info"] = {
-        "file_path": selected_path,
-        "file_name": inventory_path.name,
-        "size_kb": round(inventory_path.stat().st_size / 1024, 2),
+    step4_snapshot = snapshot.get("step4_snapshot")
+    return {
+        "name": assessment_name,
+        "warnings": warnings,
+        "session": staged_session,
+        "app_state": normalize_app_state(snapshot.get("app_state")),
+        "step4_snapshot": copy.deepcopy(step4_snapshot) if isinstance(step4_snapshot, dict) else {},
+        "preferences": staged_preferences,
+        "apply_price_preference": apply_price_preference,
     }
-    session["rvtools_import_summary"] = build_inventory_import_summary(vm_rows, source)
 
 
 def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
@@ -822,37 +858,48 @@ def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
     if not snapshot:
         return {"ok": False, "message": "Saved assessment could not be read.", "warnings": []}
 
-    warnings: list[str] = []
-    assessment_name = normalize_assessment_name(snapshot.get("name")) or file_path.stem
-    assessment_notes = normalize_assessment_notes(snapshot.get("notes"))
-    session["active_assessment_id"] = _clean_assessment_id(snapshot.get("id") or file_path.stem)
-    session["active_assessment_name"] = assessment_name
-    session["active_assessment_notes"] = assessment_notes
+    prior_session = copy.deepcopy(dict(session))
+    prior_app_state = load_app_state()
+    prior_step4_snapshot = load_step4_snapshot()
+    prior_preferences = load_preferences()
 
-    customer_name = normalize_customer_name(snapshot.get("customer_name", ""))
-    if customer_name:
-        session["customer_name"] = customer_name
-    else:
-        session.pop("customer_name", None)
+    try:
+        staged = stage_saved_assessment_load(
+            snapshot,
+            file_path,
+            prior_session,
+            prior_preferences,
+        )
+        save_app_state(staged["app_state"])
+        save_step4_snapshot(staged["step4_snapshot"])
+        session.clear()
+        session.update(copy.deepcopy(staged["session"]))
+        if staged["apply_price_preference"]:
+            save_preferences(staged["preferences"])
+    except Exception:
+        app.logger.exception("Saved assessment transactional load failed")
+        try:
+            save_app_state(prior_app_state)
+        except Exception:
+            app.logger.exception("Saved assessment app state rollback failed")
+        try:
+            save_step4_snapshot(prior_step4_snapshot)
+        except Exception:
+            app.logger.exception("Saved assessment Step 4 rollback failed")
+        try:
+            save_preferences(prior_preferences)
+        except Exception:
+            app.logger.exception("Saved assessment preferences rollback failed")
+        session.clear()
+        session.update(copy.deepcopy(prior_session))
+        return {"ok": False, "message": "Saved assessment could not be loaded.", "warnings": []}
 
-    _restore_price_list_from_assessment(snapshot, warnings)
-    _restore_inventory_from_assessment(snapshot, warnings)
-
-    save_app_state(normalize_app_state(snapshot.get("app_state")))
-
-    step4_snapshot = snapshot.get("step4_snapshot")
-    if isinstance(step4_snapshot, dict) and step4_snapshot:
-        save_step4_snapshot(step4_snapshot)
-    else:
-        clear_step4_snapshot()
-
-    last_export_file = str(snapshot.get("last_export_file") or "")
-    if last_export_file:
-        session["last_export_file"] = last_export_file
-    else:
-        session.pop("last_export_file", None)
-
-    return {"ok": True, "message": "Assessment loaded.", "name": assessment_name, "warnings": warnings}
+    return {
+        "ok": True,
+        "message": "Assessment loaded.",
+        "name": staged["name"],
+        "warnings": staged["warnings"],
+    }
 
 
 def delete_saved_assessment(assessment_id: Any) -> dict[str, Any]:

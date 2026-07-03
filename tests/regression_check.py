@@ -922,6 +922,283 @@ def validate_stage1_safe_exception_messages() -> None:
     )
 
 
+def prepare_saved_assessment_load_fault_fixture(
+    client: object,
+    label: str,
+) -> dict[str, object]:
+    price_file = find_price_file()
+    prior_price_file = app_module.DOWNLOADS_DIR / f"oci_pricing_USD_prior_{label}.json"
+    prior_price_file.write_bytes(Path(price_file).read_bytes())
+
+    client.post(
+        "/",
+        data={"action": "save_customer_name", "customer_name": f"Target Customer {label}"},
+    )
+    client.post(
+        "/",
+        data={"action": "select_pricelist", "price_list_file": price_file},
+    )
+    client.post(
+        "/",
+        data={
+            "action": "create_manual_inventory",
+            "inventory_mode": "manual",
+            "manual_vm_count": "3",
+            "manual_total_vcpus": "12",
+            "manual_total_memory_gb": "48",
+            "manual_total_storage_gb": "600",
+            "manual_supported_vm_count": "2",
+            "manual_unsupported_vm_count": "1",
+        },
+    )
+    target_state = app_module.load_app_state()
+    target_state["selected_vm_names"] = ["manual-vm-001", "manual-vm-002", "manual-vm-003"]
+    target_state["step4_hybrid_placements"] = {"manual-vm-001": "ocvs"}
+    target_state["assessor_recommendation"] = "hybrid"
+    app_module.save_app_state(target_state)
+    target_step4_snapshot = {
+        "marker": f"target-step4-{label}",
+        "selected_scenario": "hybrid",
+    }
+    app_module.save_step4_snapshot(target_step4_snapshot)
+
+    client.post(
+        "/",
+        data={
+            "action": "save_assessment",
+            "assessment_name": f"Target Manual Assessment {label}",
+            "customer_name": f"Target Customer {label}",
+            "assessment_notes": f"Target notes {label}",
+        },
+    )
+    with client.session_transaction() as sess:
+        target_assessment_id = str(sess.get("active_assessment_id", ""))
+
+    client.post(
+        "/",
+        data={
+            "action": "select_rvtools_file",
+            "inventory_mode": "upload",
+            "rvtools_file": str(CSV_INVENTORY),
+        },
+    )
+    client.post(
+        "/",
+        data={"action": "select_pricelist", "price_list_file": str(prior_price_file)},
+    )
+
+    prior_app_state = app_module.load_app_state()
+    prior_app_state["selected_vm_names"] = ["vm-app-01", "vm-db-01"]
+    prior_app_state["step4_hybrid_placements"] = {
+        "vm-app-01": "native",
+        "vm-db-01": "ocvs",
+    }
+    prior_app_state["assessor_recommendation"] = "native"
+    app_module.save_app_state(prior_app_state)
+    prior_app_state = app_module.load_app_state()
+
+    prior_step4_snapshot = {
+        "marker": f"prior-step4-{label}",
+        "selected_scenario": "native",
+    }
+    app_module.save_step4_snapshot(prior_step4_snapshot)
+    prior_preferences = {
+        "last_selected_pricelist_file": str(prior_price_file).replace("\\", "/"),
+        "last_selected_currency": "USD",
+        "preserved_marker": f"preferences-{label}",
+    }
+    app_module.save_preferences(prior_preferences)
+
+    with client.session_transaction() as sess:
+        sess["active_assessment_id"] = f"prior-active-{label}"
+        sess["active_assessment_name"] = f"Prior Upload Assessment {label}"
+        sess["active_assessment_notes"] = f"Prior notes {label}"
+        sess["customer_name"] = f"Prior Customer {label}"
+        sess["last_export_file"] = f"/private/tmp/prior-export-{label}.xlsx"
+
+    prior_response = client.get("/")
+    with client.session_transaction() as sess:
+        prior_session = json.loads(json.dumps(dict(sess)))
+    target_snapshot_path = (
+        app_module.APP_STATE_DIR / "saved_assessments" / f"{target_assessment_id}.json"
+    )
+    target_snapshot = json.loads(target_snapshot_path.read_text(encoding="utf-8"))
+    return {
+        "target_assessment_id": target_assessment_id,
+        "target_snapshot_path": target_snapshot_path,
+        "target_snapshot": target_snapshot,
+        "target_step4_snapshot": target_step4_snapshot,
+        "prior_session": prior_session,
+        "prior_app_state": prior_app_state,
+        "prior_step4_snapshot": prior_step4_snapshot,
+        "prior_preferences": prior_preferences,
+        "prior_mode_is_upload": (
+            re.search(
+                r'<input(?=[^>]*id="inventory-mode-upload")(?=[^>]*checked)[^>]*>',
+                prior_response.data.decode("utf-8"),
+            )
+            is not None
+        ),
+    }
+
+
+def assert_saved_load_fault_preserves_prior(
+    client: object,
+    fixture: dict[str, object],
+    response: object,
+    fault_name: str,
+) -> None:
+    with client.session_transaction() as sess:
+        session_after = json.loads(json.dumps(dict(sess)))
+    app_state_after = app_module.load_app_state()
+    step4_after = app_module.load_step4_snapshot()
+    preferences_after = app_module.load_preferences()
+    response_html = response.data.decode("utf-8")
+    visible_text = visible_text_outside_details(response.data)
+    upload_checked = (
+        re.search(
+            r'<input(?=[^>]*id="inventory-mode-upload")(?=[^>]*checked)[^>]*>',
+            response_html,
+        )
+        is not None
+    )
+    manual_panel = re.search(
+        r'<div(?=[^>]*data-inventory-mode-panel="manual")[^>]*>',
+        response_html,
+        re.S,
+    )
+    manual_panel_tag = manual_panel.group(0) if manual_panel else ""
+    check(
+        fault_name,
+        response.status_code == 200
+        and "Saved assessment could not be loaded" in visible_text
+        and session_after == fixture["prior_session"]
+        and app_state_after == fixture["prior_app_state"]
+        and step4_after == fixture["prior_step4_snapshot"]
+        and preferences_after == fixture["prior_preferences"]
+        and fixture["prior_mode_is_upload"] is True
+        and upload_checked
+        and 'aria-hidden="true"' in manual_panel_tag
+        and re.search(r"\shidden(?:\s|>)", manual_panel_tag) is not None,
+        json.dumps(
+            {
+                "status": response.status_code,
+                "session_after": session_after,
+                "prior_session": fixture["prior_session"],
+                "app_state_after": app_state_after,
+                "step4_after": step4_after,
+                "preferences_after": preferences_after,
+                "upload_checked": upload_checked,
+                "manual_panel": manual_panel_tag,
+                "visible_text": visible_text,
+            },
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+
+def validate_saved_assessment_load_save_state_failure() -> None:
+    with app_module.app.test_client() as client:
+        fixture = prepare_saved_assessment_load_fault_fixture(client, f"state-{uuid4().hex[:8]}")
+        original_save_app_state = app_module.save_app_state
+
+        def reject_staged_app_state(_state: dict[str, object]) -> None:
+            raise OSError("/private/tmp/private-load-state/staged-app-state.json")
+
+        app_module.save_app_state = reject_staged_app_state
+        try:
+            response = client.post(
+                "/",
+                data={
+                    "action": "load_assessment",
+                    "assessment_id": fixture["target_assessment_id"],
+                },
+            )
+        finally:
+            app_module.save_app_state = original_save_app_state
+
+        assert_saved_load_fault_preserves_prior(
+            client,
+            fixture,
+            response,
+            "saved assessment load preserves everything when app state persistence fails",
+        )
+        Path(fixture["target_snapshot_path"]).unlink(missing_ok=True)
+
+
+def validate_saved_assessment_load_step4_failure() -> None:
+    with app_module.app.test_client() as client:
+        fixture = prepare_saved_assessment_load_fault_fixture(client, f"step4-{uuid4().hex[:8]}")
+        check(
+            "saved load Step 4 fault fixture is nonempty",
+            bool(fixture["target_snapshot"].get("step4_snapshot")),
+            str(fixture["target_snapshot"].get("step4_snapshot")),
+        )
+        original_save_step4_snapshot = app_module.save_step4_snapshot
+
+        def reject_staged_step4(_snapshot: dict[str, object]) -> None:
+            raise OSError("/private/tmp/private-load-state/staged-step4.json")
+
+        app_module.save_step4_snapshot = reject_staged_step4
+        try:
+            response = client.post(
+                "/",
+                data={
+                    "action": "load_assessment",
+                    "assessment_id": fixture["target_assessment_id"],
+                },
+            )
+        finally:
+            app_module.save_step4_snapshot = original_save_step4_snapshot
+
+        assert_saved_load_fault_preserves_prior(
+            client,
+            fixture,
+            response,
+            "saved assessment load rolls back app state when Step 4 persistence fails",
+        )
+        Path(fixture["target_snapshot_path"]).unlink(missing_ok=True)
+
+
+def validate_atomic_step4_snapshot_write() -> None:
+    state_id = f"atomic_step4_{uuid4().hex}"
+    secret_path = "/private/tmp/private-load-state/atomic-step4.json"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        original_snapshot = {"marker": "original-step4"}
+        app_module.save_step4_snapshot(original_snapshot)
+        snapshot_file = app_module._step4_snapshot_file_path()
+        original_bytes = snapshot_file.read_bytes()
+        original_replace = app_module.os.replace
+        replace_sources: list[str] = []
+
+        def reject_step4_replace(source: object, destination: object) -> None:
+            replace_sources.append(str(source))
+            raise OSError(secret_path)
+
+        app_module.os.replace = reject_step4_replace
+        raised = ""
+        try:
+            try:
+                app_module.save_step4_snapshot({"marker": "replacement-step4"})
+            except OSError as exc:
+                raised = str(exc)
+        finally:
+            app_module.os.replace = original_replace
+
+        temporary_files = list(snapshot_file.parent.glob(f".{snapshot_file.name}.*.tmp"))
+        check(
+            "Step 4 snapshot writes are atomic and clean failed temporary files",
+            bool(raised)
+            and secret_path in raised
+            and bool(replace_sources)
+            and snapshot_file.read_bytes() == original_bytes
+            and not temporary_files,
+            f"raised={raised!r}, replace_sources={replace_sources}, temporary_files={temporary_files}",
+        )
+
+
 def validate_workspace_context_contracts() -> None:
     state_id = f"workspace_contract_{uuid4().hex}"
     with app_module.app.test_request_context("/"):
@@ -2680,6 +2957,9 @@ def main() -> None:
     validate_transactional_inventory_activation()
     validate_owned_candidate_cleanup_protection()
     validate_stage1_safe_exception_messages()
+    validate_saved_assessment_load_save_state_failure()
+    validate_saved_assessment_load_step4_failure()
+    validate_atomic_step4_snapshot_write()
     validate_shared_workspace_shell()
     validate_stage1_setup_redesign()
     validate_stage1_identity_save_and_loaded_manual_mode()
