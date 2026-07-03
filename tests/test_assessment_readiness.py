@@ -198,6 +198,31 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
     }
 
 
+def configure_all_native_hybrid(inputs: dict) -> None:
+    modeled_rows = copy.deepcopy(inputs["pricing_inputs"]["modeled_vm_rows"])
+    hybrid_row = next(
+        row
+        for row in inputs["scenario_analysis"]["scenario_comparison"]["rows"]
+        if row["id"] == "hybrid"
+    )
+    hybrid_row.update(native_vm_count=2, ocvs_vm_count=0)
+    inputs["scenario_analysis"]["supported_native_rows"] = modeled_rows
+    inputs["scenario_analysis"]["unsupported_ocvs_rows"] = []
+    inputs["scenario_analysis"]["hybrid_placement_plan"] = {
+        "native_count": 2,
+        "ocvs_priced_count": 0,
+        "native_rows": copy.deepcopy(modeled_rows),
+        "ocvs_rows": [],
+    }
+    inputs["scenario_analysis"]["hybrid_ocvs_price"] = None
+    inputs["scenario_analysis"]["vmware_license_summary"]["hybrid"] = {}
+    inputs["app_state"]["step4_hybrid_placements"] = {
+        "app-01": "native",
+        "legacy-01": "native",
+    }
+    inputs["app_state"]["assessor_recommendation"] = "hybrid"
+
+
 @contextmanager
 def current_step4_client():
     inventory_rows = copy.deepcopy(current_adapter_inputs()["inventory_rows"][:2])
@@ -615,17 +640,7 @@ class ReadinessTests(unittest.TestCase):
 
     def test_hybrid_pricing_distinguishes_empty_and_malformed_ocvs_subsets(self) -> None:
         empty_inputs = current_adapter_inputs()
-        hybrid_row = next(
-            row
-            for row in empty_inputs["scenario_analysis"]["scenario_comparison"]["rows"]
-            if row["id"] == "hybrid"
-        )
-        hybrid_row["ocvs_vm_count"] = 0
-        empty_inputs["scenario_analysis"]["supported_native_rows"] = copy.deepcopy(
-            empty_inputs["pricing_inputs"]["modeled_vm_rows"]
-        )
-        empty_inputs["scenario_analysis"]["hybrid_ocvs_price"] = None
-        empty_inputs["scenario_analysis"]["vmware_license_summary"]["hybrid"] = {}
+        configure_all_native_hybrid(empty_inputs)
 
         empty_result = app_module.build_current_readiness_context(**empty_inputs)
 
@@ -651,6 +666,92 @@ class ReadinessTests(unittest.TestCase):
                     "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
                 )
                 self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+
+    def test_hybrid_empty_ocvs_subset_requires_native_rows_and_models(self) -> None:
+        mutations = {
+            "missing supported Native rows": lambda values: values[
+                "scenario_analysis"
+            ].pop("supported_native_rows"),
+            "missing modeled Native rows": lambda values: values[
+                "pricing_inputs"
+            ].update(modeled_vm_rows=[]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                configure_all_native_hybrid(inputs)
+                mutate(inputs)
+
+                result = app_module.build_current_readiness_context(**inputs)
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+                self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_incomplete_native_subset_count_fails_closed(self) -> None:
+        inputs = current_adapter_inputs()
+        configure_all_native_hybrid(inputs)
+        inputs["scenario_analysis"]["supported_native_rows"] = [
+            copy.deepcopy(inputs["pricing_inputs"]["modeled_vm_rows"][0])
+        ]
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertEqual(
+            "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+        self.assertFalse(result["customer_ready_export"])
+
+    def test_hybrid_complete_all_native_partition_remains_rankable(self) -> None:
+        inputs = current_adapter_inputs()
+        configure_all_native_hybrid(inputs)
+
+        result = app_module.build_current_readiness_context(**inputs)
+
+        self.assertEqual(
+            "complete", result["scenarios"]["hybrid"]["pricing_state"]
+        )
+        self.assertTrue(result["scenarios"]["hybrid"]["rankable"])
+        self.assertTrue(result["customer_ready_export"])
+
+    def test_hybrid_partition_mismatch_and_duplicate_names_fail_closed(self) -> None:
+        mutations = {
+            "count mismatch": lambda values: next(
+                row
+                for row in values["scenario_analysis"]["scenario_comparison"]["rows"]
+                if row["id"] == "hybrid"
+            ).update(native_vm_count=1),
+            "duplicate Native names": lambda values: values["scenario_analysis"].update(
+                supported_native_rows=[
+                    copy.deepcopy(values["pricing_inputs"]["modeled_vm_rows"][0]),
+                    copy.deepcopy(values["pricing_inputs"]["modeled_vm_rows"][0]),
+                ]
+            ),
+            "conflicting OCVS names": lambda values: values["scenario_analysis"].update(
+                unsupported_ocvs_rows=[
+                    copy.deepcopy(values["pricing_inputs"]["modeled_vm_rows"][1])
+                ]
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                inputs = current_adapter_inputs()
+                configure_all_native_hybrid(inputs)
+                mutate(inputs)
+
+                try:
+                    result = app_module.build_current_readiness_context(**inputs)
+                except (TypeError, ValueError) as exc:
+                    self.fail(f"Hybrid partition mismatch escaped the adapter: {exc}")
+
+                self.assertEqual(
+                    "incomplete", result["scenarios"]["hybrid"]["pricing_state"]
+                )
+                self.assertFalse(result["scenarios"]["hybrid"]["rankable"])
+                self.assertFalse(result["customer_ready_export"])
 
     def test_hybrid_positive_ocvs_subset_requires_hosts_pricing_cores_and_vcf(self) -> None:
         mutations = {

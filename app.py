@@ -3223,21 +3223,19 @@ def build_current_readiness_context(
         )
 
     full_selected_rows = [row_by_name[name] for name in selected_names]
-    hybrid_native_value = analysis.get("supported_native_rows", [])
-    if isinstance(hybrid_native_value, list):
-        hybrid_native_rows = [
-            row for row in hybrid_native_value if isinstance(row, dict)
-        ]
-        if not all(isinstance(row, dict) for row in hybrid_native_value):
-            add_integrity_issue(
-                adapter_scenario_issues,
-                "invalid-hybrid-native-rows",
-                "Invalid Hybrid Native rows",
-                "Hybrid Native rows must be a list containing only mappings.",
-                stage="scenarios",
-            )
-    else:
-        hybrid_native_rows = []
+    hybrid_native_value = analysis.get("supported_native_rows")
+    hybrid_native_rows_valid = bool(
+        "supported_native_rows" in analysis
+        and isinstance(hybrid_native_value, list)
+        and all(
+            isinstance(row, dict) and bool(_readiness_vm_name(row))
+            for row in hybrid_native_value
+        )
+    )
+    hybrid_native_rows = (
+        list(hybrid_native_value) if hybrid_native_rows_valid else []
+    )
+    if "supported_native_rows" in analysis and not hybrid_native_rows_valid:
         add_integrity_issue(
             adapter_scenario_issues,
             "invalid-hybrid-native-rows",
@@ -3260,18 +3258,96 @@ def build_current_readiness_context(
         vcf_price_per_core_yearly = 0.0
 
     hybrid_scenario_row = scenario_rows.get("hybrid", {})
-    if "ocvs_vm_count" in hybrid_scenario_row:
-        hybrid_ocvs_workload_count = _readiness_nonnegative_count(
-            hybrid_scenario_row.get("ocvs_vm_count")
-        )
+    placement_plan_value = analysis.get("hybrid_placement_plan")
+    placement_plan_present = "hybrid_placement_plan" in analysis
+    placement_plan_valid = not placement_plan_present or isinstance(
+        placement_plan_value, dict
+    )
+    placement_plan = placement_plan_value if isinstance(placement_plan_value, dict) else {}
+
+    def reconciled_partition_count(
+        scenario_key: str,
+        placement_key: str,
+    ) -> int | None:
+        values: list[int] = []
+        if scenario_key in hybrid_scenario_row:
+            scenario_count = _readiness_nonnegative_count(
+                hybrid_scenario_row.get(scenario_key)
+            )
+            if scenario_count is None:
+                return None
+            values.append(scenario_count)
+        if placement_key in placement_plan:
+            placement_count = _readiness_nonnegative_count(
+                placement_plan.get(placement_key)
+            )
+            if placement_count is None:
+                return None
+            values.append(placement_count)
+        if not values or any(value != values[0] for value in values[1:]):
+            return None
+        return values[0]
+
+    hybrid_native_workload_count = reconciled_partition_count(
+        "native_vm_count", "native_count"
+    )
+    hybrid_ocvs_workload_count = reconciled_partition_count(
+        "ocvs_vm_count", "ocvs_priced_count"
+    )
+
+    hybrid_native_names = [
+        _readiness_vm_name(row) for row in hybrid_native_rows
+    ]
+    hybrid_ocvs_names_available = False
+    hybrid_ocvs_names_valid = True
+    hybrid_ocvs_names: list[str] = []
+    if "unsupported_ocvs_rows" in analysis:
+        hybrid_ocvs_names_available = True
+        hybrid_ocvs_value = analysis.get("unsupported_ocvs_rows")
+    elif "ocvs_rows" in placement_plan:
+        hybrid_ocvs_names_available = True
+        hybrid_ocvs_value = placement_plan.get("ocvs_rows")
     else:
-        placement_plan = analysis.get("hybrid_placement_plan")
-        hybrid_ocvs_workload_count = (
-            _readiness_nonnegative_count(placement_plan.get("ocvs_priced_count"))
-            if isinstance(placement_plan, dict)
-            and "ocvs_priced_count" in placement_plan
-            else None
+        hybrid_ocvs_value = []
+    if hybrid_ocvs_names_available:
+        hybrid_ocvs_names_valid = bool(
+            isinstance(hybrid_ocvs_value, list)
+            and all(
+                isinstance(row, dict) and bool(_readiness_vm_name(row))
+                for row in hybrid_ocvs_value
+            )
         )
+        if hybrid_ocvs_names_valid:
+            hybrid_ocvs_names = [
+                _readiness_vm_name(row) for row in hybrid_ocvs_value
+            ]
+
+    selected_name_set = set(selected_names)
+    hybrid_native_name_set = set(hybrid_native_names)
+    hybrid_ocvs_name_set = set(hybrid_ocvs_names)
+    hybrid_partition_complete = bool(
+        placement_plan_valid
+        and hybrid_native_rows_valid
+        and hybrid_native_workload_count is not None
+        and hybrid_ocvs_workload_count is not None
+        and hybrid_native_workload_count + hybrid_ocvs_workload_count
+        == len(selected_names)
+        and len(hybrid_native_names) == hybrid_native_workload_count
+        and len(hybrid_native_name_set) == len(hybrid_native_names)
+        and hybrid_native_name_set <= selected_name_set
+        and (
+            not hybrid_ocvs_names_available
+            or (
+                hybrid_ocvs_names_valid
+                and len(hybrid_ocvs_names) == hybrid_ocvs_workload_count
+                and len(hybrid_ocvs_name_set) == len(hybrid_ocvs_names)
+                and hybrid_ocvs_name_set <= selected_name_set
+                and not hybrid_native_name_set & hybrid_ocvs_name_set
+                and hybrid_native_name_set | hybrid_ocvs_name_set
+                == selected_name_set
+            )
+        )
+    )
 
     fit_warning_values = analysis.get("fit_warnings", [])
     if isinstance(fit_warning_values, list):
@@ -3350,8 +3426,12 @@ def build_current_readiness_context(
                 if scenario_id == "ocvs"
                 else native_prices_complete(hybrid_native_rows)
             )
+            partition_complete = (
+                True if scenario_id == "ocvs" else hybrid_partition_complete
+            )
             pricing_complete = bool(
                 modeled
+                and partition_complete
                 and native_subset_complete
                 and ocvs_infrastructure_complete(
                     analysis.get(summary_key),
