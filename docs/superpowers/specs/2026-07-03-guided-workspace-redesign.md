@@ -2,7 +2,7 @@
 
 ## Goal
 
-Redesign the VMware to OCI Migration Assessment as one coherent, Oracle Redwood-aligned, four-stage workspace. The workflow must lead an assessor from setup through a defensible customer-facing result without allowing incomplete assumptions, unsupported workloads, or missing licensing inputs to appear as a normal recommendation.
+Redesign the VMware to OCI Migration Assessment as one coherent, Oracle Redwood-aligned, four-stage workspace. The workflow must lead an assessor from setup through a defensible customer-facing result without hiding incomplete assumptions, unsupported-workload remediation requirements, or missing licensing inputs.
 
 The redesign preserves the existing OCI Native, OCVS, Hybrid, pricing, saved-assessment, and Excel calculation behavior unless this specification explicitly introduces a readiness or presentation rule.
 
@@ -25,7 +25,7 @@ Word proposal generation remains paused and is outside this redesign.
 
 The approved redesign directly addresses these observed issues:
 
-- Native received a normal first-place cost rank while the test inventory contained unsupported Native workloads.
+- Native received a first-place cost rank without visibly carrying its unsupported-workload remediation warning into the comparison.
 - OCVS and Hybrid were ranked while the VCF price was zero, even though the backend generated a missing-price warning.
 - The setup left rail expanded beyond its fixed width when an inventory filename was long.
 - Setup and Workload Scope produced page-level horizontal overflow at a 390px viewport.
@@ -221,7 +221,9 @@ Assumptions and outcomes are separated. Cost and capacity summaries appear once 
 
 ### OCI Native
 
-Unsupported Native workloads are labeled `Requires remediation`. They may remain in the modeled full-Native scenario for planning, but that scenario remains technically ineligible while any included VM is unsupported. Acknowledging the warning does not make the scenario eligible. The assessor must update the inventory after remediation, exclude the workload from the Native scope, or recommend Hybrid/OCVS.
+Unsupported Native workloads are labeled `Requires remediation`. They remain included in the modeled full-Native scenario, and Native remains technically eligible and fully comparable when its pricing inputs are complete. The scenario status is `needs_attention`, not `incomplete`, while unsupported VMs are present.
+
+Before a Native recommendation becomes customer-ready, the assessor must review the affected VMs and record the intended treatment in the recommendation rationale, such as remediation before migration, exclusion from a Native migration wave, or a documented exception. Acknowledging the warning does not remove the remediation indicator from results or exports.
 
 The per-VM editor provides:
 
@@ -275,7 +277,7 @@ Stage 4 opens with one status:
 - `draft_review_required`
 - `incomplete`
 
-The readiness panel lists unresolved blockers such as unsupported Native workloads, missing VM data, missing OCI pricing, missing VCF pricing, or unsaved scenario changes.
+The readiness panel lists unresolved blockers such as unreviewed Native remediation requirements, missing VM data, missing OCI pricing, missing VCF pricing, or unsaved scenario changes.
 
 ### Scenario Comparison
 
@@ -308,7 +310,7 @@ The assessor selects:
 - Hybrid.
 - No recommendation yet.
 
-The assessor may add a short rationale. A scenario may be selected for internal draft review while incomplete, but Stage 4 cannot become `customer_ready` unless the selected recommendation is technically eligible, fully priced, and based on saved assumptions.
+The assessor may add a short rationale. A scenario may be selected for internal draft review while incomplete, but Stage 4 cannot become `customer_ready` unless the selected recommendation is technically eligible, fully priced, and based on saved assumptions. A Native recommendation with unsupported VMs also requires reviewed remediation treatment in the rationale; it does not require Native to be marked ineligible.
 
 Recommendation and rationale are persisted in app state, local saved assessments, portable JSON, and relevant Excel summary output.
 
@@ -335,6 +337,7 @@ The result contains:
 - Overall readiness state.
 - Per-stage state.
 - Per-scenario eligibility and pricing state.
+- Per-scenario remediation-required state and affected VM count.
 - Blocking items.
 - Advisory items.
 - Affected VM identifiers when relevant.
@@ -456,7 +459,7 @@ Automated regression coverage includes:
 - Four-stage navigation and status transitions.
 - Stage 1 replacement failure preserving the previous inventory.
 - Stage 2 checkbox selection, filters, bulk actions, warning filtering, acknowledgment, and Undo behavior.
-- Native unsupported-workload status.
+- Native remaining eligible and rankable while clearly showing unsupported-workload remediation status.
 - OCVS and Hybrid VCF pricing blockers.
 - Exclusion of incomplete scenarios from lowest-complete-price ranking.
 - Assessor recommendation and rationale persistence.
