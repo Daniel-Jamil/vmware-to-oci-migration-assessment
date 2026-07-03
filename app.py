@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import csv
@@ -602,7 +603,15 @@ def load_app_state() -> dict[str, Any]:
 
 def save_app_state(state: dict[str, Any]) -> None:
     state_file = _state_file_path()
-    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temporary_file = state_file.with_name(f".{state_file.name}.{uuid4().hex}.tmp")
+    try:
+        temporary_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.replace(temporary_file, state_file)
+    finally:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("Temporary app state cleanup failed")
 
 
 def _saved_assessments_dir() -> Path:
@@ -790,8 +799,9 @@ def _restore_inventory_from_assessment(snapshot: dict[str, Any], warnings: list[
 
     try:
         vm_rows, source = load_vms_from_vinfo(selected_path)
-    except Exception as exc:
-        warnings.append(f"Saved inventory file could not be loaded: {exc}")
+    except Exception:
+        app.logger.exception("Saved assessment inventory restore failed")
+        warnings.append("Saved inventory file could not be loaded. Re-select or recreate the inventory source.")
         return
 
     session["selected_rvtools_file"] = selected_path
@@ -853,8 +863,9 @@ def delete_saved_assessment(assessment_id: Any) -> dict[str, Any]:
     assessment_name = normalize_assessment_name(snapshot.get("name")) or file_path.stem
     try:
         file_path.unlink()
-    except OSError as exc:
-        return {"ok": False, "message": f"Saved assessment could not be deleted: {exc}"}
+    except OSError:
+        app.logger.exception("Saved assessment file deletion failed")
+        return {"ok": False, "message": "Saved assessment could not be deleted."}
     if session.get("active_assessment_id") == file_path.stem:
         session.pop("active_assessment_id", None)
     return {"ok": True, "message": "Assessment deleted.", "name": assessment_name}
@@ -970,6 +981,12 @@ def build_source_file_info(path_text: Any) -> dict[str, Any]:
     return info
 
 
+def catalog_token_for_path(path_text: Any) -> str:
+    normalized_path = str(path_text or "").strip().replace("\\", "/")
+    digest = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[:24]
+    return f"catalog-{digest}"
+
+
 def build_catalog_choices(paths: list[str], source_kind: str) -> list[dict[str, str]]:
     choices: list[dict[str, str]] = []
     for index, path_text in enumerate(paths):
@@ -984,7 +1001,7 @@ def build_catalog_choices(paths: list[str], source_kind: str) -> list[dict[str, 
             label = f"Saved inventory {display_index} - {updated_at} - {size_label}"
         choices.append(
             {
-                "token": f"catalog-{index}",
+                "token": catalog_token_for_path(path_text),
                 "file_name": str(source_info.get("file_name") or ""),
                 "file_path": str(source_info.get("file_path") or ""),
                 "label": label,
@@ -1001,11 +1018,10 @@ def resolve_catalog_selection(submitted_value: Any, paths: list[str]) -> str:
     if clean_value in normalized_paths:
         return clean_value
     if clean_value.startswith("catalog-"):
-        token_match = re.fullmatch(r"catalog-(0|[1-9]\d*)", clean_value)
-        if not token_match:
+        if not re.fullmatch(r"catalog-[0-9a-f]{24}", clean_value):
             return ""
-        choice_index = int(token_match.group(1))
-        return normalized_paths[choice_index] if choice_index < len(normalized_paths) else ""
+        matches = [path_text for path_text in normalized_paths if catalog_token_for_path(path_text) == clean_value]
+        return matches[0] if len(matches) == 1 else ""
     matches = [path_text for path_text in normalized_paths if Path(path_text).name == clean_value]
     return matches[0] if len(matches) == 1 else ""
 
@@ -1366,6 +1382,39 @@ def list_rvtools_export_files() -> list[str]:
             if file_path.suffix.lower() in SUPPORTED_RVTOOLS_EXTENSIONS:
                 files.append(str(file_path).replace("\\", "/"))
     return sorted(files)
+
+
+def cleanup_owned_inventory_candidate(
+    candidate_path: Any,
+    owned_candidate_path: Any,
+    previously_active_path: Any,
+) -> bool:
+    candidate_text = str(candidate_path or "").strip().replace("\\", "/")
+    owned_text = str(owned_candidate_path or "").strip().replace("\\", "/")
+    active_text = str(previously_active_path or "").strip().replace("\\", "/")
+    if not candidate_text or not owned_text:
+        return False
+
+    try:
+        candidate = Path(candidate_text).resolve()
+        owned_candidate = Path(owned_text).resolve()
+        rvtools_root = RVTOOLS_DIR.resolve()
+        active_candidate = Path(active_text).resolve() if active_text else None
+        candidate.relative_to(rvtools_root)
+    except (OSError, ValueError):
+        return False
+
+    if candidate != owned_candidate or candidate == active_candidate:
+        return False
+    if candidate.suffix.lower() not in SUPPORTED_RVTOOLS_EXTENSIONS:
+        return False
+
+    try:
+        candidate.unlink(missing_ok=True)
+    except OSError:
+        app.logger.exception("Owned inventory candidate cleanup failed")
+        return False
+    return True
 
 
 def file_sha256(path: Path) -> str:
@@ -5828,18 +5877,18 @@ def index() -> str:
             session.pop("rvtools_rejected_info", None)
 
         def reject_inventory_candidate(
+            candidate_path: str,
             file_info: dict[str, Any],
             reason: str,
             field_id: str,
-            delete_candidate: bool,
+            owned_candidate_path: str,
         ) -> None:
             nonlocal rvtools_rejected_info
-            if delete_candidate:
-                candidate_path = Path(str(file_info.get("file_path") or ""))
-                try:
-                    candidate_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            cleanup_owned_inventory_candidate(
+                candidate_path,
+                owned_candidate_path,
+                selected_rvtools_file,
+            )
             rvtools_rejected_info = build_rejected_inventory_info(file_info, reason)
             field_errors[field_id] = "This file could not be used as VM inventory. Review Source Details."
             flash(
@@ -5853,30 +5902,26 @@ def index() -> str:
             success_message: str,
             *,
             field_id: str,
-            delete_candidate_on_failure: bool = False,
+            owned_candidate_path: str = "",
             select_all_rows: bool = False,
         ) -> bool:
             nonlocal selected_rvtools_file, rvtools_file_info, rvtools_import_summary
+            nonlocal rvtools_rejected_info
             try:
                 vm_rows, source = load_vms_from_vinfo(path_text)
                 candidate_summary = build_inventory_import_summary(vm_rows, source)
                 build_inventory_review_issues(vm_rows)
             except Exception as exc:
+                app.logger.exception("Stage 1 inventory candidate validation failed")
                 reject_inventory_candidate(
+                    path_text,
                     file_info,
                     str(exc),
                     field_id,
-                    delete_candidate_on_failure,
+                    owned_candidate_path,
                 )
                 return False
 
-            clear_rejected_inventory()
-            rvtools_import_summary = candidate_summary
-            selected_rvtools_file = path_text
-            rvtools_file_info = file_info
-            session["selected_rvtools_file"] = selected_rvtools_file
-            session["rvtools_file_info"] = rvtools_file_info
-            session["rvtools_import_summary"] = rvtools_import_summary
             replacement_state = _default_app_state()
             if select_all_rows:
                 replacement_state["selected_vm_names"] = [
@@ -5884,8 +5929,81 @@ def index() -> str:
                     for row in vm_rows
                     if str(row.get("name", ""))
                 ]
-            save_app_state(replacement_state)
-            clear_step4_snapshot()
+
+            prior_app_state = load_app_state()
+            inventory_session_keys = (
+                "selected_rvtools_file",
+                "rvtools_file_info",
+                "rvtools_import_summary",
+                "rvtools_rejected_info",
+            )
+            prior_session_values = {
+                key: (key in session, copy.deepcopy(session.get(key)))
+                for key in inventory_session_keys
+            }
+            prior_selected_file = selected_rvtools_file
+            prior_file_info = copy.deepcopy(rvtools_file_info)
+            prior_import_summary = copy.deepcopy(rvtools_import_summary)
+            prior_rejected_info = copy.deepcopy(rvtools_rejected_info)
+            prior_step4_snapshot = load_step4_snapshot()
+
+            try:
+                save_app_state(replacement_state)
+            except Exception:
+                app.logger.exception("Stage 1 inventory activation failed")
+                cleanup_owned_inventory_candidate(
+                    path_text,
+                    owned_candidate_path,
+                    prior_selected_file,
+                )
+                rvtools_rejected_info = build_rejected_inventory_info(
+                    file_info,
+                    "Inventory activation could not be completed.",
+                )
+                field_errors[field_id] = "The inventory source could not be activated."
+                flash("Inventory source could not be activated. Your current inventory was kept.", "rvtools_error")
+                return False
+
+            try:
+                clear_rejected_inventory()
+                selected_rvtools_file = path_text
+                rvtools_file_info = file_info
+                rvtools_import_summary = candidate_summary
+                session["selected_rvtools_file"] = selected_rvtools_file
+                session["rvtools_file_info"] = rvtools_file_info
+                session["rvtools_import_summary"] = rvtools_import_summary
+                clear_step4_snapshot()
+            except Exception:
+                app.logger.exception("Stage 1 inventory post-persistence activation failed")
+                try:
+                    save_app_state(prior_app_state)
+                except Exception:
+                    app.logger.exception("Stage 1 inventory state rollback failed")
+                for key, (was_present, prior_value) in prior_session_values.items():
+                    if was_present:
+                        session[key] = prior_value
+                    else:
+                        session.pop(key, None)
+                selected_rvtools_file = prior_selected_file
+                rvtools_file_info = prior_file_info
+                rvtools_import_summary = prior_import_summary
+                rvtools_rejected_info = prior_rejected_info
+                try:
+                    if prior_step4_snapshot:
+                        save_step4_snapshot(prior_step4_snapshot)
+                    else:
+                        clear_step4_snapshot()
+                except Exception:
+                    app.logger.exception("Stage 1 inventory snapshot rollback failed")
+                cleanup_owned_inventory_candidate(
+                    path_text,
+                    owned_candidate_path,
+                    prior_selected_file,
+                )
+                field_errors[field_id] = "The inventory source could not be activated."
+                flash("Inventory source could not be activated. Your current inventory was kept.", "rvtools_error")
+                return False
+
             flash(success_message, "rvtools_success")
             return True
 
@@ -5897,24 +6015,6 @@ def index() -> str:
             else:
                 session.pop("customer_name", None)
                 flash("Customer name cleared.", "customer_success")
-
-        elif action == "save_identity":
-            customer_name = normalize_customer_name(request.form.get("customer_name", ""))
-            active_assessment_name = normalize_assessment_name(request.form.get("assessment_name", ""))
-            active_assessment_notes = normalize_assessment_notes(request.form.get("assessment_notes", ""))
-            if customer_name:
-                session["customer_name"] = customer_name
-            else:
-                session.pop("customer_name", None)
-            if active_assessment_name:
-                session["active_assessment_name"] = active_assessment_name
-            else:
-                session.pop("active_assessment_name", None)
-            if active_assessment_notes:
-                session["active_assessment_notes"] = active_assessment_notes
-            else:
-                session.pop("active_assessment_notes", None)
-            flash("Assessment identity updated.", "success")
 
         elif action == "save_assessment":
             if "customer_name" in request.form:
@@ -5928,8 +6028,9 @@ def index() -> str:
                     request.form.get("assessment_name", active_assessment_name),
                     request.form.get("assessment_notes", active_assessment_notes),
                 )
-            except Exception as exc:
-                flash(f"Assessment could not be saved: {exc}", "error")
+            except Exception:
+                app.logger.exception("Stage 1 assessment save failed")
+                flash("Assessment could not be saved. Try again.", "error")
             else:
                 active_assessment_id = str(saved_snapshot.get("id") or "")
                 active_assessment_name = normalize_assessment_name(saved_snapshot.get("name"))
@@ -5937,22 +6038,32 @@ def index() -> str:
                 flash("Assessment saved.", "success")
 
         elif action == "load_assessment":
-            result = load_saved_assessment(request.form.get("assessment_id", ""))
-            if result.get("ok"):
-                restored_inventory_path = str(session.get("selected_rvtools_file", ""))
-                inventory_mode = "manual" if is_manual_inventory_path(restored_inventory_path) else "upload"
-                flash("Assessment loaded.", "success")
-                for warning in result.get("warnings", []):
-                    flash(str(warning), "info")
+            try:
+                result = load_saved_assessment(request.form.get("assessment_id", ""))
+            except Exception:
+                app.logger.exception("Stage 1 assessment load failed")
+                flash("Saved assessment could not be loaded. Try again.", "error")
             else:
-                flash(str(result.get("message") or "Saved assessment could not be loaded."), "error")
+                if result.get("ok"):
+                    restored_inventory_path = str(session.get("selected_rvtools_file", ""))
+                    inventory_mode = "manual" if is_manual_inventory_path(restored_inventory_path) else "upload"
+                    flash("Assessment loaded.", "success")
+                    for warning in result.get("warnings", []):
+                        flash(str(warning), "info")
+                else:
+                    flash("Saved assessment could not be loaded.", "error")
 
         elif action == "delete_assessment":
-            result = delete_saved_assessment(request.form.get("assessment_id", ""))
-            if result.get("ok"):
-                flash("Assessment deleted.", "success")
+            try:
+                result = delete_saved_assessment(request.form.get("assessment_id", ""))
+            except Exception:
+                app.logger.exception("Stage 1 assessment delete failed")
+                flash("Saved assessment could not be deleted. Try again.", "error")
             else:
-                flash(str(result.get("message") or "Saved assessment could not be deleted."), "error")
+                if result.get("ok"):
+                    flash("Assessment deleted.", "success")
+                else:
+                    flash("Saved assessment could not be deleted.", "error")
 
         elif action == "download_pricing":
             selected_currency = request.form.get("currency_code", "USD").upper().strip()
@@ -5964,22 +6075,26 @@ def index() -> str:
 
             def use_local_price_list_fallback(_reason: str) -> bool:
                 nonlocal selected_pricelist_file, selected_pricelist_info
-                fallback_file = find_downloaded_price_list_for_currency(selected_currency)
-                if not fallback_file:
+                try:
+                    fallback_file = find_downloaded_price_list_for_currency(selected_currency)
+                    if not fallback_file:
+                        return False
+                    price_lookup_preview, fallback_currency, source_file = load_price_lookup(fallback_file)
+                    if not source_file:
+                        return False
+
+                    selected_pricelist_file = source_file
+                    session["selected_pricelist_file"] = source_file
+                    remember_price_list_selection(source_file, fallback_currency or selected_currency)
+                    selected_pricelist_info = {
+                        **build_source_file_info(source_file),
+                        "currency": fallback_currency or selected_currency,
+                        "item_count": len(price_lookup_preview),
+                    }
+                except Exception:
+                    app.logger.exception("Stage 1 pricing fallback failed")
                     return False
 
-                price_lookup_preview, fallback_currency, source_file = load_price_lookup(fallback_file)
-                if not source_file:
-                    return False
-
-                selected_pricelist_file = source_file
-                session["selected_pricelist_file"] = source_file
-                remember_price_list_selection(source_file, fallback_currency or selected_currency)
-                selected_pricelist_info = {
-                    **build_source_file_info(source_file),
-                    "currency": fallback_currency or selected_currency,
-                    "item_count": len(price_lookup_preview),
-                }
                 flash(
                     f"Live {selected_currency} price-list download did not complete. "
                     f"Using existing local {selected_currency} price list.",
@@ -6014,6 +6129,7 @@ def index() -> str:
                 payload = fetch_oci_price_list(selected_currency)
                 persist_downloaded_price_list(payload, "OCI price list downloaded successfully.", "pricing_success")
             except HTTPError as exc:
+                app.logger.exception("Stage 1 pricing download HTTP failure")
                 if not use_local_price_list_fallback(f"HTTP {exc.code}"):
                     field_errors["currency_code"] = "The latest price list could not be downloaded for this currency."
                     flash(
@@ -6021,30 +6137,35 @@ def index() -> str:
                         "pricing_error",
                     )
             except URLError as exc:
+                app.logger.exception("Stage 1 pricing download connection failure")
                 reason = getattr(exc, "reason", None)
-                detail = f" ({reason})" if reason else ""
                 guidance = ""
                 if reason and "CERTIFICATE_VERIFY_FAILED" in str(reason):
                     guidance = " Please install/update trusted CA certificates (or certifi)."
-                if not use_local_price_list_fallback(f"API timeout/connectivity issue{detail}"):
+                if not use_local_price_list_fallback("API timeout/connectivity issue"):
                     field_errors["currency_code"] = "The pricing service could not be reached for this currency."
                     flash(
                         "No price list was downloaded because the Oracle pricing API could not be reached "
-                        f"after several {PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS}-second attempts{detail}. "
+                        f"after several {PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS}-second attempts. "
                         f"No local {selected_currency} price list was found. Check internet/proxy access or select another existing local price list."
                         f"{guidance}",
                         "pricing_error",
                     )
-            except (TimeoutError, ValueError, json.JSONDecodeError) as exc:
-                if not use_local_price_list_fallback(str(exc)):
+            except (TimeoutError, ValueError, json.JSONDecodeError):
+                app.logger.exception("Stage 1 pricing response processing failed")
+                if not use_local_price_list_fallback("Pricing response processing failed"):
                     field_errors["currency_code"] = "The pricing response could not be processed for this currency."
                     flash(
-                        f"Could not process OCI pricing response: {exc}. No local {selected_currency} price list was found.",
+                        f"The OCI pricing response could not be processed. No local {selected_currency} price list was found.",
                         "pricing_error",
                     )
-            except Exception as exc:  # pragma: no cover - fallback guard
+            except Exception:  # pragma: no cover - fallback guard
+                app.logger.exception("Stage 1 pricing download failed")
                 field_errors["currency_code"] = "The latest price list could not be downloaded."
-                flash(f"Unexpected error: {exc}", "pricing_error")
+                flash(
+                    "The latest OCI price list could not be downloaded. Try again or use an existing local price list.",
+                    "pricing_error",
+                )
 
         elif action == "select_rvtools_file":
             inventory_mode = "upload"
@@ -6105,10 +6226,12 @@ def index() -> str:
                     try:
                         upload.save(target)
                     except Exception:
-                        try:
-                            target.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        app.logger.exception("Stage 1 inventory upload storage failed")
+                        cleanup_owned_inventory_candidate(
+                            target,
+                            target,
+                            selected_rvtools_file,
+                        )
                         field_errors["rvtools_upload"] = "The inventory file could not be stored."
                         flash("Inventory upload could not be stored. Your current inventory was kept.", "rvtools_error")
                     else:
@@ -6119,7 +6242,7 @@ def index() -> str:
                             candidate_info,
                             "VM inventory export file uploaded, selected, and validated successfully.",
                             field_id="rvtools_upload",
-                            delete_candidate_on_failure=True,
+                            owned_candidate_path=candidate_path,
                         )
 
         elif action == "create_manual_inventory":
@@ -6132,6 +6255,7 @@ def index() -> str:
                 field_errors[exc.field_id] = str(exc)
                 flash(str(exc), "rvtools_error")
             except Exception:
+                app.logger.exception("Stage 1 manual inventory generation failed")
                 field_errors["manual_vm_count"] = "The manual summary could not be created."
                 flash("Manual workload summary could not be created. Your current inventory was kept.", "rvtools_error")
             else:
@@ -6142,7 +6266,7 @@ def index() -> str:
                     build_source_file_info(manual_candidate_path),
                     f"Manual workload summary {action_word}.",
                     field_id="manual_vm_count",
-                    delete_candidate_on_failure=True,
+                    owned_candidate_path=manual_candidate_path,
                     select_all_rows=True,
                 )
 
@@ -6160,13 +6284,19 @@ def index() -> str:
                     field_errors["price_list_file"] = "The selected OCI price list is no longer available."
                     flash("Selected OCI price list file is not available anymore.", "pricing_error")
                 else:
-                    session["selected_pricelist_file"] = chosen_price_file
-                    _, chosen_currency, _ = load_price_lookup(chosen_price_file)
-                    if chosen_currency:
-                        selected_currency = chosen_currency.upper().strip()
-                        session["selected_currency"] = selected_currency
-                    remember_price_list_selection(chosen_price_file, chosen_currency)
-                    flash("OCI price list file selected.", "pricing_success")
+                    try:
+                        _, chosen_currency, _ = load_price_lookup(chosen_price_file)
+                        remember_price_list_selection(chosen_price_file, chosen_currency)
+                    except Exception:
+                        app.logger.exception("Stage 1 local pricing selection failed")
+                        field_errors["price_list_file"] = "The selected OCI price list could not be used."
+                        flash("The selected OCI price list could not be used. Try another local price list.", "pricing_error")
+                    else:
+                        session["selected_pricelist_file"] = chosen_price_file
+                        if chosen_currency:
+                            selected_currency = chosen_currency.upper().strip()
+                            session["selected_currency"] = selected_currency
+                        flash("OCI price list file selected.", "pricing_success")
 
         downloaded_price_lists = list_downloaded_price_lists()
         rvtools_files = list_rvtools_export_files()

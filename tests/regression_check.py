@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import json
 import re
@@ -398,34 +399,61 @@ def validate_catalog_choice_tokens() -> None:
         app_module.RVTOOLS_DIR / "duplicate-source-a" / duplicate_name,
         app_module.RVTOOLS_DIR / "duplicate-source-b" / duplicate_name,
     ]
+    inserted_file = app_module.RVTOOLS_DIR / "000-inserted-source" / "inserted_inventory.csv"
     for duplicate_file in duplicate_files:
         duplicate_file.parent.mkdir(parents=True, exist_ok=True)
         duplicate_file.write_bytes(CSV_INVENTORY.read_bytes())
 
+    def expected_token(path_text: str) -> str:
+        normalized = str(path_text).strip().replace("\\", "/")
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+        return f"catalog-{digest}"
+
     try:
-        inventory_paths = app_module.list_rvtools_export_files()
+        initial_inventory_paths = app_module.list_rvtools_export_files()
         duplicate_paths = [
-            path_text for path_text in inventory_paths if Path(path_text).name == duplicate_name
+            path_text for path_text in initial_inventory_paths if Path(path_text).name == duplicate_name
         ]
-        inventory_choices = app_module.build_catalog_choices(inventory_paths, "inventory")
-        expected_inventory_tokens = [f"catalog-{index}" for index in range(len(inventory_paths))]
-        inventory_tokens = [choice.get("token", "") for choice in inventory_choices]
-        token_by_path = {
+        initial_inventory_choices = app_module.build_catalog_choices(initial_inventory_paths, "inventory")
+        initial_token_by_path = {
             str(choice.get("file_path", "")): str(choice.get("token", ""))
-            for choice in inventory_choices
+            for choice in initial_inventory_choices
         }
         expected_duplicate_tokens = {
-            path_text: f"catalog-{inventory_paths.index(path_text)}"
+            path_text: expected_token(path_text)
             for path_text in duplicate_paths
         }
+
+        inserted_file.parent.mkdir(parents=True, exist_ok=True)
+        inserted_file.write_bytes(CSV_INVENTORY.read_bytes())
+        inventory_paths = app_module.list_rvtools_export_files()
+        reordered_inventory_choices = app_module.build_catalog_choices(inventory_paths, "inventory")
+        reordered_token_by_path = {
+            str(choice.get("file_path", "")): str(choice.get("token", ""))
+            for choice in reordered_inventory_choices
+        }
+        expected_inventory_tokens = [expected_token(path_text) for path_text in inventory_paths]
+        inventory_tokens = [choice.get("token", "") for choice in reordered_inventory_choices]
         duplicate_token_resolutions = {
             path_text: app_module.resolve_catalog_selection(token, inventory_paths)
             for path_text, token in expected_duplicate_tokens.items()
         }
+        removed_path = duplicate_paths[0] if duplicate_paths else ""
+        removed_path_result = app_module.resolve_catalog_selection(
+            expected_duplicate_tokens.get(removed_path, ""),
+            [path_text for path_text in inventory_paths if path_text != removed_path],
+        )
+        tampered_token = ""
+        tampered_result = ""
+        if duplicate_paths:
+            original_token = expected_duplicate_tokens[duplicate_paths[0]]
+            replacement = "0" if original_token[-1] != "0" else "1"
+            tampered_token = f"{original_token[:-1]}{replacement}"
+            tampered_result = app_module.resolve_catalog_selection(tampered_token, inventory_paths)
 
         price_paths = app_module.list_downloaded_price_lists()[: app_module.MAX_VISIBLE_PRICE_LISTS]
         price_choices = app_module.build_catalog_choices(price_paths, "pricing")
-        expected_price_tokens = [f"catalog-{index}" for index in range(len(price_paths))]
+        expected_price_tokens = [expected_token(path_text) for path_text in price_paths]
         price_tokens = [choice.get("token", "") for choice in price_choices]
 
         malformed_tokens = [
@@ -433,8 +461,9 @@ def validate_catalog_choice_tokens() -> None:
             "catalog-x",
             "catalog--1",
             "catalog-01",
-            f"catalog-{len(inventory_paths)}",
-            "catalog-999999",
+            "catalog-0123456789abcdef0123456",
+            "catalog-0123456789abcdef012345678",
+            "catalog-0123456789ABCDEF01234567",
         ]
         malformed_results = {
             token: app_module.resolve_catalog_selection(token, inventory_paths)
@@ -450,6 +479,12 @@ def validate_catalog_choice_tokens() -> None:
         )
         duplicate_basename_result = app_module.resolve_catalog_selection(
             duplicate_name,
+            inventory_paths,
+        )
+        outside_path = "/private/tmp/outside-allowlist/shared_catalog_inventory.csv"
+        outside_exact_result = app_module.resolve_catalog_selection(outside_path, inventory_paths)
+        outside_basename_result = app_module.resolve_catalog_selection(
+            "outside_inventory.csv",
             inventory_paths,
         )
 
@@ -498,13 +533,18 @@ def validate_catalog_choice_tokens() -> None:
         token_contract = (
             len(duplicate_paths) == 2
             and inventory_tokens == expected_inventory_tokens
-            and all(token_by_path.get(path_text) == token for path_text, token in expected_duplicate_tokens.items())
+            and all(initial_token_by_path.get(path_text) == token for path_text, token in expected_duplicate_tokens.items())
+            and all(reordered_token_by_path.get(path_text) == token for path_text, token in expected_duplicate_tokens.items())
             and duplicate_token_resolutions == {path_text: path_text for path_text in duplicate_paths}
+            and removed_path_result == ""
+            and tampered_result == ""
             and price_tokens == expected_price_tokens
             and all(result == "" for result in malformed_results.values())
             and exact_path_results == {path_text: path_text for path_text in duplicate_paths}
             and unique_basename_result == str(CSV_INVENTORY).replace("\\", "/")
             and duplicate_basename_result == ""
+            and outside_exact_result == ""
+            and outside_basename_result == ""
             and all(token in inventory_option_values for token in expected_duplicate_tokens.values())
             and duplicate_name not in inventory_option_values
             and all(path_text not in inventory_option_values for path_text in duplicate_paths)
@@ -520,8 +560,15 @@ def validate_catalog_choice_tokens() -> None:
                 {
                     "inventory_tokens": inventory_tokens,
                     "expected_inventory_tokens": expected_inventory_tokens,
+                    "initial_token_by_path": initial_token_by_path,
+                    "reordered_token_by_path": reordered_token_by_path,
                     "duplicate_token_resolutions": duplicate_token_resolutions,
+                    "removed_path_result": removed_path_result,
+                    "tampered_token": tampered_token,
+                    "tampered_result": tampered_result,
                     "malformed_results": malformed_results,
+                    "outside_exact_result": outside_exact_result,
+                    "outside_basename_result": outside_basename_result,
                     "inventory_option_values": inventory_option_values,
                     "duplicate_route_results": duplicate_route_results,
                     "price_tokens": price_tokens,
@@ -533,12 +580,346 @@ def validate_catalog_choice_tokens() -> None:
             ),
         )
     finally:
-        for duplicate_file in duplicate_files:
-            duplicate_file.unlink(missing_ok=True)
+        for temporary_file in [*duplicate_files, inserted_file]:
+            temporary_file.unlink(missing_ok=True)
             try:
-                duplicate_file.parent.rmdir()
+                temporary_file.parent.rmdir()
             except OSError:
                 pass
+
+
+def validate_atomic_app_state_write() -> None:
+    state_id = f"atomic_state_{uuid4().hex}"
+    secret_path = "/private/tmp/private-state/atomic-state.json"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        original_state = app_module._default_app_state()
+        original_state["selected_vm_names"] = ["original-vm"]
+        app_module.save_app_state(original_state)
+        state_file = app_module._state_file_path()
+        original_bytes = state_file.read_bytes()
+
+        original_replace = app_module.os.replace
+        replace_sources: list[str] = []
+
+        def reject_atomic_replace(source: object, destination: object) -> None:
+            replace_sources.append(str(source))
+            raise OSError(secret_path)
+
+        app_module.os.replace = reject_atomic_replace
+        raised = ""
+        try:
+            replacement_state = app_module._default_app_state()
+            replacement_state["selected_vm_names"] = ["replacement-vm"]
+            try:
+                app_module.save_app_state(replacement_state)
+            except OSError as exc:
+                raised = str(exc)
+        finally:
+            app_module.os.replace = original_replace
+
+        temporary_files = list(state_file.parent.glob(f".{state_file.name}.*.tmp"))
+        check(
+            "app state writes are atomic and clean failed temporary files",
+            bool(raised)
+            and secret_path in raised
+            and bool(replace_sources)
+            and state_file.read_bytes() == original_bytes
+            and not temporary_files,
+            f"raised={raised!r}, replace_sources={replace_sources}, temporary_files={temporary_files}",
+        )
+
+
+def validate_transactional_inventory_activation() -> None:
+    secret_path = "/private/tmp/private-state/activation-state.json"
+    candidate_name = f"transaction_candidate_{uuid4().hex}.csv"
+    candidate_path = app_module.RVTOOLS_DIR / candidate_name
+    preserved_keys = [
+        "active_assessment_id",
+        "active_assessment_name",
+        "active_assessment_notes",
+        "selected_pricelist_file",
+        "selected_currency",
+        "selected_rvtools_file",
+        "rvtools_file_info",
+        "rvtools_import_summary",
+    ]
+
+    with app_module.app.test_client() as client:
+        client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "3",
+                "manual_total_vcpus": "12",
+                "manual_total_memory_gb": "48",
+                "manual_total_storage_gb": "600",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "1",
+            },
+        )
+        with client.session_transaction() as sess:
+            sess["active_assessment_id"] = "transaction-preserved"
+            sess["active_assessment_name"] = "Transaction preserved"
+            sess["active_assessment_notes"] = "Keep this identity."
+            sess["selected_pricelist_file"] = find_price_file()
+            sess["selected_currency"] = "EUR"
+            state_id = str(sess.get("state_id", ""))
+            prior_source = str(sess.get("selected_rvtools_file", ""))
+            prior_session = json.loads(json.dumps({key: sess.get(key) for key in preserved_keys}))
+
+        prior_state = app_module.load_app_state()
+        prior_state["selected_vm_names"] = ["manual-vm-001", "manual-vm-003"]
+        prior_state["step4_hybrid_placements"] = {
+            "manual-vm-001": "native",
+            "manual-vm-003": "ocvs",
+        }
+        app_module.save_app_state(prior_state)
+        prior_state = app_module.load_app_state()
+        state_file = app_module.APP_STATE_DIR / f"{state_id}.json"
+        prior_state_bytes = state_file.read_bytes()
+        prior_source_bytes = Path(prior_source).read_bytes()
+
+        original_save_app_state = app_module.save_app_state
+
+        def reject_replacement_state(_state: dict[str, object]) -> None:
+            raise OSError(secret_path)
+
+        app_module.save_app_state = reject_replacement_state
+        response = None
+        raised = ""
+        try:
+            try:
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "upload_rvtools_file",
+                        "inventory_mode": "upload",
+                        "rvtools_upload": (BytesIO(CSV_INVENTORY.read_bytes()), candidate_name),
+                    },
+                    content_type="multipart/form-data",
+                )
+            except OSError as exc:
+                raised = str(exc)
+        finally:
+            app_module.save_app_state = original_save_app_state
+
+        with client.session_transaction() as sess:
+            session_after = json.loads(json.dumps({key: sess.get(key) for key in preserved_keys}))
+        state_after = app_module.load_app_state()
+        visible_text = visible_text_outside_details(response.data) if response is not None else ""
+        check(
+            "inventory activation rolls back when app state persistence fails",
+            response is not None
+            and response.status_code == 200
+            and not raised
+            and session_after == prior_session
+            and state_after == prior_state
+            and state_file.read_bytes() == prior_state_bytes
+            and Path(prior_source).read_bytes() == prior_source_bytes
+            and not candidate_path.exists()
+            and secret_path not in visible_text
+            and Path(secret_path).name not in visible_text
+            and "Inventory source could not be activated" in visible_text,
+            json.dumps(
+                {
+                    "response_status": response.status_code if response is not None else None,
+                    "raised": raised,
+                    "session_after": session_after,
+                    "candidate_exists": candidate_path.exists(),
+                    "visible_text": visible_text,
+                },
+                sort_keys=True,
+            ),
+        )
+
+
+def validate_owned_candidate_cleanup_protection() -> None:
+    with app_module.app.test_client() as client:
+        client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "3",
+                "manual_total_vcpus": "12",
+                "manual_total_memory_gb": "48",
+                "manual_total_storage_gb": "600",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "1",
+            },
+        )
+        with client.session_transaction() as sess:
+            active_manual_path = str(sess.get("selected_rvtools_file", ""))
+        active_manual_file = Path(active_manual_path)
+        active_manual_bytes = active_manual_file.read_bytes()
+
+        original_manual_generator = app_module.create_manual_inventory_csv_from_form
+        original_summary_builder = app_module.build_inventory_import_summary
+
+        def return_active_manual_source() -> tuple[Path, list[str]]:
+            return active_manual_file, []
+
+        def reject_active_manual_source(_rows: list[dict[str, object]], _source: str) -> dict[str, object]:
+            raise ValueError("Injected active-source validation failure")
+
+        app_module.create_manual_inventory_csv_from_form = return_active_manual_source
+        app_module.build_inventory_import_summary = reject_active_manual_source
+        try:
+            response = client.post(
+                "/",
+                data={
+                    "action": "create_manual_inventory",
+                    "inventory_mode": "manual",
+                    "manual_vm_count": "3",
+                    "manual_total_vcpus": "12",
+                    "manual_total_memory_gb": "48",
+                    "manual_total_storage_gb": "600",
+                    "manual_supported_vm_count": "2",
+                    "manual_unsupported_vm_count": "1",
+                },
+            )
+        finally:
+            app_module.create_manual_inventory_csv_from_form = original_manual_generator
+            app_module.build_inventory_import_summary = original_summary_builder
+
+        active_exists_after_failure = active_manual_file.exists()
+        active_bytes_after_failure = active_manual_file.read_bytes() if active_exists_after_failure else b""
+        with client.session_transaction() as sess:
+            selected_after_failure = str(sess.get("selected_rvtools_file", ""))
+
+        if not active_manual_file.exists():
+            active_manual_file.parent.mkdir(parents=True, exist_ok=True)
+            active_manual_file.write_bytes(active_manual_bytes)
+
+        catalog_bytes = CSV_INVENTORY.read_bytes()
+        app_module.build_inventory_import_summary = reject_active_manual_source
+        try:
+            client.post(
+                "/",
+                data={
+                    "action": "select_rvtools_file",
+                    "inventory_mode": "upload",
+                    "rvtools_file": str(CSV_INVENTORY),
+                },
+            )
+            catalog_preserved = CSV_INVENTORY.exists() and CSV_INVENTORY.read_bytes() == catalog_bytes
+            client.post(
+                "/",
+                data={
+                    "action": "upload_rvtools_file",
+                    "inventory_mode": "upload",
+                    "rvtools_upload": (BytesIO(catalog_bytes), CSV_INVENTORY.name),
+                },
+                content_type="multipart/form-data",
+            )
+            reused_upload_preserved = CSV_INVENTORY.exists() and CSV_INVENTORY.read_bytes() == catalog_bytes
+        finally:
+            app_module.build_inventory_import_summary = original_summary_builder
+
+        check(
+            "owned candidate cleanup never deletes the active or reused source",
+            response.status_code == 200
+            and active_exists_after_failure
+            and active_bytes_after_failure == active_manual_bytes
+            and selected_after_failure == active_manual_path
+            and catalog_preserved
+            and reused_upload_preserved,
+            (
+                f"active_exists={active_exists_after_failure}, selected={selected_after_failure}, "
+                f"catalog_preserved={catalog_preserved}, reused_preserved={reused_upload_preserved}"
+            ),
+        )
+
+
+def validate_stage1_safe_exception_messages() -> None:
+    secret_paths = {
+        "save": "/private/tmp/private-assessments/customer-alpha.json",
+        "load": "/private/tmp/private-assessments/customer-load.json",
+        "delete": "/private/tmp/private-assessments/customer-delete.json",
+        "pricing": "/private/tmp/private-pricing/oci_pricing_EUR_private.json",
+    }
+    cases = [
+        (
+            "save",
+            "save_current_assessment",
+            {"action": "save_assessment", "assessment_name": "Safe failure", "assessment_notes": ""},
+            "Assessment could not be saved. Try again.",
+            "Stage 1 assessment save failed",
+        ),
+        (
+            "load",
+            "load_saved_assessment",
+            {"action": "load_assessment", "assessment_id": "safe_failure"},
+            "Saved assessment could not be loaded. Try again.",
+            "Stage 1 assessment load failed",
+        ),
+        (
+            "delete",
+            "delete_saved_assessment",
+            {"action": "delete_assessment", "assessment_id": "safe_failure"},
+            "Saved assessment could not be deleted. Try again.",
+            "Stage 1 assessment delete failed",
+        ),
+        (
+            "pricing",
+            "fetch_oci_price_list",
+            {"action": "download_pricing", "currency_code": "EUR"},
+            "The latest OCI price list could not be downloaded. Try again or use an existing local price list.",
+            "Stage 1 pricing download failed",
+        ),
+    ]
+    outcomes: dict[str, dict[str, object]] = {}
+    logged_messages: list[str] = []
+    original_logger_exception = app_module.app.logger.exception
+    app_module.app.logger.exception = lambda message, *args, **kwargs: logged_messages.append(str(message))
+    try:
+        for case_name, attribute_name, form_data, expected_message, expected_log in cases:
+            original = getattr(app_module, attribute_name)
+
+            def raise_private_path(*_args: object, _path: str = secret_paths[case_name], **_kwargs: object) -> None:
+                raise OSError(_path)
+
+            setattr(app_module, attribute_name, raise_private_path)
+            response = None
+            raised = ""
+            try:
+                with app_module.app.test_client() as client:
+                    try:
+                        response = client.post("/", data=form_data)
+                    except OSError as exc:
+                        raised = str(exc)
+            finally:
+                setattr(app_module, attribute_name, original)
+
+            visible_text = visible_text_outside_details(response.data) if response is not None else ""
+            outcomes[case_name] = {
+                "status": response.status_code if response is not None else None,
+                "raised": raised,
+                "safe": expected_message in visible_text,
+                "path_hidden": secret_paths[case_name] not in visible_text,
+                "basename_hidden": Path(secret_paths[case_name]).name not in visible_text,
+                "logged": expected_log in logged_messages,
+            }
+    finally:
+        app_module.app.logger.exception = original_logger_exception
+
+    app_source = (ROOT / "app.py").read_text(encoding="utf-8")
+    check(
+        "Stage 1 exception flashes hide filesystem details and log failures",
+        all(
+            outcome.get("status") == 200
+            and not outcome.get("raised")
+            and outcome.get("safe")
+            and outcome.get("path_hidden")
+            and outcome.get("basename_hidden")
+            and outcome.get("logged")
+            for outcome in outcomes.values()
+        )
+        and 'elif action == "save_identity":' not in app_source,
+        json.dumps({"outcomes": outcomes, "logged_messages": logged_messages}, sort_keys=True),
+    )
 
 
 def validate_workspace_context_contracts() -> None:
@@ -771,7 +1152,11 @@ def validate_price_list_dropdown_policy() -> None:
         response = client.get("/")
         html = response.data.decode("utf-8")
         price_select = re.search(r'<select[^>]*id="price_list_file".*?</select>', html, re.S)
-        price_option_count = len(re.findall(r'<option value="catalog-\d+"', price_select.group(0))) if price_select else 0
+        price_option_count = (
+            len(re.findall(r'<option value="catalog-[0-9a-f]{24}"', price_select.group(0)))
+            if price_select
+            else 0
+        )
         check("price list dropdown capped at 10", price_option_count == 10, str(price_option_count))
         check(
             "currency list EMEA plus USD",
@@ -2291,6 +2676,10 @@ def main() -> None:
     validate_unsupported_currency_workspace_shell()
     validate_pricing_fallback_filename_concealment()
     validate_catalog_choice_tokens()
+    validate_atomic_app_state_write()
+    validate_transactional_inventory_activation()
+    validate_owned_candidate_cleanup_protection()
+    validate_stage1_safe_exception_messages()
     validate_shared_workspace_shell()
     validate_stage1_setup_redesign()
     validate_stage1_identity_save_and_loaded_manual_mode()
