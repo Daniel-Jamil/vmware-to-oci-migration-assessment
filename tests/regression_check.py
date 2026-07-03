@@ -2104,9 +2104,6 @@ def validate_guided_inventory_review() -> None:
                     ("included_vm_names", "review-unknown"),
                     ("included_vm_names", "review-unsupported"),
                     ("included_vm_names", "review-supported"),
-                    ("placement:review-unknown", "review"),
-                    ("placement:review-unsupported", "ocvs"),
-                    ("placement:review-supported", "native"),
                     ("acknowledged_warning_ids", "unknown-os"),
                     ("acknowledged_warning_ids", "unsupported-native"),
                     ("acknowledged_warning_ids", "missing-storage"),
@@ -2246,7 +2243,6 @@ def validate_guided_inventory_review() -> None:
                 [
                     ("action", "save_inventory_review"),
                     ("included_vm_names", "unknown-only-vm"),
-                    ("placement:unknown-only-vm", "review"),
                     ("acknowledged_warning_ids", "unknown-os"),
                 ]
             ),
@@ -2281,7 +2277,7 @@ def validate_guided_inventory_review() -> None:
         f"status={response.status_code}",
     )
 
-    client, _ = inventory_client(INVENTORY_REVIEW_INVENTORY)
+    client, critical_state_id = inventory_client(INVENTORY_REVIEW_INVENTORY)
     response = client.post(
         "/step3",
         data=MultiDict(
@@ -2295,10 +2291,17 @@ def validate_guided_inventory_review() -> None:
             ]
         ),
     )
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = critical_state_id
+        critical_blocked_state = app_module.load_app_state()
     check(
-        "inventory review continue blocks critical issues",
-        response.status_code == 200 and b"Resolve critical inventory issues" in response.data,
-        f"status={response.status_code}",
+        "inventory review persists valid state while critical issues block Continue",
+        response.status_code == 200
+        and b"Resolve critical inventory issues" in response.data
+        and critical_blocked_state.get("selected_vm_names") == ["review-supported"]
+        and critical_blocked_state.get("step4_hybrid_placements") == {"review-supported": "native"}
+        and critical_blocked_state.get("acknowledged_warning_ids") == ["unsupported-native", "unknown-os"],
+        f"status={response.status_code}, state={critical_blocked_state}",
     )
 
     client, _ = inventory_client(CSV_INVENTORY)
@@ -2429,7 +2432,6 @@ def validate_inventory_review_transactions_and_step4_boundary() -> None:
             ("included_vm_names", "vm-app-01"),
             ("placement:vm-app-01", "elsewhere"),
         ],
-        "missing included placement": [("included_vm_names", "vm-app-01")],
         "placement outside included scope": [
             ("included_vm_names", "vm-app-01"),
             ("placement:vm-app-01", "native"),
@@ -2465,12 +2467,15 @@ def validate_inventory_review_transactions_and_step4_boundary() -> None:
     )
     state_after_not_ready = read_state(state_id)
     check(
-        "inventory review unready Continue preserves prior state",
+        "inventory review persists valid state while advisories block Continue",
         response.status_code == 200
         and b"Acknowledge advisory warnings" in response.data
-        and state_after_not_ready == prior_state,
+        and state_after_not_ready.get("selected_vm_names") == ["vm-db-01"]
+        and state_after_not_ready.get("step4_hybrid_placements") == {"vm-db-01": "native"}
+        and state_after_not_ready.get("acknowledged_warning_ids") == [],
         str(state_after_not_ready),
     )
+    state_before_save_failure = state_after_not_ready
 
     original_save_app_state = app_module.save_app_state
 
@@ -2498,7 +2503,7 @@ def validate_inventory_review_transactions_and_step4_boundary() -> None:
         response.status_code == 200
         and b"could not be saved" in response.data.lower()
         and b"private-stage2-state" not in response.data
-        and state_after_failure == prior_state,
+        and state_after_failure == state_before_save_failure,
         str(state_after_failure),
     )
 

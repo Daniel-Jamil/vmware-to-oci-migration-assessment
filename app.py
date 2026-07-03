@@ -2441,6 +2441,7 @@ def parse_exact_placement_fields(
     prefix: str,
     expected_vm_names: list[str],
     known_vm_names: list[str],
+    missing_defaults: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     expected_set = set(expected_vm_names)
     known_fields = {
@@ -2479,6 +2480,12 @@ def parse_exact_placement_fields(
     if outside_scope:
         add_error("Placements may only be submitted for included VMs.")
     missing = expected_set - set(parsed)
+    if missing_defaults is not None:
+        for vm_name in missing:
+            default_placement = str(missing_defaults.get(vm_name, "")).strip().lower()
+            if default_placement in HYBRID_PLACEMENT_VALUES:
+                parsed[vm_name] = default_placement
+        missing = expected_set - set(parsed)
     if missing:
         add_error("Choose a valid placement for every included VM.")
         for vm_name in missing:
@@ -6563,6 +6570,10 @@ def step3() -> str:
                 "placement",
                 candidate_names,
                 list(vm_index),
+                {
+                    vm_name: default_inventory_placement(vm_index[vm_name], supported_signatures)
+                    for vm_name in candidate_names
+                },
             )
             inventory_errors.extend(keyed_errors)
 
@@ -6577,11 +6588,6 @@ def step3() -> str:
             candidate_state["step4_hybrid_placements"] = candidate_placements
             candidate_state["acknowledged_warning_ids"] = acknowledged_warning_ids
             continue_to_scenarios = request.form.get("continue_to_scenarios") == "1"
-            if continue_to_scenarios and not inventory_errors:
-                inventory_errors.extend(
-                    inventory_review_readiness_errors(all_vms, candidate_state, inventory_issues)
-                )
-
             if not inventory_errors:
                 try:
                     save_app_state(candidate_state)
@@ -6594,7 +6600,15 @@ def step3() -> str:
                     app_state = candidate_state
                     selected_vm_names = candidate_names
                     if continue_to_scenarios:
-                        return redirect(url_for("step4", tab="native"))
+                        readiness_errors = inventory_review_readiness_errors(
+                            all_vms,
+                            candidate_state,
+                            inventory_issues,
+                        )
+                        if readiness_errors:
+                            inventory_errors.extend(readiness_errors)
+                        else:
+                            return redirect(url_for("step4", tab="native"))
         else:
             chosen_vm_names = request.form.getlist("vm_names")
             single_vm_name = str(request.form.get("vm_name") or "").strip()
