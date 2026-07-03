@@ -18,6 +18,7 @@ desktop.ini
 # Project temp runtime state
 .codex_snapshots/
 .superpowers/
+.worktrees/
 downloads/app_state/
 downloads/exports/
 *.zip
