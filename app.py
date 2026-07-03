@@ -2444,6 +2444,141 @@ def normalize_step4_scenario_tab(value: Any, default: str = "paths") -> str:
     return tab if tab in {"paths", "native", "ocvs", "hybrid", "price"} else default
 
 
+WORKSPACE_STAGE_MAP = {
+    "setup": {
+        "number": 1,
+        "name": "Setup & Inventory",
+        "endpoint": "index",
+        "url_values": {},
+        "previous_stage": "",
+        "continue_stage": "inventory",
+    },
+    "inventory": {
+        "number": 2,
+        "name": "Inventory Review",
+        "endpoint": "step3",
+        "url_values": {},
+        "previous_stage": "setup",
+        "continue_stage": "scenarios",
+    },
+    "scenarios": {
+        "number": 3,
+        "name": "Scenario Configuration",
+        "endpoint": "step4",
+        "url_values": {"tab": "native"},
+        "previous_stage": "inventory",
+        "continue_stage": "results",
+    },
+    "results": {
+        "number": 4,
+        "name": "Results & Export",
+        "endpoint": "step4",
+        "url_values": {"tab": "price"},
+        "previous_stage": "scenarios",
+        "continue_stage": "",
+    },
+}
+
+
+def build_workspace_context(
+    stage_id: str,
+    readiness: dict[str, Any] | None = None,
+    **values: Any,
+) -> dict[str, Any]:
+    """Adapt route values to the shared four-stage workspace shell."""
+    if stage_id not in WORKSPACE_STAGE_MAP:
+        raise ValueError(f"Unknown workspace stage: {stage_id}")
+
+    workspace_readiness: dict[str, Any] = {
+        "state": "not_started",
+        "blockers": [],
+        "advisories": [],
+        "stages": {},
+    }
+    if isinstance(readiness, dict):
+        workspace_readiness.update(readiness)
+    for collection_name in ("blockers", "advisories"):
+        if not isinstance(workspace_readiness.get(collection_name), (list, tuple)):
+            workspace_readiness[collection_name] = []
+    if not isinstance(workspace_readiness.get("stages"), dict):
+        workspace_readiness["stages"] = {}
+
+    stage_status_labels = {
+        "available": "Available",
+        "not_started": "Not started",
+        "needs_attention": "Needs attention",
+        "ready": "Ready",
+        "complete": "Complete",
+        "incomplete": "Incomplete",
+        "blocked": "Blocked",
+    }
+    readiness_stages = workspace_readiness["stages"]
+    workspace_stages: list[dict[str, Any]] = []
+    for mapped_id, mapped_stage in WORKSPACE_STAGE_MAP.items():
+        mapped_readiness = readiness_stages.get(mapped_id, {})
+        if isinstance(mapped_readiness, dict):
+            mapped_status = str(mapped_readiness.get("state", "available"))
+        elif isinstance(mapped_readiness, str):
+            mapped_status = mapped_readiness
+        else:
+            mapped_status = "available"
+        if mapped_status not in stage_status_labels:
+            mapped_status = "available"
+        is_current = mapped_id == stage_id
+        status_label = stage_status_labels[mapped_status]
+        if not is_current and mapped_status == "available":
+            status_label = "Next step" if int(mapped_stage["number"]) == int(WORKSPACE_STAGE_MAP[stage_id]["number"]) + 1 else "Available later"
+        workspace_stages.append(
+            {
+                "id": mapped_id,
+                "number": mapped_stage["number"],
+                "name": mapped_stage["name"],
+                "url": url_for(mapped_stage["endpoint"], **mapped_stage["url_values"]),
+                "is_current": is_current,
+                "status": "current" if is_current else mapped_status,
+                "status_label": "Current stage" if is_current else status_label,
+            }
+        )
+
+    stage = WORKSPACE_STAGE_MAP[stage_id]
+    previous_id = str(stage["previous_stage"])
+    continue_id = str(stage["continue_stage"])
+    previous_url = ""
+    continue_url = ""
+    if previous_id:
+        previous_stage = WORKSPACE_STAGE_MAP[previous_id]
+        previous_url = url_for(previous_stage["endpoint"], **previous_stage["url_values"])
+    if continue_id:
+        continue_stage = WORKSPACE_STAGE_MAP[continue_id]
+        continue_url = url_for(continue_stage["endpoint"], **continue_stage["url_values"])
+
+    assessment_name = normalize_assessment_name(
+        values.get("active_assessment_name", session.get("active_assessment_name", ""))
+    )
+    customer_name = normalize_customer_name(values.get("customer_name", session.get("customer_name", "")))
+    active_assessment_id = _clean_assessment_id(
+        values.get("active_assessment_id", session.get("active_assessment_id", ""))
+    )
+
+    context = dict(values)
+    context.update(
+        {
+            "workspace_stage": stage_id,
+            "workspace_stage_number": stage["number"],
+            "workspace_stage_count": len(WORKSPACE_STAGE_MAP),
+            "workspace_stage_name": stage["name"],
+            "workspace_stages": workspace_stages,
+            "workspace_readiness": workspace_readiness,
+            "workspace_assessment_name": assessment_name or "Untitled assessment",
+            "workspace_customer_name": customer_name or "Customer not set",
+            "workspace_is_saved": bool(active_assessment_id),
+            "workspace_previous_url": previous_url,
+            "workspace_continue_url": continue_url,
+        }
+    )
+    return context
+
+
 def step4_tab_redirect(tab: str = "paths") -> str:
     normalized_tab = normalize_step4_scenario_tab(tab)
     return f"{url_for('step4', tab=normalized_tab)}#scenario-{normalized_tab}"
@@ -5857,25 +5992,28 @@ def index() -> str:
 
     return render_template(
         "index.html",
-        currencies=SUPPORTED_CURRENCIES,
-        selected_currency=selected_currency,
-        download_info=download_info,
-        downloaded_price_lists=downloaded_price_lists,
-        price_list_options=price_list_options,
-        selected_pricelist_file=selected_pricelist_file,
-        selected_pricelist_info=selected_pricelist_info,
-        rvtools_files=rvtools_files,
-        selected_rvtools_file=selected_rvtools_file,
-        rvtools_file_info=rvtools_file_info,
-        rvtools_import_summary=rvtools_import_summary,
-        rvtools_rejected_info=rvtools_rejected_info,
-        customer_name=customer_name,
-        manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
-        inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
-        saved_assessments=list_saved_assessments(),
-        active_assessment_id=active_assessment_id,
-        active_assessment_name=active_assessment_name,
-        active_assessment_notes=active_assessment_notes,
+        **build_workspace_context(
+            "setup",
+            currencies=SUPPORTED_CURRENCIES,
+            selected_currency=selected_currency,
+            download_info=download_info,
+            downloaded_price_lists=downloaded_price_lists,
+            price_list_options=price_list_options,
+            selected_pricelist_file=selected_pricelist_file,
+            selected_pricelist_info=selected_pricelist_info,
+            rvtools_files=rvtools_files,
+            selected_rvtools_file=selected_rvtools_file,
+            rvtools_file_info=rvtools_file_info,
+            rvtools_import_summary=rvtools_import_summary,
+            rvtools_rejected_info=rvtools_rejected_info,
+            customer_name=customer_name,
+            manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
+            inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
+            saved_assessments=list_saved_assessments(),
+            active_assessment_id=active_assessment_id,
+            active_assessment_name=active_assessment_name,
+            active_assessment_notes=active_assessment_notes,
+        ),
     )
 
 
@@ -6030,20 +6168,23 @@ def step3() -> str:
 
     return render_template(
         "step3.html",
-        selected_rvtools_file=selected_rvtools_file,
-        source_vinfo_csv=source_vinfo_csv,
-        available_vms=available_vms,
-        selected_vms=selected_vms,
-        available_summary=available_summary,
-        selected_summary=selected_summary,
-        available_os_filter=available_os_filter,
-        selected_os_filter=selected_os_filter,
-        available_power_filter=available_power_filter,
-        selected_power_filter=selected_power_filter,
-        available_os_options=available_os_options,
-        selected_os_options=selected_os_options,
-        available_power_options=available_power_options,
-        selected_power_options=selected_power_options,
+        **build_workspace_context(
+            "inventory",
+            selected_rvtools_file=selected_rvtools_file,
+            source_vinfo_csv=source_vinfo_csv,
+            available_vms=available_vms,
+            selected_vms=selected_vms,
+            available_summary=available_summary,
+            selected_summary=selected_summary,
+            available_os_filter=available_os_filter,
+            selected_os_filter=selected_os_filter,
+            available_power_filter=available_power_filter,
+            selected_power_filter=selected_power_filter,
+            available_os_options=available_os_options,
+            selected_os_options=selected_os_options,
+            available_power_options=available_power_options,
+            selected_power_options=selected_power_options,
+        ),
     )
 
 
@@ -6593,51 +6734,54 @@ def step4() -> str:
 
     return render_template(
         "step4.html",
-        selected_rvtools_file=selected_rvtools_file,
-        source_vinfo_csv=source_vinfo_csv,
-        vm_rows=vm_rows,
-        native_vm_input_rows=native_vm_input_rows,
-        native_vm_input_row_limit=NATIVE_VM_INPUT_ROW_LIMIT,
-        native_vm_input_total=len(vm_rows),
-        native_shape_strategy_rows=native_shape_strategy_rows,
-        overall=overall,
-        shape_options=shape_options,
-        vpu_options=vpu_options,
-        pricing_currency=pricing_currency,
-        source_pricelist_file=source_pricelist_file,
-        shape_price_rates=shape_price_rates,
-        block_storage_unit_price=block_storage_unit_price,
-        block_perf_unit_price=block_perf_unit_price,
-        windows_os_unit_price=windows_os_unit_price,
-        iaas_discount_pct=iaas_discount_pct,
-        ocvs_price=ocvs_price,
-        hybrid_ocvs_price=hybrid_ocvs_price,
-        ocvs_profiles=OCVS_HOST_PROFILES,
-        ocvs_profile_choice=ocvs_profile_choice,
-        ocvs_commitment_options=[
-            {"value": value, "label": OCVS_COMMITMENT_LABELS[value]}
-            for value in ["payg", "1_year", "3_year"]
-        ],
-        ocvs_commitment_term=ocvs_commitment_term,
-        ocvs_policy=ocvs_policy,
-        ocvs_dr_nodes=ocvs_dr_nodes,
-        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
-        scenario_comparison=scenario_comparison,
-        executive_summary=executive_summary,
-        fit_warnings=fit_warnings,
-        price_comparison=price_comparison,
-        ocvs_shape_comparison=ocvs_shape_comparison,
-        vmware_license_summary=vmware_license_summary,
-        workload_summary=workload_summary,
-        supported_native_summary=analysis["supported_native_summary"],
-        scenario_chart_rows=analysis["scenario_chart_rows"],
-        scenario_views=scenario_views,
-        migration_waves=migration_waves,
-        hybrid_placement_plan=analysis["hybrid_placement_plan"],
-        hybrid_placement_options=HYBRID_PLACEMENT_OPTIONS,
-        last_export_file=session.get("last_export_file", ""),
-        customer_name=customer_name,
-        active_scenario=active_scenario,
+        **build_workspace_context(
+            "results" if active_scenario == "price" else "scenarios",
+            selected_rvtools_file=selected_rvtools_file,
+            source_vinfo_csv=source_vinfo_csv,
+            vm_rows=vm_rows,
+            native_vm_input_rows=native_vm_input_rows,
+            native_vm_input_row_limit=NATIVE_VM_INPUT_ROW_LIMIT,
+            native_vm_input_total=len(vm_rows),
+            native_shape_strategy_rows=native_shape_strategy_rows,
+            overall=overall,
+            shape_options=shape_options,
+            vpu_options=vpu_options,
+            pricing_currency=pricing_currency,
+            source_pricelist_file=source_pricelist_file,
+            shape_price_rates=shape_price_rates,
+            block_storage_unit_price=block_storage_unit_price,
+            block_perf_unit_price=block_perf_unit_price,
+            windows_os_unit_price=windows_os_unit_price,
+            iaas_discount_pct=iaas_discount_pct,
+            ocvs_price=ocvs_price,
+            hybrid_ocvs_price=hybrid_ocvs_price,
+            ocvs_profiles=OCVS_HOST_PROFILES,
+            ocvs_profile_choice=ocvs_profile_choice,
+            ocvs_commitment_options=[
+                {"value": value, "label": OCVS_COMMITMENT_LABELS[value]}
+                for value in ["payg", "1_year", "3_year"]
+            ],
+            ocvs_commitment_term=ocvs_commitment_term,
+            ocvs_policy=ocvs_policy,
+            ocvs_dr_nodes=ocvs_dr_nodes,
+            vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+            scenario_comparison=scenario_comparison,
+            executive_summary=executive_summary,
+            fit_warnings=fit_warnings,
+            price_comparison=price_comparison,
+            ocvs_shape_comparison=ocvs_shape_comparison,
+            vmware_license_summary=vmware_license_summary,
+            workload_summary=workload_summary,
+            supported_native_summary=analysis["supported_native_summary"],
+            scenario_chart_rows=analysis["scenario_chart_rows"],
+            scenario_views=scenario_views,
+            migration_waves=migration_waves,
+            hybrid_placement_plan=analysis["hybrid_placement_plan"],
+            hybrid_placement_options=HYBRID_PLACEMENT_OPTIONS,
+            last_export_file=session.get("last_export_file", ""),
+            customer_name=customer_name,
+            active_scenario=active_scenario,
+        ),
     )
 
 

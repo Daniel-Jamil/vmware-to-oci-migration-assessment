@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}VMware to OCI Migration Assessment{% endblock %}</title>
+  {% include "_redwood_theme.html" %}
+  {% block head %}{% endblock %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/workspace.css') }}" />
+</head>
+<body class="redwood-body workspace-body">
+  <a class="skip-link" href="#main-workspace">Skip to main workspace</a>
+
+  <header class="workspace-header">
+    <div class="workspace-identity">
+      <span class="workspace-oracle">ORACLE</span>
+      <span class="workspace-product">VMware to OCI Migration Assessment</span>
+    </div>
+    <div class="workspace-assessment" aria-label="Current assessment">
+      <span class="workspace-assessment__name" title="{{ workspace_assessment_name }}">
+        {{ workspace_assessment_name }}
+      </span>
+      <span class="workspace-assessment__customer" title="{{ workspace_customer_name }}">
+        {{ workspace_customer_name }}
+      </span>
+      <span class="workspace-save-state {{ 'is-saved' if workspace_is_saved else 'is-unsaved' }}">
+        <span class="workspace-save-state__icon" aria-hidden="true"></span>
+        {{ "Saved assessment" if workspace_is_saved else "Unsaved assessment" }}
+      </span>
+    </div>
+    {% include "_assessment_menu.html" %}
+  </header>
+
+  <div class="workspace-shell">
+    {% include "_stage_nav.html" %}
+    <div class="workspace-workarea">
+      <div class="workspace-stage-heading">
+        <span>Step {{ workspace_stage_number }} of {{ workspace_stage_count }}</span>
+        <strong>{{ workspace_stage_name }}</strong>
+      </div>
+
+      {% include "_readiness_panel.html" %}
+
+      {% set workspace_messages = get_flashed_messages(with_categories=true) %}
+      <div id="workspace-status" role="status" aria-live="polite">
+        {% for category, message in workspace_messages %}
+          <div class="workspace-message workspace-message--{{ category|replace('_', '-') }}">
+            <span class="workspace-message__icon" aria-hidden="true"></span>
+            <span>{{ message }}</span>
+          </div>
+        {% endfor %}
+        {% if workspace_status_message %}
+          <div class="workspace-message workspace-message--info">
+            <span class="workspace-message__icon" aria-hidden="true"></span>
+            <span>{{ workspace_status_message }}</span>
+          </div>
+        {% endif %}
+      </div>
+
+      <main id="main-workspace">
+        {% block stage_content %}{% endblock %}
+      </main>
+
+      {% if workspace_previous_url or workspace_continue_url %}
+        <footer class="workspace-stage-actions" aria-label="Stage actions">
+          {% if workspace_previous_url %}
+            <a class="workspace-action workspace-action--secondary" href="{{ workspace_previous_url }}">
+              <span aria-hidden="true">&#8592;</span>
+              Previous
+            </a>
+          {% else %}
+            <span></span>
+          {% endif %}
+          {% if workspace_continue_url %}
+            <a class="workspace-action workspace-action--primary" href="{{ workspace_continue_url }}">
+              Continue
+              <span aria-hidden="true">&#8594;</span>
+            </a>
+          {% endif %}
+        </footer>
+      {% endif %}
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/workspace.js') }}" defer></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,9 +1,6 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VMware to OCI Migration Assessment - Migration Paths</title>
+{% extends "base.html" %}
+{% block title %}VMware to OCI Migration Assessment - {{ "Results & Export" if active_scenario == "price" else "Scenario Configuration" }}{% endblock %}
+{% block head %}
   <style>
     :root {
       --bg: #f4f5f7;
@@ -802,9 +799,8 @@
       .scenario-panel-actions { justify-content: flex-start; }
     }
   </style>
-  {% include "_redwood_theme.html" %}
-</head>
-<body class="redwood-body">
+{% endblock %}
+{% block stage_content %}
   <div class="container">
     {% set currency_symbol_map = {
       'EUR': '€',
@@ -829,24 +825,6 @@
       'price': 'Price Comparison'
     } %}
     <h1 id="step4-main-title">{{ initial_titles.get(active_scenario, 'Step 3 - Migration Paths') }}</h1>
-
-    <nav class="wizard-steps" aria-label="Assessment wizard">
-      <a class="wizard-step" href="{{ url_for('index') }}#assessment-setup">
-        <strong>Step 1</strong>
-        <span>Setup & Inventory</span>
-        <small>Customer, price list, and inventory.</small>
-      </a>
-      <a class="wizard-step" href="{{ url_for('step3') }}">
-        <strong>Step 2</strong>
-        <span>Workload Scope</span>
-        <small>VMs selected for analysis.</small>
-      </a>
-      <span class="wizard-step is-current">
-        <strong>Step 3</strong>
-        <span>Migration Paths</span>
-        <small>Configure paths and compare prices.</small>
-      </span>
-    </nav>
 
     <div class="top-actions">
       <div class="workspace-nav" aria-label="Assessment workspace">
@@ -932,19 +910,6 @@
         </div>
       </div>
     </div>
-
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% set seen_flashes = [] %}
-        {% for category, message in messages %}
-          {% set flash_key = category ~ '|' ~ message %}
-          {% if flash_key not in seen_flashes %}
-            {% set _ = seen_flashes.append(flash_key) %}
-            <div class="flash {{ category }}" {% if category == 'success' %}data-autohide-flash="true"{% endif %}>{{ message }}</div>
-          {% endif %}
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
 
     {% set ocvs_selected = ocvs_price.selected %}
     {% set ocvs_totals = ocvs_price.totals %}
@@ -2874,7 +2839,8 @@
 
     </div>
   </div>
-
+{% endblock %}
+{% block scripts %}
   <script>
     (function () {
       const tabs = Array.from(document.querySelectorAll('[data-scenario-tab]'));
@@ -3859,5 +3825,4 @@
       }
     })();
   </script>
-</body>
-</html>
+{% endblock %}

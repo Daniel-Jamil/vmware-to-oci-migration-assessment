@@ -1,9 +1,6 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VMware to OCI Migration Assessment - Setup</title>
+{% extends "base.html" %}
+{% block title %}VMware to OCI Migration Assessment - Setup{% endblock %}
+{% block head %}
   <style>
     :root {
       --bg: #f4f5f7;
@@ -233,74 +230,9 @@
       .field-hint { grid-column: 1; }
     }
   </style>
-  {% include "_redwood_theme.html" %}
-</head>
-<body class="redwood-body">
-  <div class="redwood-app-shell">
-    <aside class="redwood-rail" aria-label="Assessment navigation">
-      <div>
-        <div class="redwood-brand">ORACLE</div>
-        <div class="redwood-kicker">Cloud assessment</div>
-        <div class="redwood-rail-title">VMware to OCI Migration Assessment</div>
-      </div>
-      <nav class="redwood-nav">
-        <a class="is-current" href="#assessment-setup">Setup & Inventory</a>
-        <a href="{{ url_for('step3') }}">Workload Scope</a>
-        <span>Migration Paths</span>
-        <span>Exports</span>
-      </nav>
-      <div class="redwood-panel" style="margin: 0; padding: .75rem;">
-        <div class="redwood-kicker">Assessment State</div>
-        <div class="redwood-status-grid" style="margin-top: .55rem;">
-          <div class="redwood-status-row"><span>Customer</span><strong>{{ customer_name or "Not set" }}</strong></div>
-          <div class="redwood-status-row"><span>OCI price list</span><strong>{{ selected_pricelist_info.currency if selected_pricelist_info else "Needed" }}</strong></div>
-          <div class="redwood-status-row"><span>Inventory</span><strong>{{ rvtools_file_info.file_name if rvtools_file_info else "Needed" }}</strong></div>
-          <div class="redwood-status-row">
-            <span>Review</span>
-            {% if inventory_review_issues %}
-              <strong class="redwood-pill redwood-pill-warning">{{ inventory_review_issues|length }} item(s)</strong>
-            {% else %}
-              <strong class="redwood-pill redwood-pill-success">Ready</strong>
-            {% endif %}
-          </div>
-        </div>
-      </div>
-    </aside>
-
-    <main class="container redwood-main">
-    <div class="redwood-page-head">
-      <div class="redwood-kicker">Step 1 of 4</div>
-      <h1>Setup & Inventory</h1>
-      <p>Start here for new assessments. Set the customer, load OCI pricing, and choose either manual sizing or an inventory export before moving to workload scope.</p>
-    </div>
-    <nav class="wizard-steps" aria-label="Assessment wizard">
-      <a class="wizard-step is-current" href="#assessment-setup">
-        <strong>Step 1</strong>
-        <span>Setup & Inventory</span>
-        <small>Customer, price list, and VM inventory source.</small>
-      </a>
-      <a class="wizard-step" href="{{ url_for('step3') }}">
-        <strong>Step 2</strong>
-        <span>Workload Scope</span>
-        <small>Select the VMs included in analysis.</small>
-      </a>
-      <span class="wizard-step is-disabled" aria-disabled="true">
-        <strong>Step 3</strong>
-        <span>Migration Paths</span>
-        <small>Configure paths and compare prices.</small>
-      </span>
-    </nav>
-    {% set flash_messages = get_flashed_messages(with_categories=true) %}
-    {% set customer_flash_categories = ["customer_error", "customer_success"] %}
-    {% set pricing_flash_categories = ["pricing_error", "pricing_success", "pricing_info"] %}
-    {% set rvtools_flash_categories = ["rvtools_error", "rvtools_success", "rvtools_info"] %}
-    {% set section_flash_categories = customer_flash_categories + pricing_flash_categories + rvtools_flash_categories %}
-
-    {% for category, message in flash_messages %}
-      {% if category not in section_flash_categories %}
-        <div class="flash {{ category }}">{{ message }}</div>
-      {% endif %}
-    {% endfor %}
+{% endblock %}
+{% block stage_content %}
+  <div class="container">
 
     <h2 id="assessment-setup">Step 1 - Setup & Inventory</h2>
     <p>Set the customer or project name, choose the OCI price list, and load the VM inventory used for sizing and report exports.</p>
@@ -318,12 +250,6 @@
       />
       <button type="submit">Save Customer</button>
     </form>
-
-    {% for category, message in flash_messages %}
-      {% if category in customer_flash_categories %}
-        <div class="flash {{ 'error' if category == 'customer_error' else 'success' }}">{{ message }}</div>
-      {% endif %}
-    {% endfor %}
 
     {% if customer_name %}
       <div class="result">
@@ -351,12 +277,6 @@
         <button type="submit">Use Selected Price List</button>
       </form>
     {% endif %}
-
-    {% for category, message in flash_messages %}
-      {% if category in pricing_flash_categories %}
-        <div class="flash {% if category == 'pricing_error' %}error{% elif category == 'pricing_info' %}info{% else %}success{% endif %}">{{ message }}</div>
-      {% endif %}
-    {% endfor %}
 
     <form method="post" id="download_pricing_form">
       <input type="hidden" name="action" value="download_pricing" />
@@ -435,12 +355,6 @@
       <button type="submit">Upload & Select</button>
       <div class="field-hint">Choose an inventory export from your local filesystem. Files already present in <code>rvtools/</code> are reused when the content matches.</div>
     </form>
-
-    {% for category, message in flash_messages %}
-      {% if category in rvtools_flash_categories %}
-        <div class="flash {% if category == 'rvtools_error' %}error{% elif category == 'rvtools_info' %}info{% else %}success{% endif %}">{{ message }}</div>
-      {% endif %}
-    {% endfor %}
 
     {% if rvtools_rejected_info %}
       <div class="result">
@@ -532,7 +446,7 @@
         </p>
       </div>
     {% endif %}
-    </main>
+  </div>
     <aside class="redwood-action-rail" aria-label="Setup actions and warnings">
       <section class="redwood-panel" style="margin: 0; padding: .8rem;">
         <h3>Next Actions</h3>
@@ -545,7 +459,7 @@
           <a class="btn" href="#download_pricing_form">Review OCI Price List</a>
         </div>
       </section>
-      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
+      <section id="saved-assessments" class="redwood-panel" style="margin: 0; padding: .8rem;">
         <h3>Saved Assessments</h3>
         <form method="post" class="assessment-form">
           <input type="hidden" name="action" value="save_assessment" />
@@ -613,12 +527,9 @@
           <p style="margin-bottom: 0;">No inventory review items detected.</p>
         {% endif %}
       </section>
-      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
-        <h3>Color Rule</h3>
-        <p style="margin-bottom: 0;">Green/teal marks ready and recommended actions. Amber marks review items. Oracle red stays as a restrained brand accent.</p>
-      </section>
     </aside>
-  </div>
+{% endblock %}
+{% block scripts %}
   <script>
     if (/^#scenario-(paths|native|ocvs|hybrid|price)$/.test(String(window.location.hash || ''))) {
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
@@ -652,5 +563,4 @@
       });
     }
   </script>
-</body>
-</html>
+{% endblock %}

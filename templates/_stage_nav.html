@@ -1,0 +1,39 @@
+<nav class="stage-nav" aria-label="Assessment stages">
+  <div class="stage-nav__desktop">
+    <div class="stage-nav__summary">
+      <span>Assessment progress</span>
+      <strong>Step {{ workspace_stage_number }} of {{ workspace_stage_count }}</strong>
+    </div>
+    <ol class="stage-nav__list">
+      {% for stage in workspace_stages %}
+        <li>
+          <a
+            class="stage-nav__link {{ 'is-current' if stage.is_current else '' }}"
+            href="{{ stage.url }}"
+            {% if stage.is_current %}aria-current="step"{% endif %}
+          >
+            <span class="stage-nav__number" aria-hidden="true">{{ stage.number }}</span>
+            <span class="stage-nav__label">
+              <strong>{{ stage.name }}</strong>
+              <span class="stage-nav__status stage-nav__status--{{ stage.status }}">
+                <span class="stage-nav__status-icon" aria-hidden="true"></span>
+                {{ stage.status_label }}
+              </span>
+            </span>
+          </a>
+        </li>
+      {% endfor %}
+    </ol>
+  </div>
+
+  <div class="stage-nav__mobile">
+    <label for="workspace-stage-select">Assessment stage</label>
+    <select id="workspace-stage-select" data-stage-select>
+      {% for stage in workspace_stages %}
+        <option value="{{ stage.url }}" {% if stage.is_current %}selected{% endif %}>
+          {{ stage.number }}. {{ stage.name }}
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+</nav>

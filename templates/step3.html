@@ -1,9 +1,6 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VMware to OCI Migration Assessment - Workload Scope</title>
+{% extends "base.html" %}
+{% block title %}VMware to OCI Migration Assessment - Inventory Review{% endblock %}
+{% block head %}
   <style>
     :root {
       --bg: #f4f5f7;
@@ -169,35 +166,11 @@
       .wizard-action-controls button { width: 100%; }
     }
   </style>
-  {% include "_redwood_theme.html" %}
-</head>
-<body class="redwood-body">
+{% endblock %}
+{% block stage_content %}
   <div class="container">
-    <h1>Step 2 - Workload Scope</h1>
-    <nav class="wizard-steps" aria-label="Assessment wizard">
-      <a class="wizard-step" href="{{ url_for('index') }}#assessment-setup">
-        <strong>Step 1</strong>
-        <span>Setup & Inventory</span>
-        <small>Customer, price list, and inventory.</small>
-      </a>
-      <span class="wizard-step is-current">
-        <strong>Step 2</strong>
-        <span>Workload Scope</span>
-        <small>Select VMs for analysis.</small>
-      </span>
-      <span class="wizard-step is-disabled" aria-disabled="true">
-        <strong>Step 3</strong>
-        <span>Migration Paths</span>
-        <small>Open after saving scope.</small>
-      </span>
-    </nav>
     <div class="top-actions">
-      <div class="wizard-action-copy">
-        <strong>Step 2 of 3</strong>
-        <span>Confirm the workload in scope, then continue to Migration Paths to tune scenario assumptions.</span>
-      </div>
       <div class="wizard-action-controls">
-        <a class="btn" href="{{ url_for('index') }}#assessment-setup">Previous: Step 1 - Setup & Inventory</a>
         <form method="post" id="continue_step4_form">
           <input type="hidden" name="action" value="add" />
           <input type="hidden" name="redirect_to" value="step4" />
@@ -209,14 +182,6 @@
         </form>
       </div>
     </div>
-
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, message in messages %}
-          <div class="flash {{ category }}">{{ message }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
 
     <div class="meta">
       <p><strong>Selected inventory file:</strong> <code>{{ selected_rvtools_file }}</code></p>
@@ -425,7 +390,8 @@
       </div>
     </div>
   </div>
-
+{% endblock %}
+{% block scripts %}
   <script>
     (function () {
       const tableState = {
@@ -564,5 +530,4 @@
       });
     })();
   </script>
-</body>
-</html>
+{% endblock %}

@@ -201,6 +201,52 @@ def find_price_file() -> str:
     return next((path for path in price_lists if "EUR" in path), price_lists[0])
 
 
+def validate_shared_workspace_shell() -> None:
+    price_file = find_price_file()
+    inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
+    state_id = f"workspace_shell_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = [str(row["name"]) for row in inventory_rows]
+        app_module.save_app_state(state)
+
+    shell_fragments = [
+        b'<header class="workspace-header">',
+        b'<nav class="stage-nav" aria-label="Assessment stages">',
+        b'<main id="main-workspace">',
+        b'<div id="workspace-status" role="status" aria-live="polite">',
+    ]
+    old_color_explanation = (
+        b"Green/teal marks ready and recommended actions. Amber marks review items. "
+        b"Oracle red stays as a restrained brand accent."
+    )
+
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(CSV_INVENTORY)
+            sess["selected_pricelist_file"] = price_file
+            sess["selected_currency"] = "EUR"
+            sess["customer_name"] = "Workspace Shell Customer"
+
+        for route, progress_text in [
+            ("/", b"Step 1 of 4"),
+            ("/step3", b"Step 2 of 4"),
+            ("/step4?tab=native", b"Step 3 of 4"),
+            ("/step4?tab=price", b"Step 4 of 4"),
+        ]:
+            response = client.get(route)
+            check(
+                f"{route} shared workspace shell",
+                response.status_code == 200 and all(fragment in response.data for fragment in shell_fragments),
+                f"status={response.status_code}",
+            )
+            check(f"{route} workspace progress", progress_text in response.data)
+            check(f"{route} old color explanation removed", old_color_explanation not in response.data)
+
+
 def validate_price_list_dropdown_policy() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
@@ -1264,6 +1310,7 @@ def main() -> None:
     )
 
     validate_inventory_imports()
+    validate_shared_workspace_shell()
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
     validate_saved_assessments()

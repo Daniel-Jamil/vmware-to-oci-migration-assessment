@@ -1,0 +1,30 @@
+{% set readiness_blockers = workspace_readiness.get('blockers', []) %}
+{% set readiness_advisories = workspace_readiness.get('advisories', []) %}
+{% if readiness_blockers or readiness_advisories %}
+  <section class="readiness-panel" aria-labelledby="readiness-panel-title">
+    <div class="readiness-panel__heading">
+      <span class="readiness-panel__icon" aria-hidden="true">!</span>
+      <h2 id="readiness-panel-title">Readiness review</h2>
+    </div>
+    {% if readiness_blockers %}
+      <div class="readiness-panel__group readiness-panel__group--blocker">
+        <h3>Required before completion</h3>
+        <ul>
+          {% for item in readiness_blockers %}
+            <li>{{ item.message if item is mapping and item.message else item }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+    {% if readiness_advisories %}
+      <div class="readiness-panel__group readiness-panel__group--advisory">
+        <h3>Review advised</h3>
+        <ul>
+          {% for item in readiness_advisories %}
+            <li>{{ item.message if item is mapping and item.message else item }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+  </section>
+{% endif %}
