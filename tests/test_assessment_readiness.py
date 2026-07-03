@@ -231,35 +231,110 @@ class ReadinessTests(unittest.TestCase):
 
     def test_scalar_string_collections_fail_closed_without_crashing(self) -> None:
         context = complete_context()
+        context["recommendation"] = "ocvs"
         context["inventory"]["included_vm_names"] = 17
         included_result = build_assessment_readiness(context)
         self.assertEqual(
             "needs_attention", included_result["stages"]["inventory"]["state"]
         )
+        self.assertFalse(included_result["customer_ready_export"])
 
         context = complete_context()
+        context["recommendation"] = "ocvs"
         context["inventory"]["placements"] = "native"
         placements_result = build_assessment_readiness(context)
         self.assertEqual(
             "needs_attention", placements_result["stages"]["inventory"]["state"]
         )
+        self.assertFalse(placements_result["customer_ready_export"])
 
         context = complete_context()
+        context["recommendation"] = "native"
+        context["recommendation_rationale"] = "Treatment documented."
         context["scenarios"]["native"]["unsupported_vm_names"] = 17
         unsupported_result = build_assessment_readiness(context)
         self.assertEqual(
             [], unsupported_result["scenarios"]["native"]["affected_vm_names"]
         )
+        self.assertEqual(
+            "needs_attention", unsupported_result["scenarios"]["native"]["state"]
+        )
+        self.assertTrue(unsupported_result["scenarios"]["native"]["rankable"])
+        self.assertFalse(unsupported_result["customer_ready_export"])
+        self.assertIn(
+            "invalid-native-unsupported-vms",
+            {item["id"] for item in unsupported_result["advisory_items"]},
+        )
 
         context = complete_context()
+        context["recommendation"] = "native"
+        context["recommendation_rationale"] = "Treatment documented."
         context["inventory"]["acknowledged_warning_ids"] = "unsupported-native"
         acknowledged_result = build_assessment_readiness(context)
         self.assertEqual(
-            "needs_attention", acknowledged_result["stages"]["inventory"]["state"]
+            "complete", acknowledged_result["stages"]["inventory"]["state"]
         )
-        self.assertEqual(
-            "unsupported-native", acknowledged_result["advisory_items"][0]["id"]
+        self.assertTrue(acknowledged_result["customer_ready_export"])
+
+    def test_scalar_unsupported_vm_name_preserves_native_remediation(self) -> None:
+        context = complete_context()
+        context["recommendation"] = "native"
+        context["scenarios"]["native"]["unsupported_vm_names"] = "legacy-01"
+
+        result = build_assessment_readiness(context)
+        native = result["scenarios"]["native"]
+
+        self.assertEqual(["legacy-01"], native["affected_vm_names"])
+        self.assertTrue(native["remediation_required"])
+        self.assertTrue(native["rankable"])
+        self.assertEqual("needs_attention", native["state"])
+        self.assertFalse(result["customer_ready_export"])
+
+    def test_malformed_unsupported_vm_collections_deny_native_export(self) -> None:
+        malformed_values = (
+            17,
+            True,
+            {"vm": "legacy-01"},
+            ["legacy-01", 17],
         )
+        for malformed in malformed_values:
+            with self.subTest(malformed=malformed):
+                context = complete_context()
+                context["recommendation"] = "native"
+                context["recommendation_rationale"] = "Treatment documented."
+                context["scenarios"]["native"]["unsupported_vm_names"] = malformed
+
+                result = build_assessment_readiness(context)
+                native = result["scenarios"]["native"]
+
+                self.assertTrue(native["rankable"])
+                self.assertEqual("needs_attention", native["state"])
+                self.assertFalse(native["customer_ready"])
+                self.assertFalse(result["customer_ready_export"])
+                self.assertIn(
+                    "invalid-native-unsupported-vms",
+                    {item["id"] for item in result["advisory_items"]},
+                )
+
+    def test_malformed_warning_id_collections_deny_customer_ready_export(self) -> None:
+        malformed_values = (
+            17,
+            True,
+            {"id": "unsupported-native"},
+            ["unsupported-native", 17],
+        )
+        for malformed in malformed_values:
+            with self.subTest(malformed=malformed):
+                context = complete_context()
+                context["recommendation"] = "ocvs"
+                context["inventory"]["acknowledged_warning_ids"] = malformed
+
+                result = build_assessment_readiness(context)
+
+                self.assertEqual(
+                    "needs_attention", result["stages"]["inventory"]["state"]
+                )
+                self.assertFalse(result["customer_ready_export"])
 
     def test_single_issue_mapping_is_processed(self) -> None:
         context = complete_context()
@@ -277,14 +352,56 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual("incomplete", result["overall_state"])
         self.assertFalse(result["customer_ready_export"])
 
-    def test_malformed_issue_collection_does_not_crash(self) -> None:
-        context = complete_context()
-        context["inventory"]["issues"] = 17
+    def test_malformed_issue_collections_add_integrity_blocker(self) -> None:
+        malformed_values = (
+            17,
+            True,
+            "missing-storage",
+            [
+                {
+                    "id": "unsupported-native",
+                    "severity": "advisory",
+                    "vm_names": ["legacy-01"],
+                },
+                17,
+            ],
+        )
+        for malformed in malformed_values:
+            with self.subTest(malformed=malformed):
+                context = complete_context()
+                context["recommendation"] = "ocvs"
+                context["inventory"]["issues"] = malformed
 
-        result = build_assessment_readiness(context)
+                result = build_assessment_readiness(context)
+                blockers = {item["id"]: item for item in result["blocking_items"]}
 
-        self.assertEqual([], result["blocking_items"])
-        self.assertEqual([], result["advisory_items"])
+                self.assertIn("invalid-inventory-issues", blockers)
+                self.assertEqual(
+                    "critical", blockers["invalid-inventory-issues"]["severity"]
+                )
+                self.assertEqual(
+                    "inventory", blockers["invalid-inventory-issues"]["stage"]
+                )
+                self.assertEqual(
+                    "needs_attention", result["stages"]["inventory"]["state"]
+                )
+                self.assertFalse(result["customer_ready_export"])
+
+    def test_none_or_missing_issue_collection_is_validly_empty(self) -> None:
+        for issues_state in ("none", "missing"):
+            with self.subTest(issues_state=issues_state):
+                context = complete_context()
+                context["recommendation"] = "ocvs"
+                if issues_state == "none":
+                    context["inventory"]["issues"] = None
+                else:
+                    context["inventory"].pop("issues")
+
+                result = build_assessment_readiness(context)
+
+                self.assertEqual("complete", result["stages"]["inventory"]["state"])
+                self.assertEqual([], result["blocking_items"])
+                self.assertTrue(result["customer_ready_export"])
 
     def test_monthly_cost_requires_a_finite_non_boolean_number(self) -> None:
         invalid_costs = ("100.0", True, float("nan"), float("inf"), float("-inf"))
