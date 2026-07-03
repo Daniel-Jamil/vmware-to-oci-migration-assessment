@@ -1,4 +1,6 @@
+import copy
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import app as app_module
@@ -179,7 +181,102 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
     }
 
 
+@contextmanager
+def current_step4_client():
+    inventory_rows = copy.deepcopy(current_adapter_inputs()["inventory_rows"][:2])
+    state = app_module._default_app_state()
+    state["selected_vm_names"] = ["app-01", "legacy-01"]
+    state["step4_hybrid_placements"] = {
+        "app-01": "native",
+        "legacy-01": "ocvs",
+    }
+    state["acknowledged_warning_ids"] = ["unsupported-native"]
+    state["step4_vmware_license_price_per_core_yearly"] = 400.0
+
+    price_lookup: dict[str, float] = {
+        "Storage - Block Volume - Storage": 0.02,
+        "Storage - Block Volume - Performance Units": 0.001,
+        "Compute - Windows OS": 0.09,
+    }
+    for mapping in app_module.load_oci_price_mapping_details().values():
+        for key in ("ocpu_display_name", "memory_display_name"):
+            display_name = str(mapping.get(key) or "").strip()
+            if display_name:
+                price_lookup[display_name] = 0.03
+    for profile in app_module.OCVS_HOST_PROFILES:
+        for key in (
+            "ocpu_display_name",
+            "memory_display_name",
+            "nvme_display_name",
+        ):
+            display_name = str(profile.get(key) or "").strip()
+            if display_name:
+                price_lookup[display_name] = 0.03
+
+    def load_state() -> dict:
+        return copy.deepcopy(state)
+
+    def save_state(value: dict) -> None:
+        state.clear()
+        state.update(copy.deepcopy(value))
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                app_module,
+                "load_vms_from_vinfo",
+                side_effect=lambda _path: (copy.deepcopy(inventory_rows), "fixture.csv"),
+            )
+        )
+        stack.enter_context(
+            patch.object(app_module, "load_app_state", side_effect=load_state)
+        )
+        stack.enter_context(
+            patch.object(app_module, "save_app_state", side_effect=save_state)
+        )
+        stack.enter_context(
+            patch.object(app_module, "load_step4_snapshot", return_value={})
+        )
+        stack.enter_context(
+            patch.object(app_module, "save_step4_snapshot", return_value=None)
+        )
+        stack.enter_context(
+            patch.object(
+                app_module,
+                "load_price_lookup",
+                return_value=(price_lookup, "EUR", "prices.json"),
+            )
+        )
+        with app_module.app.test_client() as client:
+            with client.session_transaction() as sess:
+                sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+                sess["selected_rvtools_file"] = "fixture.csv"
+                sess["selected_pricelist_file"] = "prices.json"
+                sess["selected_currency"] = "EUR"
+                sess["customer_name"] = "Example Customer"
+                sess["active_assessment_name"] = "Current assessment"
+            yield client, state
+
+
 class ReadinessTests(unittest.TestCase):
+    def assert_readiness_item_contract(
+        self,
+        item: dict,
+        *,
+        item_id: str,
+        stage: str,
+        severity: str,
+        affected_vm_names: list[str],
+        acknowledged: bool,
+    ) -> None:
+        self.assertEqual(item_id, item["id"])
+        self.assertTrue(item["title"].strip())
+        self.assertTrue(item["detail"].strip())
+        self.assertEqual(stage, item["stage"])
+        self.assertEqual(affected_vm_names, item["affected_vm_names"])
+        self.assertEqual(severity, item["severity"])
+        self.assertIs(acknowledged, item["acknowledged"])
+
     def test_current_adapter_keeps_unsupported_native_eligible_and_visible(self) -> None:
         adapter = getattr(app_module, "build_current_readiness_context", None)
         self.assertTrue(callable(adapter), "current readiness adapter is missing")
@@ -201,9 +298,115 @@ class ReadinessTests(unittest.TestCase):
         unsupported = next(
             item for item in source_advisories if item["id"] == "unsupported-native"
         )
-        self.assertTrue(unsupported["acknowledged"])
-        self.assertEqual(["legacy-01"], unsupported["affected_vm_names"])
+        self.assert_readiness_item_contract(
+            unsupported,
+            item_id="unsupported-native",
+            stage="inventory",
+            severity="advisory",
+            affected_vm_names=["legacy-01"],
+            acknowledged=True,
+        )
         self.assertEqual("complete", result["stages"]["inventory"]["state"])
+
+    def test_invalid_step4_post_marks_only_redirected_get_unsaved(self) -> None:
+        real_adapter = app_module.build_current_readiness_context
+        adapter_calls: list[tuple[dict, dict]] = []
+
+        def capture_adapter(**kwargs: object) -> dict:
+            result = real_adapter(**kwargs)
+            adapter_calls.append((dict(kwargs), result))
+            return result
+
+        with current_step4_client() as (client, _state), patch.object(
+            app_module,
+            "build_current_readiness_context",
+            side_effect=capture_adapter,
+        ):
+            response = client.post(
+                "/step4",
+                data={"action": "save", "active_scenario": "native"},
+                follow_redirects=True,
+            )
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(1, len(adapter_calls))
+            self.assertIs(
+                True, adapter_calls[0][0]["has_unsaved_scenario_changes"]
+            )
+            unsupported = next(
+                item
+                for item in adapter_calls[0][1]["stages"]["inventory"]["advisories"]
+                if item["id"] == "unsupported-native"
+            )
+            self.assert_readiness_item_contract(
+                unsupported,
+                item_id="unsupported-native",
+                stage="inventory",
+                severity="advisory",
+                affected_vm_names=["legacy-01"],
+                acknowledged=True,
+            )
+            fit_item = next(
+                item
+                for item in adapter_calls[0][1]["advisory_items"]
+                if item["id"] == "fit-vcf-license-cost-included"
+            )
+            self.assert_readiness_item_contract(
+                fit_item,
+                item_id="fit-vcf-license-cost-included",
+                stage="scenarios",
+                severity="info",
+                affected_vm_names=[],
+                acknowledged=False,
+            )
+
+            response = client.get("/step4?tab=native")
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(2, len(adapter_calls))
+            self.assertIs(
+                False, adapter_calls[1][0]["has_unsaved_scenario_changes"]
+            )
+
+    def test_successful_step4_save_clears_pending_unsaved_signal(self) -> None:
+        real_adapter = app_module.build_current_readiness_context
+        adapter_calls: list[dict] = []
+
+        def capture_adapter(**kwargs: object) -> dict:
+            adapter_calls.append(dict(kwargs))
+            return real_adapter(**kwargs)
+
+        with current_step4_client() as (client, state), patch.object(
+            app_module,
+            "build_current_readiness_context",
+            side_effect=capture_adapter,
+        ):
+            with client.session_transaction() as sess:
+                sess["_step4_unsaved_scenario_changes"] = True
+            response = client.post(
+                "/step4",
+                data={
+                    "action": "save",
+                    "active_scenario": "native",
+                    **{
+                        app_module.inventory_placement_field_name(
+                            "hybrid_placement", vm_name
+                        ): placement
+                        for vm_name, placement in state[
+                            "step4_hybrid_placements"
+                        ].items()
+                    },
+                },
+                follow_redirects=True,
+            )
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(1, len(adapter_calls))
+            self.assertIs(
+                False, adapter_calls[0]["has_unsaved_scenario_changes"]
+            )
+            with client.session_transaction() as sess:
+                self.assertNotIn("_step4_unsaved_scenario_changes", sess)
 
     def test_current_adapter_blocks_ocvs_ranking_without_vcf_unit_price(self) -> None:
         adapter = getattr(app_module, "build_current_readiness_context", None)

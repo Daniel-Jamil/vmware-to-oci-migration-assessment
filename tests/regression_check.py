@@ -411,10 +411,12 @@ def validate_current_readiness_routes() -> None:
         app_module.save_app_state(state)
 
     original_builder = app_module.build_assessment_readiness
+    readiness_contexts: list[dict[str, object]] = []
     readiness_results: list[dict[str, object]] = []
 
     def tracked_builder(context: dict[str, object]) -> dict[str, object]:
         result = original_builder(context)
+        readiness_contexts.append(context)
         readiness_results.append(result)
         return result
 
@@ -469,6 +471,11 @@ def validate_current_readiness_routes() -> None:
                 and native.get("affected_vm_names") == ["vm-legacy-01"]
                 and any(
                     item.get("id") == "unsupported-native"
+                    and bool(str(item.get("title", "")).strip())
+                    and bool(str(item.get("detail", "")).strip())
+                    and item.get("stage") == "inventory"
+                    and item.get("affected_vm_names") == ["vm-legacy-01"]
+                    and item.get("severity") == "advisory"
                     and item.get("acknowledged") is True
                     for item in readiness.get("stages", {})
                     .get("inventory", {})
@@ -495,6 +502,59 @@ def validate_current_readiness_routes() -> None:
                 )
                 and b"OCVS and Hybrid costs exclude VCF license cost" in response.data,
                 str(readiness.get("advisory_items")),
+            )
+
+            prior_calls = len(readiness_results)
+            response = client.post(
+                "/step4",
+                data={"action": "save", "active_scenario": "native"},
+                follow_redirects=True,
+            )
+            check(
+                "invalid Step 4 POST marks redirected readiness unsaved once",
+                response.status_code == 200
+                and len(readiness_results) == prior_calls + 1
+                and readiness_contexts[-1].get("has_unsaved_scenario_changes") is True,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, context={readiness_contexts[-1]}",
+            )
+
+            valid_save_data = {
+                "action": "save",
+                "active_scenario": "native",
+                **{
+                    app_module.inventory_placement_field_name(
+                        "hybrid_placement", vm_name
+                    ): placement
+                    for vm_name, placement in {
+                        "vm-app-01": "native",
+                        "vm-db-01": "native",
+                        "vm-web-01": "native",
+                        "vm-legacy-01": "ocvs",
+                    }.items()
+                },
+            }
+            prior_calls = len(readiness_results)
+            response = client.post(
+                "/step4",
+                data=valid_save_data,
+                follow_redirects=True,
+            )
+            check(
+                "successful Step 4 save resets redirected readiness unsaved",
+                response.status_code == 200
+                and len(readiness_results) == prior_calls + 1
+                and readiness_contexts[-1].get("has_unsaved_scenario_changes") is False,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, context={readiness_contexts[-1]}",
+            )
+
+            prior_calls = len(readiness_results)
+            response = client.get("/step4?tab=native")
+            check(
+                "unsaved readiness does not persist after successful save",
+                response.status_code == 200
+                and len(readiness_results) == prior_calls + 1
+                and readiness_contexts[-1].get("has_unsaved_scenario_changes") is False,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, context={readiness_contexts[-1]}",
             )
     finally:
         app_module.build_assessment_readiness = original_builder

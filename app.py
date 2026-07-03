@@ -145,6 +145,7 @@ SAVED_ASSESSMENT_SCHEMA_VERSION = 1
 PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_VISIBLE_PRICE_LISTS = 10
 NATIVE_VM_INPUT_ROW_LIMIT = 500
+STEP4_UNSAVED_READINESS_SESSION_KEY = "_step4_unsaved_scenario_changes"
 
 HOURS_PER_MONTH = 730.0
 MIN_BLOCK_VOLUME_GB = 50
@@ -7239,6 +7240,10 @@ def step3() -> str:
 @app.route("/step4", methods=["GET", "POST"])
 def step4() -> str:
     _cleanup_legacy_session_keys()
+    has_unsaved_scenario_changes = bool(
+        request.method == "GET"
+        and session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, False) is True
+    )
 
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
     customer_name = normalize_customer_name(session.get("customer_name", ""))
@@ -7282,6 +7287,7 @@ def step4() -> str:
             hybrid_field_errors.append("Legacy positional Hybrid placement fields are not accepted.")
         if hybrid_field_errors:
             active_tab = normalize_step4_scenario_tab(request.form.get("active_scenario", "paths"))
+            session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
             flash(
                 "Choose a valid placement for every included VM. No scenario settings were saved.",
                 "error",
@@ -7678,6 +7684,7 @@ def step4() -> str:
                 }
             )
 
+            session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, None)
             flash("Migration path settings saved.", "success")
             return redirect(step4_tab_redirect(active_scenario))
 
@@ -7800,7 +7807,7 @@ def step4() -> str:
             "has_price_list": bool(source_pricelist_file and price_lookup),
             "has_inventory": bool(all_vms),
         },
-        has_unsaved_scenario_changes=False,
+        has_unsaved_scenario_changes=has_unsaved_scenario_changes,
         inventory_issues=inventory_issues,
         pricing_inputs={
             "source_pricelist_file": source_pricelist_file,
