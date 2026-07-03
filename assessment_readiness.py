@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 
@@ -7,38 +8,67 @@ VALID_RECOMMENDATIONS = {"", "native", "ocvs", "hybrid"}
 CRITICAL_INVENTORY_ISSUES = {"missing-storage", "missing-cpu", "missing-memory"}
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _string(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _string_collection(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return [text for item in value if (text := _string(item))]
+
+
+def _issue_collection(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    return [issue for issue in value if isinstance(issue, Mapping)]
+
+
+def _finite_monthly_cost(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _normalize_issue(issue: Mapping[str, Any]) -> dict[str, Any]:
-    issue_id = str(issue.get("id") or "").strip()
+    issue_id = _string(issue.get("id"))
     affected_vm_names = issue.get("affected_vm_names")
     if affected_vm_names is None:
         affected_vm_names = issue.get("vm_names")
     return {
         "id": issue_id,
-        "title": str(issue.get("title") or issue_id.replace("-", " ").title()).strip(),
-        "detail": str(issue.get("detail") or "").strip(),
-        "stage": str(issue.get("stage") or "inventory").strip(),
-        "affected_vm_names": [str(name) for name in affected_vm_names or []],
-        "severity": str(issue.get("severity") or "advisory").strip().lower(),
+        "title": _string(issue.get("title")) or issue_id.replace("-", " ").title(),
+        "detail": _string(issue.get("detail")),
+        "stage": _string(issue.get("stage")) or "inventory",
+        "affected_vm_names": _string_collection(affected_vm_names),
+        "severity": _string(issue.get("severity")).lower() or "advisory",
     }
 
 
 def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
-    setup = dict(context.get("setup") or {})
-    inventory = dict(context.get("inventory") or {})
-    scenario_inputs = dict(context.get("scenarios") or {})
-    recommendation = str(context.get("recommendation") or "").strip().lower()
+    setup = _mapping(context.get("setup"))
+    inventory = _mapping(context.get("inventory"))
+    scenario_inputs = _mapping(context.get("scenarios"))
+    recommendation = _string(context.get("recommendation")).lower()
     if recommendation not in VALID_RECOMMENDATIONS:
         recommendation = ""
-    rationale = str(context.get("recommendation_rationale") or "").strip()
+    rationale = _string(context.get("recommendation_rationale"))
 
     issues = [
         _normalize_issue(issue)
-        for issue in inventory.get("issues") or []
-        if isinstance(issue, Mapping)
+        for issue in _issue_collection(inventory.get("issues"))
     ]
-    acknowledged = {
-        str(value) for value in inventory.get("acknowledged_warning_ids") or []
-    }
+    acknowledged = set(
+        _string_collection(inventory.get("acknowledged_warning_ids"))
+    )
     critical = [
         issue
         for issue in issues
@@ -54,10 +84,13 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
 
     scenario_results: dict[str, dict[str, Any]] = {}
     for scenario_id in ("native", "ocvs", "hybrid"):
-        source = dict(scenario_inputs.get(scenario_id) or {})
-        eligible = bool(source.get("technically_eligible"))
-        pricing_complete = bool(source.get("pricing_complete"))
-        unsupported = [str(name) for name in source.get("unsupported_vm_names") or []]
+        source = _mapping(scenario_inputs.get(scenario_id))
+        eligible = source.get("technically_eligible") is True
+        monthly_cost = _finite_monthly_cost(source.get("monthly_cost"))
+        pricing_complete = (
+            source.get("pricing_complete") is True and monthly_cost is not None
+        )
+        unsupported = _string_collection(source.get("unsupported_vm_names"))
         remediation_required = scenario_id == "native" and bool(unsupported)
         rankable = eligible and pricing_complete
         state = (
@@ -74,8 +107,8 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
             "rankable": rankable,
             "remediation_required": remediation_required,
             "affected_vm_names": unsupported,
-            "customer_ready": rankable and not remediation_required,
-            "monthly_cost": float(source.get("monthly_cost") or 0.0),
+            "customer_ready": False,
+            "monthly_cost": monthly_cost,
         }
 
     ranked = [
@@ -85,6 +118,26 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
     ]
     lowest_complete = min(ranked)[1] if ranked else ""
 
+    setup_ready = all(
+        (
+            _string(setup.get("assessment_name")),
+            _string(setup.get("customer_name")),
+            setup.get("has_price_list") is True,
+            setup.get("has_inventory") is True,
+        )
+    )
+    included = _string_collection(inventory.get("included_vm_names"))
+    placements = _mapping(inventory.get("placements"))
+    inventory_ready = bool(included) and not critical and not unacknowledged and all(
+        placements.get(name) in {"native", "ocvs", "review"} for name in included
+    )
+    unsaved_value = context.get("has_unsaved_scenario_changes")
+    scenarios_saved = isinstance(unsaved_value, bool) and not unsaved_value
+    scenarios_complete = scenarios_saved and any(
+        scenario["rankable"] for scenario in scenario_results.values()
+    )
+
+    prerequisites_ready = setup_ready and inventory_ready and scenarios_complete
     selected = scenario_results.get(recommendation)
     native_treatment_ready = not (
         recommendation == "native"
@@ -92,37 +145,19 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
         and selected["remediation_required"]
         and ("unsupported-native" not in acknowledged or not rationale)
     )
+    for scenario in scenario_results.values():
+        scenario["customer_ready"] = bool(
+            prerequisites_ready
+            and scenario["rankable"]
+            and not scenario["remediation_required"]
+        )
     if selected:
         selected["customer_ready"] = bool(
-            selected["rankable"] and native_treatment_ready
+            prerequisites_ready
+            and selected["rankable"]
+            and native_treatment_ready
         )
-    customer_ready = bool(
-        selected
-        and selected["rankable"]
-        and not critical
-        and not unacknowledged
-        and not context.get("has_unsaved_scenario_changes")
-        and native_treatment_ready
-    )
-
-    setup_ready = all(
-        (
-            str(setup.get("assessment_name") or "").strip(),
-            str(setup.get("customer_name") or "").strip(),
-            setup.get("has_price_list"),
-            setup.get("has_inventory"),
-        )
-    )
-    included = [str(name) for name in inventory.get("included_vm_names") or []]
-    placements = dict(inventory.get("placements") or {})
-    inventory_ready = bool(included) and not critical and not unacknowledged and all(
-        placements.get(name) in {"native", "ocvs", "review"} for name in included
-    )
-    scenarios_complete = not context.get("has_unsaved_scenario_changes") and any(
-        values["rankable"] for values in scenario_results.values()
-    )
-
-    prerequisites_ready = setup_ready and inventory_ready and scenarios_complete
+    customer_ready = bool(selected and selected["customer_ready"])
     overall = (
         "customer_ready"
         if customer_ready
