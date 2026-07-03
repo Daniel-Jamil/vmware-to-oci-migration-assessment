@@ -36,6 +36,7 @@ DUPLICATE_INVENTORY = app_module.RVTOOLS_DIR / "duplicate_inventory.csv"
 INVENTORY_REVIEW_INVENTORY = app_module.RVTOOLS_DIR / "inventory_review.csv"
 UNKNOWN_ONLY_INVENTORY = app_module.RVTOOLS_DIR / "unknown_only_inventory.csv"
 LARGE_INVENTORY = app_module.RVTOOLS_DIR / "large_inventory_950.csv"
+NATIVE_SCENARIO_INVENTORY = app_module.RVTOOLS_DIR / "native_scenario_75.csv"
 OFFICE_LOCK_INVENTORY = app_module.RVTOOLS_DIR / "~$regression_inventory.xlsx"
 REJECTED_INPUT = app_module.RVTOOLS_DIR / "not_vm_inventory.csv"
 EXPECTED_VM_COUNT = 4
@@ -280,6 +281,31 @@ def create_regression_fixtures() -> None:
         "\n".join(",".join(value for value in row) for row in large_inventory_rows) + "\n",
         encoding="utf-8",
     )
+    native_scenario_rows = [
+        ["VM", "Powerstate", "Template", "OS according to the configuration file", "CPUs", "Memory", "Provisioned MiB"]
+    ]
+    native_scenario_rows.extend(
+        [
+            f"native-page-vm-{index + 1:03d}",
+            "poweredOn",
+            "False",
+            (
+                "Oracle Linux 8 (64-bit)"
+                if index < 70
+                else "Microsoft Windows Server 2008 (64-bit)"
+                if index < 73
+                else "Unknown"
+            ),
+            "4",
+            "8192",
+            "102400",
+        ]
+        for index in range(75)
+    )
+    NATIVE_SCENARIO_INVENTORY.write_text(
+        "\n".join(",".join(value for value in row) for row in native_scenario_rows) + "\n",
+        encoding="utf-8",
+    )
     xlsx_bytes = app_module._build_xlsx_workbook_bytes(
         [{"name": "vInfo", "rows": inventory_rows}],
         currency_fmt_code='€#,##0.00',
@@ -522,7 +548,11 @@ def validate_current_readiness_routes() -> None:
             prior_calls = len(readiness_results)
             response = client.post(
                 "/step4",
-                data={"action": "save", "active_scenario": "native"},
+                data={
+                    "action": "save",
+                    "active_scenario": "native",
+                    "hybrid_placement:vm-app-01": "native",
+                },
                 follow_redirects=True,
             )
             check(
@@ -2906,6 +2936,330 @@ def validate_large_inventory_review_containment() -> None:
     )
 
 
+def validate_task7_native_scenario_workspace() -> None:
+    rows, _source = app_module.load_vms_from_vinfo(str(NATIVE_SCENARIO_INVENTORY))
+    check("Task 7 Native fixture has 75 VMs", len(rows) == 75, str(len(rows)))
+    selected_names = [str(row["name"]) for row in rows]
+    supported_signatures = app_module.load_supported_os_signatures()
+    placements = {
+        str(row["name"]): app_module.default_inventory_placement(row, supported_signatures)
+        for row in rows
+    }
+    state_id = f"task7_native_{uuid4().hex}"
+    price_file = find_price_file()
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = selected_names
+        state["step4_hybrid_placements"] = placements
+        state["acknowledged_warning_ids"] = ["unsupported-native", "unknown-os"]
+        state["step4_vm_shapes"] = {
+            selected_names[0]: "E4",
+            selected_names[50]: "E5",
+        }
+        state["step4_vm_bursts"] = {
+            selected_names[0]: "100%",
+            selected_names[50]: "12.5%",
+        }
+        app_module.save_app_state(state)
+
+    client = app_module.app.test_client()
+    with client.session_transaction() as sess:
+        sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+        sess["state_id"] = state_id
+        sess["selected_rvtools_file"] = str(NATIVE_SCENARIO_INVENTORY)
+        sess["selected_pricelist_file"] = price_file
+        sess["customer_name"] = "Task 7 Customer"
+        sess["active_assessment_name"] = "Task 7 Assessment"
+
+    paths_response = client.get("/step4?tab=paths", follow_redirects=False)
+    paths_alias = client.get("/scenario/paths", follow_redirects=False)
+    price_alias = client.get("/scenario/price", follow_redirects=False)
+    native_alias = client.get("/scenario/native", follow_redirects=False)
+    check(
+        "Task 7 scenario aliases route to their owning stages",
+        paths_response.status_code in {302, 303}
+        and paths_response.headers.get("Location", "").endswith("/step3")
+        and paths_alias.headers.get("Location", "").endswith("/step3")
+        and price_alias.headers.get("Location", "").endswith("/step4?tab=price")
+        and native_alias.headers.get("Location", "").endswith("/step4?tab=native"),
+        str(
+            {
+                "paths": paths_response.headers.get("Location"),
+                "paths_alias": paths_alias.headers.get("Location"),
+                "price_alias": price_alias.headers.get("Location"),
+                "native_alias": native_alias.headers.get("Location"),
+            }
+        ),
+    )
+
+    response = client.get("/step4?tab=native")
+    html = response.data.decode("utf-8", errors="replace")
+    tablist_match = re.search(
+        r'<div\b[^>]*class="[^"]*top-tabs[^"]*"[^>]*role="tablist"[^>]*>(.*?)</div>',
+        html,
+        re.S,
+    )
+    tablist_html = tablist_match.group(1) if tablist_match else ""
+    tabs = re.findall(r'<button\b([^>]*role="tab"[^>]*)>(.*?)</button>', tablist_html, re.S)
+    tab_labels = [re.sub(r"<[^>]+>", "", label).strip() for _attrs, label in tabs]
+    active_tabs = [attrs for attrs, _label in tabs if 'aria-selected="true"' in attrs]
+    inactive_tabs = [attrs for attrs, _label in tabs if 'aria-selected="false"' in attrs]
+    check(
+        "Stage 3 tablist contains only Native OCVS and Hybrid with one roving active tab",
+        response.status_code == 200
+        and tab_labels == ["Native", "OCVS", "Hybrid"]
+        and len(active_tabs) == 1
+        and 'tabindex="0"' in active_tabs[0]
+        and all('tabindex="-1"' in attrs for attrs in inactive_tabs)
+        and "Migration Paths" not in tablist_html
+        and "Price Comparison" not in tablist_html
+        and "disabled" not in tabs[0][0],
+        f"labels={tab_labels}, active={active_tabs}, inactive={inactive_tabs}",
+    )
+    check(
+        "Results remains reachable through shared four-stage navigation",
+        'href="/step4?tab=price"' in html and "Results &amp; Export" in html,
+    )
+
+    page_rows = re.findall(r'<tr\b[^>]*data-native-editor-row[^>]*>', html)
+    monthly_cost_match = re.search(r'data-native-monthly-cost="([0-9.]+)"', html)
+    check(
+        "Native page one renders 50 of 75 editor rows while retaining full-scope totals",
+        len(page_rows) == 50
+        and 'data-native-workload-count="75"' in html
+        and 'data-native-editor-filtered-count="75"' in html
+        and 'data-native-page="1"' in html
+        and 'data-native-page-count="2"' in html
+        and monthly_cost_match is not None
+        and float(monthly_cost_match.group(1)) > 0,
+        f"rows={len(page_rows)}, monthly={monthly_cost_match.group(1) if monthly_cost_match else None}",
+    )
+    native_header = re.search(r'<header\b[^>]*data-scenario-header="native".*?</header>', html, re.S)
+    native_header_html = native_header.group(0) if native_header else ""
+    check(
+        "Native summary uses backend readiness and keeps unsupported workloads modeled",
+        'data-native-readiness-state="needs_attention"' in native_header_html
+        and "Requires remediation" in native_header_html
+        and "Recalculate &amp; Save" in html
+        and "75 VMs" in native_header_html
+        and "Ineligible" not in native_header_html
+        and "Not saved yet" in native_header_html,
+        native_header_html[:800],
+    )
+
+    first_vm = selected_names[0]
+    expected_labels = {
+        "ocpu": "OCPU",
+        "burst": "burst",
+        "vpu": "VPU",
+        "oci-shape": "OCI target shape",
+    }
+    accessible_controls = True
+    for suffix, setting in expected_labels.items():
+        control_id = f"native-row-1-{suffix}"
+        label_match = re.search(
+            rf'<label\b[^>]*for="{re.escape(control_id)}"[^>]*>(.*?)</label>',
+            html,
+            re.S,
+        )
+        label_text = re.sub(r"<[^>]+>", " ", label_match.group(1)) if label_match else ""
+        accessible_controls = accessible_controls and bool(
+            label_match and first_vm in " ".join(label_text.split()) and setting in label_text
+        )
+    rendered_ids = re.findall(r'\bid="([^"]+)"', html)
+    check(
+        "Native editor controls use stable row IDs and explicit VM setting labels",
+        accessible_controls
+        and all(first_vm not in control_id for control_id in rendered_ids)
+        and 'aria-label="Native editor rows"' in html,
+    )
+    submitted_control_counts = {
+        name: len(re.findall(rf'<(?:input|select)\b[^>]*name="{re.escape(name)}"', html))
+        for name in ("vm_name", "vm_ocpu", "vm_burst", "vm_vpu", "oci_shape", "vm_os_license")
+    }
+    submitted_control_counts["editor_rows"] = html.count("data-native-editor-row")
+    check(
+        "Native desktop and mobile rendering share one submitted control tree",
+        all(count == 50 for count in submitted_control_counts.values()),
+        str(submitted_control_counts),
+    )
+
+    remediation_response = client.get("/step4?tab=native&native_support=remediation")
+    remediation_html = remediation_response.data.decode("utf-8", errors="replace")
+    remediation_rows = re.findall(r'<tr\b[^>]*data-native-editor-row[^>]*>', remediation_html)
+    remediation_label = re.search(
+        r'<label\b[^>]*for="native-row-71-os-license"[^>]*>(.*?)</label>',
+        remediation_html,
+        re.S,
+    )
+    remediation_label_text = re.sub(r"<[^>]+>", " ", remediation_label.group(1)) if remediation_label else ""
+    remediation_cost_match = re.search(r'data-native-monthly-cost="([0-9.]+)"', remediation_html)
+    check(
+        "Native remediation filter renders three supported-in-scope editor rows with full totals",
+        remediation_response.status_code == 200
+        and len(remediation_rows) == 3
+        and remediation_html.count("Requires remediation") >= 4
+        and 'data-native-editor-filtered-count="3"' in remediation_html
+        and remediation_cost_match is not None
+        and monthly_cost_match is not None
+        and remediation_cost_match.group(1) == monthly_cost_match.group(1)
+        and "native-page-vm-071" in remediation_label_text
+        and "OS license" in remediation_label_text,
+        f"rows={len(remediation_rows)}, label={remediation_label_text}",
+    )
+
+    search_response = client.get("/step4?tab=native&native_search=075")
+    search_html = search_response.data.decode("utf-8", errors="replace")
+    check(
+        "Native search filters editor rows only",
+        search_html.count("data-native-editor-row") == 1
+        and 'data-native-editor-filtered-count="1"' in search_html
+        and 'data-native-workload-count="75"' in search_html,
+    )
+    invalid_response = client.get(
+        "/step4?tab=native&native_page=not-a-page&native_page_size=77&native_support=invalid"
+    )
+    invalid_html = invalid_response.data.decode("utf-8", errors="replace")
+    clamped_response = client.get("/step4?tab=native&native_page=999")
+    clamped_html = clamped_response.data.decode("utf-8", errors="replace")
+    preserved_query_response = client.get(
+        "/step4?tab=native&native_page=2&native_page_size=25&native_search=native-page&native_support=supported"
+    )
+    preserved_query_html = preserved_query_response.data.decode("utf-8", errors="replace")
+    check(
+        "Native pagination inputs normalize malformed values and clamp ranges",
+        'data-native-page="1"' in invalid_html
+        and 'data-native-page-size="50"' in invalid_html
+        and 'data-native-support="all"' in invalid_html
+        and 'data-native-page="2"' in clamped_html
+        and clamped_html.count("data-native-editor-row") == 25,
+    )
+    check(
+        "Native pagination links preserve tab search size and support state",
+        "tab=native" in preserved_query_html
+        and "native_page_size=25" in preserved_query_html
+        and "native_search=native-page" in preserved_query_html
+        and "native_support=supported" in preserved_query_html,
+    )
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state_before_empty_save = app_module.load_app_state()
+    empty_save = client.post(
+        "/step4",
+        data={"action": "save", "active_scenario": "native"},
+        follow_redirects=False,
+    )
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state_after_empty_save = app_module.load_app_state()
+    with client.session_transaction() as sess:
+        empty_save_marked_unsaved = (
+            sess.get(app_module.STEP4_UNSAVED_READINESS_SESSION_KEY) is True
+        )
+    empty_save_redirect = client.get(empty_save.headers.get("Location", ""))
+    check(
+        "Empty Native save rejects without persistence and marks redirected readiness unsaved",
+        empty_save.status_code in {302, 303}
+        and state_after_empty_save == state_before_empty_save
+        and empty_save_marked_unsaved
+        and b"No scenario settings were submitted" in empty_save_redirect.data,
+        f"status={empty_save.status_code}, location={empty_save.headers.get('Location')}",
+    )
+
+    partial_post = client.post(
+        "/step4",
+        data=MultiDict(
+            [
+                ("action", "save"),
+                ("active_scenario", "native"),
+                ("native_page", "1"),
+                ("native_page_size", "50"),
+                ("native_search", ""),
+                ("native_support", "all"),
+                ("vm_name", first_vm),
+                ("vm_os_license", ""),
+                ("vm_ocpu", "3"),
+                ("vm_burst", "50%"),
+                ("vm_vpu", "20"),
+                ("oci_shape", "E6"),
+            ]
+        ),
+        follow_redirects=False,
+    )
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        updated_state = app_module.load_app_state()
+    check(
+        "Partial Native page POST updates submitted controls and preserves omitted pages",
+        partial_post.status_code in {302, 303}
+        and updated_state.get("step4_vm_shapes", {}).get(first_vm) == "E6"
+        and updated_state.get("step4_vm_shapes", {}).get(selected_names[50]) == "E5"
+        and updated_state.get("step4_vm_bursts", {}).get(first_vm) == "50%"
+        and updated_state.get("step4_vm_bursts", {}).get(selected_names[50]) == "12.5%"
+        and updated_state.get("step4_hybrid_placements") == placements,
+        f"location={partial_post.headers.get('Location')}, state={updated_state}",
+    )
+
+    price_response = client.get("/step4?tab=price")
+    price_html = price_response.data.decode("utf-8", errors="replace")
+    check(
+        "Price renders as Stage 4 Results without joining the Stage 3 tablist",
+        price_response.status_code == 200
+        and "Step 4 of 4" in price_html
+        and 'role="tablist"' not in price_html
+        and 'id="scenario-panel-price"' in price_html
+        and 'aria-labelledby="scenario-tab-price"' not in price_html
+        and 'aria-label="Results and price comparison"' in price_html,
+    )
+
+    step4_source = (ROOT / "templates" / "step4.html").read_text(encoding="utf-8")
+    header_partial_path = ROOT / "templates" / "_scenario_header.html"
+    native_partial_path = ROOT / "templates" / "_scenario_native.html"
+    scenarios_css_path = ROOT / "static" / "css" / "scenarios.css"
+    scenario_js_path = ROOT / "static" / "js" / "scenario-editor.js"
+    scenarios_css = scenarios_css_path.read_text(encoding="utf-8") if scenarios_css_path.exists() else ""
+    scenario_js = scenario_js_path.read_text(encoding="utf-8") if scenario_js_path.exists() else ""
+    check(
+        "Stage 3 uses scenario header and Native content partials with conventional assets",
+        header_partial_path.exists()
+        and native_partial_path.exists()
+        and '{% include "_scenario_header.html" %}' in step4_source
+        and '{% include "_scenario_native.html" %}' in step4_source
+        and "css/scenarios.css" in step4_source
+        and "js/scenario-editor.js" in step4_source,
+    )
+    check(
+        "Scenario editor source exposes roving tabs dirty live status and navigation warning hooks",
+        all(token in scenario_js for token in [
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+            "aria-selected",
+            "tabindex",
+            "beforeunload",
+            "data-scenario-dirty-live",
+            "data-dirty-navigation",
+            "workspace-stage-select",
+            "control.form === scenarioForm",
+        ]),
+    )
+    check(
+        "Scenario CSS constrains page width and provides scroll sticky and mobile contracts",
+        all(token in scenarios_css for token in [
+            "overflow-x: auto",
+            "position: sticky",
+            "max-width: 100%",
+            "@media (max-width: 600px)",
+            "--oracle-red",
+            "--status-green",
+        ]),
+    )
+
+
 def validate_manual_sizing_input() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
@@ -3922,6 +4276,7 @@ def main() -> None:
     validate_guided_inventory_review()
     validate_inventory_review_transactions_and_step4_boundary()
     validate_large_inventory_review_containment()
+    validate_task7_native_scenario_workspace()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)
     validate_workbook(workbook_path)

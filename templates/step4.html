@@ -799,6 +799,7 @@
       .scenario-panel-actions { justify-content: flex-start; }
     }
   </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/scenarios.css') }}" />
 {% endblock %}
 {% block stage_content %}
   <div class="container">
@@ -818,29 +819,18 @@
     {% set pricing_symbol = currency_symbol_map.get((pricing_currency or 'USD'), (pricing_currency or 'USD') ~ ' ') %}
 
     {% set initial_titles = {
-      'paths': 'Step 3 - Migration Paths',
       'native': 'Migration to OCI Native',
       'ocvs': 'Migration to OCVS',
       'hybrid': 'Migration to Hybrid Platform',
-      'price': 'Price Comparison'
+      'price': 'Results & Export'
     } %}
-    <h1 id="step4-main-title">{{ initial_titles.get(active_scenario, 'Step 3 - Migration Paths') }}</h1>
+    <h1 id="step4-main-title">{{ initial_titles.get(active_scenario, 'Migration to OCI Native') }}</h1>
 
     <div class="top-actions">
-      <div class="workspace-nav" aria-label="Assessment workspace">
-        <span class="workspace-nav-label">Assessment workspace</span>
-        <div class="top-tabs" role="tablist" aria-label="Migration path views">
-          <button
-            type="button"
-            id="scenario-tab-paths"
-            class="scenario-tab {% if active_scenario == 'paths' %}is-active{% endif %}"
-            role="tab"
-            aria-selected="{{ 'true' if active_scenario == 'paths' else 'false' }}"
-            aria-controls="scenario-panel-paths"
-            data-scenario-tab="paths"
-          >
-            Migration Paths
-          </button>
+      {% if active_scenario != 'price' %}
+        <div class="workspace-nav" aria-label="Scenario workspace">
+          <span class="workspace-nav-label">Scenario workspace</span>
+          <div class="top-tabs" role="tablist" aria-label="Migration scenarios">
           {% for view in scenario_views %}
             <button
               type="button"
@@ -849,27 +839,18 @@
               role="tab"
               aria-selected="{{ 'true' if active_scenario == view.id else 'false' }}"
               aria-controls="scenario-panel-{{ view.id }}"
+              tabindex="{{ '0' if active_scenario == view.id else '-1' }}"
               data-scenario-tab="{{ view.id }}"
+              data-dirty-navigation
             >
-              {{ view.title }}
+              {{ 'Native' if view.id == 'native' else view.title }}
             </button>
           {% endfor %}
-          <button
-            type="button"
-            id="scenario-tab-price"
-            class="scenario-tab {% if active_scenario == 'price' %}is-active{% endif %}"
-            role="tab"
-            aria-selected="{{ 'true' if active_scenario == 'price' else 'false' }}"
-            aria-controls="scenario-panel-price"
-            data-scenario-tab="price"
-          >
-            Price Comparison
-          </button>
+          </div>
         </div>
-      </div>
+      {% endif %}
       <div class="action-group">
         <input type="hidden" id="active_scenario" name="active_scenario" value="{{ active_scenario }}" form="step4-form" />
-        <button type="submit" form="step4-form" name="action" value="save">Save Settings</button>
         <button type="submit" form="step4-form" name="action" value="export_excel">Export to Excel</button>
       </div>
     </div>
@@ -921,7 +902,7 @@
           id="scenario-panel-paths"
           class="scenario-panel {% if active_scenario == 'paths' %}is-active{% endif %}"
           role="tabpanel"
-          aria-labelledby="scenario-tab-paths"
+          aria-label="Migration paths overview"
           data-scenario-panel="paths"
           {% if active_scenario != 'paths' %}hidden{% endif %}
         >
@@ -1210,7 +1191,7 @@
           id="scenario-panel-price"
           class="scenario-panel {% if active_scenario == 'price' %}is-active{% endif %}"
           role="tabpanel"
-          aria-labelledby="scenario-tab-price"
+          aria-label="Results and price comparison"
           data-scenario-panel="price"
           {% if active_scenario != 'price' %}hidden{% endif %}
         >
@@ -1404,28 +1385,11 @@
             data-scenario-panel="{{ view.id }}"
             {% if active_scenario != view.id %}hidden{% endif %}
           >
-            <div class="scenario-panel-head">
-              <div>
-                <h3>
-                  {% if view.id == 'native' %}
-                    Migration to OCI Native
-                  {% elif view.id == 'ocvs' %}
-                    Migration to OCVS
-                  {% elif view.id == 'hybrid' %}
-                    Migration to Hybrid Platform
-                  {% else %}
-                    {{ view.title }}
-                  {% endif %}
-                </h3>
-                <p class="scenario-intro">{{ view.intro }}</p>
-              </div>
-              <div class="scenario-panel-actions">
-                {% if view.id == best_scenario.id %}
-                  <span class="scenario-badge">Lowest cost path</span>
-                {% endif %}
-              </div>
-            </div>
+            {% include "_scenario_header.html" %}
 
+            {% if view.id == 'native' %}
+              {% include "_scenario_native.html" %}
+            {% else %}
             {% if view.id == 'ocvs' %}
               <div class="ocvs-step-label">
                 <h4>1. Scenario Snapshot</h4>
@@ -2833,6 +2797,7 @@
                 <div class="pricing-note">OCVS host pricing was not found in the selected price list.</div>
               {% endif %}
             {% endif %}
+            {% endif %}
           </section>
         {% endfor %}
       </div>
@@ -2872,10 +2837,10 @@
         hybrid: 'Migration to Hybrid Platform',
         price: 'Price Comparison',
       };
-      if (!tabs.length || !panels.length) return;
+      if (!panels.length) return;
 
       function setScenarioTab(id, updateHash) {
-        const targetId = id || 'paths';
+        const targetId = id || 'native';
         if (activeScenarioInput) {
           activeScenarioInput.value = targetId;
         }
@@ -2891,6 +2856,7 @@
           const isActive = tab.dataset.scenarioTab === targetId;
           tab.classList.toggle('is-active', isActive);
           tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+          tab.setAttribute('tabindex', isActive ? '0' : '-1');
         });
         panels.forEach((panel) => {
           const isActive = panel.dataset.scenarioPanel === targetId;
@@ -3035,7 +3001,7 @@
           syncActiveScenarioSettings();
           const activeTab = document.querySelector('[data-scenario-tab].is-active');
           const hashMatch = String(window.location.hash || '').match(/^#scenario-(paths|price|native|ocvs|hybrid)$/);
-          activeScenarioInput.value = hashMatch?.[1] || activeTab?.dataset.scenarioTab || activeScenarioInput.value || 'paths';
+          activeScenarioInput.value = hashMatch?.[1] || activeTab?.dataset.scenarioTab || activeScenarioInput.value || 'native';
 
           const submitter = event.submitter;
           if (submitter && submitter.name === 'action' && submitter.value === 'export_excel') {
@@ -3825,4 +3791,5 @@
       }
     })();
   </script>
+  <script src="{{ url_for('static', filename='js/scenario-editor.js') }}" defer></script>
 {% endblock %}

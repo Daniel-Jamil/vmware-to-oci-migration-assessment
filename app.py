@@ -144,7 +144,10 @@ APP_STATE_DIR = Path("downloads/app_state")
 SAVED_ASSESSMENT_SCHEMA_VERSION = 1
 PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_VISIBLE_PRICE_LISTS = 10
-NATIVE_VM_INPUT_ROW_LIMIT = 500
+NATIVE_VM_INPUT_ROW_LIMIT = 50
+NATIVE_PAGE_SIZE_OPTIONS = (25, 50, 100)
+NATIVE_SUPPORT_FILTERS = {"all", "supported", "remediation", "review"}
+NATIVE_SEARCH_MAX_LENGTH = 200
 STEP4_UNSAVED_READINESS_SESSION_KEY = "_step4_unsaved_scenario_changes"
 
 HOURS_PER_MONTH = 730.0
@@ -2755,6 +2758,93 @@ def normalize_step4_scenario_tab(value: Any, default: str = "paths") -> str:
     return tab if tab in {"paths", "native", "ocvs", "hybrid", "price"} else default
 
 
+def normalize_native_editor_query(values: Any) -> dict[str, Any]:
+    try:
+        page = int(str(values.get("native_page", "1")).strip())
+    except (TypeError, ValueError):
+        page = 1
+    page = max(1, page)
+
+    try:
+        page_size = int(str(values.get("native_page_size", NATIVE_VM_INPUT_ROW_LIMIT)).strip())
+    except (TypeError, ValueError):
+        page_size = NATIVE_VM_INPUT_ROW_LIMIT
+    if page_size not in NATIVE_PAGE_SIZE_OPTIONS:
+        page_size = NATIVE_VM_INPUT_ROW_LIMIT
+
+    search = str(values.get("native_search", "") or "").strip()[:NATIVE_SEARCH_MAX_LENGTH]
+    support = str(values.get("native_support", "all") or "all").strip().lower()
+    if support not in NATIVE_SUPPORT_FILTERS:
+        support = "all"
+    return {
+        "page": page,
+        "page_size": page_size,
+        "search": search,
+        "support": support,
+    }
+
+
+def build_native_editor_page(
+    vm_rows: list[dict[str, Any]],
+    query: dict[str, Any],
+    supported_signatures: list[str],
+) -> dict[str, Any]:
+    annotated_rows: list[dict[str, Any]] = []
+    for row_index, source_row in enumerate(vm_rows, start=1):
+        row = dict(source_row)
+        os_name = str(row.get("os_name") or "Unknown / Empty")
+        if _is_unknown_os(os_name) or not supported_signatures:
+            support_state = "review"
+            support_label = "Review required"
+        elif is_oci_supported_os(os_name, supported_signatures):
+            support_state = "supported"
+            support_label = "Supported"
+        else:
+            support_state = "remediation"
+            support_label = "Requires remediation"
+        row.update(
+            {
+                "native_row_index": row_index,
+                "native_support_state": support_state,
+                "native_support_label": support_label,
+            }
+        )
+        annotated_rows.append(row)
+
+    search_term = str(query.get("search") or "").casefold()
+    support_filter = str(query.get("support") or "all")
+    filtered_rows = [
+        row
+        for row in annotated_rows
+        if (
+            not search_term
+            or search_term
+            in f"{row.get('vm_name', '')} {row.get('os_name', '')}".casefold()
+        )
+        and (
+            support_filter == "all"
+            or row.get("native_support_state") == support_filter
+        )
+    ]
+    page_size = int(query.get("page_size") or NATIVE_VM_INPUT_ROW_LIMIT)
+    page_count = max(1, int(math.ceil(len(filtered_rows) / page_size)))
+    page = min(max(1, int(query.get("page") or 1)), page_count)
+    start = (page - 1) * page_size
+    return {
+        "rows": filtered_rows[start : start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "page_size_options": NATIVE_PAGE_SIZE_OPTIONS,
+        "page_count": page_count,
+        "filtered_count": len(filtered_rows),
+        "workload_count": len(vm_rows),
+        "search": str(query.get("search") or ""),
+        "support": support_filter,
+        "first_row": start + 1 if filtered_rows else 0,
+        "last_row": min(start + page_size, len(filtered_rows)),
+    }
+
+
 WORKSPACE_STAGE_MAP = {
     "setup": {
         "number": 1,
@@ -3720,9 +3810,22 @@ def build_workspace_context(
     return context
 
 
-def step4_tab_redirect(tab: str = "paths") -> str:
-    normalized_tab = normalize_step4_scenario_tab(tab)
-    return f"{url_for('step4', tab=normalized_tab)}#scenario-{normalized_tab}"
+def step4_tab_redirect(tab: str = "native", **native_query: Any) -> str:
+    normalized_tab = normalize_step4_scenario_tab(tab, "native")
+    if normalized_tab == "paths":
+        return url_for("step3")
+    values: dict[str, Any] = {"tab": normalized_tab}
+    if normalized_tab == "native" and native_query:
+        query = normalize_native_editor_query(native_query)
+        values.update(
+            {
+                "native_page": query["page"],
+                "native_page_size": query["page_size"],
+                "native_search": query["search"],
+                "native_support": query["support"],
+            }
+        )
+    return url_for("step4", **values)
 
 
 def normalize_hybrid_placement(value: Any, default: str = "ocvs") -> str:
@@ -7662,6 +7765,12 @@ def step3() -> str:
 def step4() -> str:
     _cleanup_legacy_session_keys()
     has_unsaved_scenario_changes = False
+    requested_scenario = normalize_step4_scenario_tab(
+        request.args.get("tab", "native"),
+        "native",
+    )
+    if request.method == "GET" and requested_scenario == "paths":
+        return redirect(url_for("step3"))
 
     selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
     customer_name = normalize_customer_name(session.get("customer_name", ""))
@@ -7695,22 +7804,102 @@ def step4() -> str:
 
     submitted_hybrid_placements: dict[str, str] | None = None
     if request.method == "POST":
-        submitted_hybrid_placements, hybrid_field_errors, _field_errors = parse_exact_placement_fields(
-            request.form,
-            "hybrid_placement",
-            selected_vm_names,
-            selected_vm_names,
+        posted_scenario = normalize_step4_scenario_tab(
+            request.form.get("active_scenario", "native"),
+            "native",
         )
+        has_hybrid_fields = any(
+            str(key).startswith("hybrid_placement:") for key in request.form.keys()
+        )
+        hybrid_field_errors: list[str] = []
+        if posted_scenario == "hybrid" or has_hybrid_fields:
+            submitted_hybrid_placements, hybrid_field_errors, _field_errors = parse_exact_placement_fields(
+                request.form,
+                "hybrid_placement",
+                selected_vm_names,
+                selected_vm_names,
+            )
         if "hybrid_vm_name" in request.form or "hybrid_placement" in request.form:
             hybrid_field_errors.append("Legacy positional Hybrid placement fields are not accepted.")
         if hybrid_field_errors:
-            active_tab = normalize_step4_scenario_tab(request.form.get("active_scenario", "paths"))
+            active_tab = normalize_step4_scenario_tab(
+                request.form.get("active_scenario", "native"),
+                "native",
+            )
             session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
             flash(
                 "Choose a valid placement for every included VM. No scenario settings were saved.",
                 "error",
             )
-            return redirect(step4_tab_redirect(active_tab))
+            return redirect(step4_tab_redirect(active_tab, **request.form))
+
+        action = str(request.form.get("action", "save")).strip().lower()
+        if action == "save":
+            submitted_vm_names = request.form.getlist("vm_name")
+            native_control_values = [
+                request.form.getlist(field_name)
+                for field_name in (
+                    "oci_shape",
+                    "vm_ocpu",
+                    "vm_burst",
+                    "vm_vpu",
+                    "vm_os_license",
+                )
+            ]
+            selected_vm_set = set(selected_vm_names)
+            has_native_row_control = any(
+                str(vm_name).strip() in selected_vm_set
+                and any(row_index < len(values) for values in native_control_values)
+                for row_index, vm_name in enumerate(submitted_vm_names)
+            )
+            scenario_setting_fields = (
+                "iaas_discount_pct",
+                "vmware_license_price_per_core_yearly",
+                "ocvs_profile",
+                "ocvs_commitment_term",
+                "ocvs_dr_nodes",
+                "ocvs_vcpu_per_ocpu",
+                "ocvs_cpu_headroom_pct",
+                "ocvs_memory_headroom_pct",
+                "ocvs_storage_headroom_pct",
+                "ocvs_dense_vsan_usable_pct",
+                "ocvs_standard_storage_vpu",
+            )
+            has_scenario_setting = any(
+                field_name in request.form
+                and str(request.form.get(field_name, "")).strip()
+                for field_name in scenario_setting_fields
+            )
+            has_bulk_setting = any(
+                str(request.form.get(field_name, "")).strip()
+                for field_name in (
+                    "bulk_apply_oci_shape",
+                    "bulk_apply_burst",
+                    "bulk_apply_vpu",
+                    "bulk_apply_os_license",
+                )
+            )
+            has_native_strategy = (
+                str(request.form.get("native_shape_strategy_enabled", "")).strip()
+                == "1"
+                and bool(request.form.getlist("native_strategy_os"))
+            )
+            has_hybrid_setting = bool(submitted_hybrid_placements)
+            if not any(
+                (
+                    has_native_row_control,
+                    has_scenario_setting,
+                    has_bulk_setting,
+                    has_native_strategy,
+                    has_hybrid_setting,
+                )
+            ):
+                session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+                flash(
+                    "No scenario settings were submitted. No changes were saved.",
+                    "error",
+                )
+                return redirect(step4_tab_redirect(posted_scenario, **request.form))
 
     shape_options = load_oci_target_shapes()
     shape_pricing_map = load_oci_price_mapping_details()
@@ -7859,12 +8048,18 @@ def step4() -> str:
 
     export_format: str | None = None
     return_to = "step4"
-    active_scenario = normalize_step4_scenario_tab(request.args.get("tab", "paths"))
+    active_scenario = requested_scenario
+    native_editor_query = normalize_native_editor_query(
+        request.form if request.method == "POST" else request.args
+    )
 
     if request.method == "POST":
         action = str(request.form.get("action", "save")).strip().lower()
         return_to = str(request.form.get("return_to", "step4")).strip().lower()
-        active_scenario = normalize_step4_scenario_tab(request.form.get("active_scenario", "paths"))
+        active_scenario = normalize_step4_scenario_tab(
+            request.form.get("active_scenario", "native"),
+            "native",
+        )
         vm_names = request.form.getlist("vm_name")
         selected_shapes = request.form.getlist("oci_shape")
         selected_ocpus = request.form.getlist("vm_ocpu")
@@ -7915,7 +8110,9 @@ def step4() -> str:
         updated_bursts = dict(vm_burst_selection)
         updated_vpus = dict(vm_vpu_selection)
         updated_os_license = dict(vm_os_license_selection)
-        updated_hybrid_placements = dict(submitted_hybrid_placements or {})
+        updated_hybrid_placements = dict(hybrid_placement_selection)
+        if submitted_hybrid_placements is not None:
+            updated_hybrid_placements.update(submitted_hybrid_placements)
         for vm_name, shape in zip(vm_names, selected_shapes):
             clean_vm = str(vm_name).strip()
             clean_shape = str(shape).strip()
@@ -8104,7 +8301,7 @@ def step4() -> str:
             )
 
             flash("Migration path settings saved.", "success")
-            return redirect(step4_tab_redirect(active_scenario))
+            return redirect(step4_tab_redirect(active_scenario, **request.form))
 
     cost_context = {
         "shape_options": shape_options,
@@ -8130,7 +8327,12 @@ def step4() -> str:
 
     vm_rows.sort(key=lambda r: str(r["vm_name"]).lower())
     non_selected_vm_rows.sort(key=lambda r: str(r["vm_name"]).lower())
-    native_vm_input_rows = vm_rows[:NATIVE_VM_INPUT_ROW_LIMIT]
+    native_editor = build_native_editor_page(
+        vm_rows,
+        native_editor_query,
+        load_supported_os_signatures(),
+    )
+    native_vm_input_rows = native_editor["rows"]
     native_shape_strategy_rows = build_native_shape_strategy_rows(vm_rows)
 
     analysis = build_price_analysis_from_rows(
@@ -8240,6 +8442,41 @@ def step4() -> str:
             "windows_os_unit_price": windows_os_unit_price,
         },
     )
+    native_readiness = readiness.get("scenarios", {}).get("native", {})
+    if not isinstance(native_readiness, dict):
+        native_readiness = {}
+    if native_readiness.get("remediation_required") is True:
+        native_status_label = "Requires remediation"
+        native_status_tone = "remediation"
+    elif native_readiness.get("state") == "ready":
+        native_status_label = "Ready"
+        native_status_tone = "ready"
+    elif native_readiness.get("state") == "incomplete":
+        native_status_label = "Incomplete"
+        native_status_tone = "incomplete"
+    else:
+        native_status_label = "Needs attention"
+        native_status_tone = "attention"
+    if has_unsaved_scenario_changes:
+        native_change_summary = "Pending changes require recalculation"
+    elif step4_last_updated_at:
+        native_change_summary = f"Saved {step4_last_updated_at}"
+    else:
+        native_change_summary = "Not saved yet"
+    native_header = {
+        "readiness_state": str(native_readiness.get("state") or "incomplete"),
+        "status_label": native_status_label,
+        "status_tone": native_status_tone,
+        "monthly_cost": float(overall.get("total_monthly_cost", 0.0) or 0.0),
+        "workload_count": len(vm_rows),
+        "capacity_outcome": (
+            f"{int(overall.get('total_cpus', 0) or 0):,} vCPU / "
+            f"{int(overall.get('total_memory_gb', 0) or 0):,} GB RAM / "
+            f"{int(overall.get('total_provisioned_gb', 0) or 0):,} GB storage"
+        ),
+        "change_summary": native_change_summary,
+        "remediation_count": len(native_readiness.get("affected_vm_names", [])),
+    }
 
     return render_template(
         "step4.html",
@@ -8250,8 +8487,10 @@ def step4() -> str:
             source_vinfo_csv=source_vinfo_csv,
             vm_rows=vm_rows,
             native_vm_input_rows=native_vm_input_rows,
-            native_vm_input_row_limit=NATIVE_VM_INPUT_ROW_LIMIT,
-            native_vm_input_total=len(vm_rows),
+            native_vm_input_row_limit=native_editor["page_size"],
+            native_vm_input_total=native_editor["workload_count"],
+            native_editor=native_editor,
+            native_header=native_header,
             native_shape_strategy_rows=native_shape_strategy_rows,
             overall=overall,
             shape_options=shape_options,
@@ -8330,12 +8569,15 @@ def open_last_export() -> dict[str, Any] | tuple[dict[str, Any], int]:
 def scenario_page(scenario_id: str) -> str:
     _cleanup_legacy_session_keys()
 
-    scenario_id = str(scenario_id or "").strip().lower()
-    if scenario_id not in {"native", "ocvs", "hybrid"}:
+    raw_scenario_id = str(scenario_id or "").strip().lower()
+    scenario_id = normalize_step4_scenario_tab(raw_scenario_id, "")
+    if scenario_id == "paths":
+        return redirect(url_for("step3"))
+    if scenario_id not in {"native", "ocvs", "hybrid", "price"}:
         flash("Please select a valid migration path.", "error")
-        return redirect(step4_tab_redirect("paths"))
+        return redirect(url_for("step3"))
 
-    return redirect(f"{url_for('step4')}#scenario-{scenario_id}")
+    return redirect(step4_tab_redirect(scenario_id))
 
 
 @app.route("/step5", methods=["GET"])

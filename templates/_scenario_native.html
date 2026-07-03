@@ -1,0 +1,279 @@
+<div
+  class="native-workspace"
+  data-native-editor
+  data-native-page="{{ native_editor.page }}"
+  data-native-page-size="{{ native_editor.page_size }}"
+  data-native-page-count="{{ native_editor.page_count }}"
+  data-native-editor-filtered-count="{{ native_editor.filtered_count }}"
+  data-native-workload-count="{{ native_editor.workload_count }}"
+  data-native-support="{{ native_editor.support }}"
+>
+  <section class="native-decision" aria-labelledby="native-decision-title">
+    <div>
+      <p class="native-section-label">Sizing outcome</p>
+      <h3 id="native-decision-title">OCI Native sizing decision</h3>
+      <p>All selected VMs remain in the Native model. Compatibility findings identify remediation work without removing workload cost or capacity.</p>
+    </div>
+    <dl class="native-decision__metrics">
+      <div><dt>vCPU</dt><dd>{{ "{:,}".format(overall.total_cpus) }}</dd></div>
+      <div><dt>RAM</dt><dd>{{ "{:,}".format(overall.total_memory_gb) }} GB</dd></div>
+      <div><dt>Storage</dt><dd>{{ "{:,}".format(overall.total_provisioned_gb) }} GB</dd></div>
+      <div><dt>Total VPUs</dt><dd>{{ "{:,}".format(overall.total_vpus) }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="native-infrastructure" aria-labelledby="native-infrastructure-title">
+    <div>
+      <p class="native-section-label">Commercial inputs</p>
+      <h3 id="native-infrastructure-title">Infrastructure and Licensing</h3>
+      <p>Compute, memory, Block Volume, VPU, discount, and Windows license assumptions feed the full-workload model.</p>
+    </div>
+    <label class="native-field native-field--discount" for="iaas_discount_pct">
+      <span>IaaS discount</span>
+      <span class="native-input-suffix">
+        <input
+          id="iaas_discount_pct"
+          type="number"
+          name="iaas_discount_pct"
+          form="step4-form"
+          min="0"
+          max="100"
+          step="0.01"
+          value="{{ '%.2f'|format(iaas_discount_pct) }}"
+        />
+        <span aria-hidden="true">%</span>
+      </span>
+    </label>
+  </section>
+
+  <section class="native-editor" aria-labelledby="native-editor-title">
+    <div class="native-editor__heading">
+      <div>
+        <p class="native-section-label">Workload editor</p>
+        <h3 id="native-editor-title">VM Sizing Inputs</h3>
+        <p>Showing {{ native_editor.first_row }}-{{ native_editor.last_row }} of {{ native_editor.filtered_count }} matching VM(s). Scenario totals always use all {{ native_editor.workload_count }} selected VMs.</p>
+      </div>
+      <button type="button" id="open-shape-strategy" class="scenario-secondary-action">Default Shape</button>
+    </div>
+
+    <form class="native-filter-bar" method="get" action="{{ url_for('step4') }}" aria-label="Native editor filters">
+      <input type="hidden" name="tab" value="native" />
+      <label class="native-field native-field--search" for="native-search">
+        <span>Search</span>
+        <input id="native-search" type="search" name="native_search" value="{{ native_editor.search }}" placeholder="VM name or operating system" />
+      </label>
+      <label class="native-field" for="native-support">
+        <span>Native support</span>
+        <select id="native-support" name="native_support">
+          <option value="all" {% if native_editor.support == 'all' %}selected{% endif %}>All support states</option>
+          <option value="supported" {% if native_editor.support == 'supported' %}selected{% endif %}>Supported</option>
+          <option value="remediation" {% if native_editor.support == 'remediation' %}selected{% endif %}>Requires remediation</option>
+          <option value="review" {% if native_editor.support == 'review' %}selected{% endif %}>Review required</option>
+        </select>
+      </label>
+      <label class="native-field" for="native-page-size">
+        <span>Rows</span>
+        <select id="native-page-size" name="native_page_size">
+          {% for page_size in native_editor.page_size_options %}
+            <option value="{{ page_size }}" {% if native_editor.page_size == page_size %}selected{% endif %}>{{ page_size }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="scenario-secondary-action" type="submit">Apply filters</button>
+    </form>
+
+    <form
+      id="step4-form"
+      class="native-editor__form"
+      method="post"
+      action="{{ url_for('step4') }}"
+      data-scenario-form
+      data-scenario-clean="true"
+    >
+      <input type="hidden" name="native_page" value="{{ native_editor.page }}" />
+      <input type="hidden" name="native_page_size" value="{{ native_editor.page_size }}" />
+      <input type="hidden" name="native_search" value="{{ native_editor.search }}" />
+      <input type="hidden" name="native_support" value="{{ native_editor.support }}" />
+      <input type="hidden" id="bulk_apply_oci_shape" name="bulk_apply_oci_shape" value="" />
+      <input type="hidden" id="bulk_apply_burst" name="bulk_apply_burst" value="" />
+      <input type="hidden" id="bulk_apply_vpu" name="bulk_apply_vpu" value="" />
+      <input type="hidden" id="bulk_apply_os_license" name="bulk_apply_os_license" value="" />
+      <input type="hidden" id="native_shape_strategy_enabled" name="native_shape_strategy_enabled" value="" />
+      <div id="native-shape-strategy-fields"></div>
+
+      <div class="native-bulk-bar" aria-label="Native editor bulk defaults">
+        <label class="native-field" for="bulk_oci_shape">
+          <span>Target shape</span>
+          <select id="bulk_oci_shape">
+            <option value="">No bulk change</option>
+            {% for shape_name in shape_options %}<option value="{{ shape_name }}">{{ shape_name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="native-field" for="bulk_burst">
+          <span>Burst</span>
+          <select id="bulk_burst">
+            <option value="">No bulk change</option>
+            {% for burst_value in ['100%', '50%', '12.5%'] %}<option value="{{ burst_value }}">{{ burst_value }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="native-field" for="bulk_vpu">
+          <span>VPU</span>
+          <select id="bulk_vpu">
+            <option value="">No bulk change</option>
+            {% for vpu in vpu_options %}<option value="{{ vpu }}">{{ vpu }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="native-field" for="bulk_os_license">
+          <span>Windows license</span>
+          <select id="bulk_os_license">
+            <option value="">No bulk change</option>
+            <option value="BYOL">BYOL</option>
+            <option value="Lic Include">License included</option>
+          </select>
+        </label>
+      </div>
+      <div id="native-bulk-pending" class="native-bulk-pending" role="status" aria-live="polite" hidden></div>
+
+      <div class="native-editor-scroll" tabindex="0" role="region" aria-label="Native editor rows">
+        <table class="vm-table native-editor-table">
+          <thead>
+            <tr>
+              <th scope="col">VM</th>
+              <th scope="col">OS</th>
+              <th scope="col">Native status</th>
+              <th scope="col">OCI target</th>
+              <th scope="col">OCPU</th>
+              <th scope="col">Burst</th>
+              <th scope="col">VPU</th>
+              <th scope="col">OS license</th>
+              <th scope="col">vCPU</th>
+              <th scope="col">RAM</th>
+              <th scope="col">Storage</th>
+              <th scope="col">Monthly cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in native_vm_input_rows %}
+              {% set row_id = 'native-row-' ~ row.native_row_index %}
+              <tr
+                class="vm-row native-editor-row"
+                data-native-editor-row
+                data-native-support="{{ row.native_support_state }}"
+                data-memory-gb="{{ row.memory_gb }}"
+                data-provisioned-gb="{{ row.provisioned_gb }}"
+                data-os-name="{{ row.os_name }}"
+                data-initial-cpu-cost="{{ '%.6f'|format(row.cpu_monthly_cost) }}"
+                data-initial-ram-cost="{{ '%.6f'|format(row.ram_monthly_cost) }}"
+                data-initial-storage-capacity-cost="{{ '%.6f'|format(row.storage_capacity_monthly_cost) }}"
+                data-initial-storage-vpu-cost="{{ '%.6f'|format(row.storage_performance_monthly_cost) }}"
+                data-initial-storage-cost="{{ '%.6f'|format(row.storage_monthly_cost) }}"
+                data-initial-license-cost="{{ '%.6f'|format(row.os_license_monthly_cost) }}"
+                data-initial-total-cost="{{ '%.6f'|format(row.cpu_ram_monthly_cost + row.storage_monthly_cost + row.os_license_monthly_cost) }}"
+                data-initial-license-included="{{ 1 if row.os_license == 'Lic Include' else 0 }}"
+                data-initial-vpu="{{ row.vpu }}"
+              >
+                <th scope="row">
+                  <span class="native-editor-row__name">{{ row.vm_name }}</span>
+                  <input type="hidden" name="vm_name" value="{{ row.vm_name }}" />
+                </th>
+                <td><span class="native-editor-row__os">{{ row.os_name }}</span></td>
+                <td>
+                  <span class="native-support native-support--{{ row.native_support_state }}">{{ row.native_support_label }}</span>
+                </td>
+                <td>
+                  <label class="scenario-visually-hidden" for="{{ row_id }}-oci-shape">{{ row.vm_name }} OCI target shape setting</label>
+                  <select id="{{ row_id }}-oci-shape" name="oci_shape" required>
+                    {% for shape_name in shape_options %}
+                      <option value="{{ shape_name }}" {% if row.oci_shape == shape_name %}selected{% endif %}>{{ shape_name }}</option>
+                    {% endfor %}
+                  </select>
+                </td>
+                <td>
+                  <label class="scenario-visually-hidden" for="{{ row_id }}-ocpu">{{ row.vm_name }} OCPU setting</label>
+                  <input id="{{ row_id }}-ocpu" type="number" name="vm_ocpu" value="{{ row.ocpu }}" min="1" step="1" required />
+                </td>
+                <td>
+                  <label class="scenario-visually-hidden" for="{{ row_id }}-burst">{{ row.vm_name }} burst setting</label>
+                  <select id="{{ row_id }}-burst" name="vm_burst" required>
+                    {% for burst_value in ['100%', '50%', '12.5%'] %}
+                      <option value="{{ burst_value }}" {% if row.burst == burst_value or (row.burst == '1:1' and burst_value == '100%') %}selected{% endif %}>{{ burst_value }}</option>
+                    {% endfor %}
+                  </select>
+                </td>
+                <td>
+                  <label class="scenario-visually-hidden" for="{{ row_id }}-vpu">{{ row.vm_name }} VPU setting</label>
+                  <select id="{{ row_id }}-vpu" name="vm_vpu" required>
+                    {% for vpu in vpu_options %}<option value="{{ vpu }}" {% if row.vpu == vpu %}selected{% endif %}>{{ vpu }}</option>{% endfor %}
+                  </select>
+                </td>
+                <td>
+                  {% if row.is_windows_server %}
+                    <label class="scenario-visually-hidden" for="{{ row_id }}-os-license">{{ row.vm_name }} OS license setting</label>
+                    <select id="{{ row_id }}-os-license" name="vm_os_license" required>
+                      <option value="BYOL" {% if row.os_license == 'BYOL' %}selected{% endif %}>BYOL</option>
+                      <option value="Lic Include" {% if row.os_license == 'Lic Include' %}selected{% endif %}>License included</option>
+                    </select>
+                  {% else %}
+                    <span aria-hidden="true">Not applicable</span>
+                    <input type="hidden" name="vm_os_license" value="" />
+                  {% endif %}
+                </td>
+                <td>{{ row.cpus }}</td>
+                <td>{{ "{:,}".format(row.memory_gb) }} GB</td>
+                <td>{{ "{:,}".format(row.provisioned_gb) }} GB</td>
+                <td class="native-cost-cell">
+                  <strong class="total-cost">{{ pricing_symbol }}{{ "{:,.2f}".format(row.cpu_ram_monthly_cost + row.storage_monthly_cost + row.os_license_monthly_cost) }}</strong>
+                  <span class="cpu-ram-cost" hidden>{{ pricing_symbol }}{{ "{:,.2f}".format(row.cpu_ram_monthly_cost) }}</span>
+                  <span class="storage-cost" hidden>{{ pricing_symbol }}{{ "{:,.2f}".format(row.storage_monthly_cost) }}</span>
+                  <span class="os-license-cost" hidden>{{ pricing_symbol }}{{ "{:,.2f}".format(row.os_license_monthly_cost) }}</span>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="12" class="native-editor-empty">No VMs match the current Native editor filters.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <script id="pricing-config" type="application/json">
+        {{ {
+            'pricing_currency': pricing_currency or 'USD',
+            'shape_price_rates': shape_price_rates or {},
+            'shape_options': shape_options or [],
+            'block_storage_unit_price': block_storage_unit_price or 0,
+            'block_perf_unit_price': block_perf_unit_price or 0,
+            'windows_os_unit_price': windows_os_unit_price or 0,
+            'iaas_discount_pct': iaas_discount_pct or 0
+          } | tojson }}
+      </script>
+    </form>
+
+    <nav class="native-pagination" aria-label="Native editor pages">
+      <span>Page {{ native_editor.page }} of {{ native_editor.page_count }}</span>
+      <div>
+        {% if native_editor.page > 1 %}
+          <a
+            data-dirty-navigation
+            href="{{ url_for('step4', tab='native', native_page=native_editor.page - 1, native_page_size=native_editor.page_size, native_search=native_editor.search, native_support=native_editor.support) }}"
+          >Previous</a>
+        {% endif %}
+        {% for page_number in range(1, native_editor.page_count + 1) %}
+          {% if page_number == native_editor.page %}
+            <span aria-current="page">{{ page_number }}</span>
+          {% else %}
+            <a
+              data-dirty-navigation
+              href="{{ url_for('step4', tab='native', native_page=page_number, native_page_size=native_editor.page_size, native_search=native_editor.search, native_support=native_editor.support) }}"
+            >{{ page_number }}</a>
+          {% endif %}
+        {% endfor %}
+        {% if native_editor.page < native_editor.page_count %}
+          <a
+            data-dirty-navigation
+            href="{{ url_for('step4', tab='native', native_page=native_editor.page + 1, native_page_size=native_editor.page_size, native_search=native_editor.search, native_support=native_editor.support) }}"
+          >Next</a>
+        {% endif %}
+      </div>
+    </nav>
+  </section>
+</div>

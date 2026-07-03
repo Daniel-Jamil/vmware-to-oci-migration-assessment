@@ -1,0 +1,75 @@
+<header
+  class="scenario-header scenario-header--{{ view.id }}"
+  data-scenario-header="{{ view.id }}"
+  {% if view.id == 'native' %}
+    data-native-readiness-state="{{ native_header.readiness_state }}"
+    data-native-monthly-cost="{{ '%.6f'|format(native_header.monthly_cost) }}"
+    data-native-workload-count="{{ native_header.workload_count }}"
+  {% endif %}
+>
+  <div class="scenario-header__identity">
+    <div>
+      <p class="scenario-header__eyebrow">{{ 'OCI Compute and Block Volume' if view.id == 'native' else 'Scenario configuration' }}</p>
+      <h2>
+        {% if view.id == 'native' %}
+          OCI Native
+        {% elif view.id == 'ocvs' %}
+          OCVS
+        {% else %}
+          Hybrid
+        {% endif %}
+      </h2>
+      <p>{{ view.intro }}</p>
+    </div>
+    {% if view.id == 'native' %}
+      <span class="scenario-status scenario-status--{{ native_header.status_tone }}">
+        {{ native_header.status_label }}
+      </span>
+    {% elif view.id == best_scenario.id %}
+      <span class="scenario-badge">Lowest cost path</span>
+    {% endif %}
+  </div>
+
+  {% if view.id == 'native' %}
+    <dl class="scenario-header__summary" aria-label="Native scenario summary">
+      <div>
+        <dt>Modeled monthly cost</dt>
+        <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(native_header.monthly_cost) }}</dd>
+      </div>
+      <div>
+        <dt>Workload scope</dt>
+        <dd>{{ "{:,}".format(native_header.workload_count) }} VMs</dd>
+      </div>
+      <div>
+        <dt>Capacity outcome</dt>
+        <dd>{{ native_header.capacity_outcome }}</dd>
+      </div>
+      <div>
+        <dt>Change summary</dt>
+        <dd data-native-save-summary>{{ native_header.change_summary }}</dd>
+      </div>
+    </dl>
+    {% if native_header.remediation_count %}
+      <p class="scenario-header__remediation">
+        {{ "{:,}".format(native_header.remediation_count) }} VM(s) remain modeled and require remediation review for OCI Native.
+      </p>
+    {% endif %}
+  {% endif %}
+</header>
+{% if view.id == 'native' %}
+  <div class="scenario-save-bar" data-scenario-save-bar>
+    <span data-scenario-dirty-live role="status" aria-live="polite" aria-atomic="true">
+      {{ native_header.change_summary }}
+    </span>
+    <button class="scenario-primary-action" type="submit" form="step4-form" name="action" value="save">
+      Recalculate &amp; Save
+    </button>
+  </div>
+  {% else %}
+  <div class="scenario-save-bar scenario-save-bar--compact" data-scenario-save-bar>
+    <span>Changes apply to the complete selected workload.</span>
+    <button class="scenario-primary-action" type="submit" form="step4-form" name="action" value="save">
+      Recalculate &amp; Save
+    </button>
+  </div>
+{% endif %}
