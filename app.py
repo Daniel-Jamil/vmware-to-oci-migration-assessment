@@ -950,6 +950,46 @@ def list_downloaded_price_lists() -> list[str]:
     return [str(p).replace("\\", "/") for p in files]
 
 
+def build_source_file_info(path_text: Any) -> dict[str, Any]:
+    clean_path = str(path_text or "").strip().replace("\\", "/")
+    path = Path(clean_path) if clean_path else None
+    info: dict[str, Any] = {
+        "file_path": clean_path,
+        "file_name": path.name if path else "",
+        "size_kb": "",
+        "updated_at": "",
+    }
+    if path is None:
+        return info
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return info
+    info["size_kb"] = round(file_stat.st_size / 1024, 2)
+    info["updated_at"] = datetime.fromtimestamp(file_stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    return info
+
+
+def build_catalog_choices(paths: list[str]) -> list[dict[str, str]]:
+    return [
+        {
+            "file_name": Path(path_text).name,
+            "file_path": str(path_text).replace("\\", "/"),
+        }
+        for path_text in paths
+    ]
+
+
+def resolve_catalog_selection(submitted_value: Any, paths: list[str]) -> str:
+    clean_value = str(submitted_value or "").strip().replace("\\", "/")
+    if not clean_value:
+        return ""
+    if clean_value in paths:
+        return clean_value
+    matches = [path_text for path_text in paths if Path(path_text).name == clean_value]
+    return matches[0] if len(matches) == 1 else ""
+
+
 def find_downloaded_price_list_for_currency(currency_code: str) -> str:
     """Return newest downloaded OCI price list that matches the requested currency."""
     wanted = str(currency_code or "").upper().strip()
@@ -2264,14 +2304,20 @@ def build_inventory_review_issues_from_path(selected_path: Any) -> list[dict[str
     return build_inventory_review_issues(vm_rows)
 
 
+class SetupFieldError(ValueError):
+    def __init__(self, field_id: str, message: str) -> None:
+        super().__init__(message)
+        self.field_id = field_id
+
+
 def _parse_manual_sizing_int(form_key: str, label: str) -> int:
     raw_value = str(request.form.get(form_key, "")).strip()
     try:
         parsed = int(float(raw_value))
     except (TypeError, ValueError):
-        raise ValueError(f"{label} must be a whole number.")
+        raise SetupFieldError(form_key, f"{label} must be a whole number.")
     if parsed < 0:
-        raise ValueError(f"{label} cannot be negative.")
+        raise SetupFieldError(form_key, f"{label} cannot be negative.")
     return parsed
 
 
@@ -2292,11 +2338,23 @@ def create_manual_inventory_csv_from_form() -> tuple[Path, list[str]]:
     unsupported_count = _parse_manual_sizing_int("manual_unsupported_vm_count", "Unsupported/legacy VM count")
 
     if vm_count <= 0:
-        raise ValueError("VM count must be greater than zero.")
+        raise SetupFieldError("manual_vm_count", "VM count must be greater than zero.")
     if supported_count + unsupported_count != vm_count:
-        raise ValueError("Manual sizing counts must add up to the VM count.")
+        raise SetupFieldError(
+            "manual_supported_vm_count",
+            "Manual sizing counts must add up to the VM count.",
+        )
     if total_vcpus < vm_count or total_memory_gb < vm_count or total_storage_gb < vm_count:
-        raise ValueError("Total vCPU, RAM GB, and storage GB must each be at least the VM count.")
+        if total_vcpus < vm_count:
+            field_id = "manual_total_vcpus"
+        elif total_memory_gb < vm_count:
+            field_id = "manual_total_memory_gb"
+        else:
+            field_id = "manual_total_storage_gb"
+        raise SetupFieldError(
+            field_id,
+            "Total vCPU, RAM GB, and storage GB must each be at least the VM count.",
+        )
 
     cpu_values = _distribute_integer_total(total_vcpus, vm_count)
     memory_gb_values = _distribute_integer_total(total_memory_gb, vm_count)
@@ -2348,7 +2406,7 @@ def is_manual_inventory_path(path_text: Any) -> bool:
 def default_manual_sizing_form() -> dict[str, Any]:
     return {
         "is_active": False,
-        "submit_label": "Create Manual Inventory",
+        "submit_label": "Create Summary",
         "vm_count": "",
         "total_vcpus": "",
         "total_memory_gb": "",
@@ -2358,40 +2416,51 @@ def default_manual_sizing_form() -> dict[str, Any]:
     }
 
 
-def build_manual_sizing_form(selected_path: Any) -> dict[str, Any]:
+def build_manual_sizing_form(
+    selected_path: Any,
+    submitted_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     form_state = default_manual_sizing_form()
-    if not is_manual_inventory_path(selected_path):
-        return form_state
+    if is_manual_inventory_path(selected_path):
+        try:
+            vm_rows, _source = load_vms_from_vinfo(str(selected_path))
+        except Exception:
+            vm_rows = []
+        if vm_rows:
+            unsupported_count = sum(
+                1
+                for row in vm_rows
+                if str(row.get("mapped_os") or "").strip().lower().startswith("unmapped")
+            )
+            supported_count = max(0, len(vm_rows) - unsupported_count)
+            form_state.update(
+                {
+                    "is_active": True,
+                    "submit_label": "Update Summary",
+                    "vm_count": str(len(vm_rows)),
+                    "total_vcpus": str(int(sum(_to_number(row.get("cpus")) for row in vm_rows))),
+                    "total_memory_gb": str(
+                        int(sum(math.ceil(_to_number(row.get("memory_mb")) / 1024.0) for row in vm_rows))
+                    ),
+                    "total_storage_gb": str(
+                        int(sum(math.ceil(_to_number(row.get("provisioned_mib")) / 1024.0) for row in vm_rows))
+                    ),
+                    "supported_vm_count": str(supported_count),
+                    "unsupported_vm_count": str(unsupported_count),
+                }
+            )
 
-    try:
-        vm_rows, _source = load_vms_from_vinfo(str(selected_path))
-    except Exception:
-        return form_state
-    if not vm_rows:
-        return form_state
-
-    unsupported_count = sum(
-        1
-        for row in vm_rows
-        if str(row.get("mapped_os") or "").strip().lower().startswith("unmapped")
-    )
-    supported_count = max(0, len(vm_rows) - unsupported_count)
-    form_state.update(
-        {
-            "is_active": True,
-            "submit_label": "Update Manual Inventory",
-            "vm_count": str(len(vm_rows)),
-            "total_vcpus": str(int(sum(_to_number(row.get("cpus")) for row in vm_rows))),
-            "total_memory_gb": str(
-                int(sum(math.ceil(_to_number(row.get("memory_mb")) / 1024.0) for row in vm_rows))
-            ),
-            "total_storage_gb": str(
-                int(sum(math.ceil(_to_number(row.get("provisioned_mib")) / 1024.0) for row in vm_rows))
-            ),
-            "supported_vm_count": str(supported_count),
-            "unsupported_vm_count": str(unsupported_count),
+    if submitted_values is not None:
+        submitted_keys = {
+            "vm_count": "manual_vm_count",
+            "total_vcpus": "manual_total_vcpus",
+            "total_memory_gb": "manual_total_memory_gb",
+            "total_storage_gb": "manual_total_storage_gb",
+            "supported_vm_count": "manual_supported_vm_count",
+            "unsupported_vm_count": "manual_unsupported_vm_count",
         }
-    )
+        for state_key, form_key in submitted_keys.items():
+            form_state[state_key] = str(submitted_values.get(form_key, "")).strip()
     return form_state
 
 
@@ -5664,6 +5733,9 @@ def index() -> str:
     active_assessment_id = _clean_assessment_id(session.get("active_assessment_id", ""))
     active_assessment_name = normalize_assessment_name(session.get("active_assessment_name", ""))
     active_assessment_notes = normalize_assessment_notes(session.get("active_assessment_notes", ""))
+    field_errors: dict[str, str] = {}
+    manual_sizing_values: dict[str, Any] | None = None
+    inventory_mode = "manual" if is_manual_inventory_path(selected_rvtools_file) else "upload"
 
     if not selected_pricelist_file:
         preferences = load_preferences()
@@ -5685,8 +5757,9 @@ def index() -> str:
     if selected_pricelist_file:
         price_lookup_preview, selected_pricing_currency, source_file = load_price_lookup(selected_pricelist_file)
         if source_file:
+            source_info = build_source_file_info(source_file)
             selected_pricelist_info = {
-                "file_path": source_file,
+                **source_info,
                 "currency": selected_pricing_currency or "Unknown",
                 "item_count": len(price_lookup_preview),
             }
@@ -5701,15 +5774,20 @@ def index() -> str:
                 download_info=download_info,
                 downloaded_price_lists=downloaded_price_lists,
                 price_list_options=price_list_options,
+                price_list_choices=build_catalog_choices(price_list_options),
                 selected_pricelist_file=selected_pricelist_file,
                 selected_pricelist_info=selected_pricelist_info,
                 rvtools_files=rvtools_files,
+                rvtools_file_choices=build_catalog_choices(rvtools_files),
                 selected_rvtools_file=selected_rvtools_file,
                 rvtools_file_info=rvtools_file_info,
                 rvtools_import_summary=rvtools_import_summary,
                 rvtools_rejected_info=rvtools_rejected_info,
                 customer_name=customer_name,
-                manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
+                manual_sizing_form=build_manual_sizing_form(selected_rvtools_file, manual_sizing_values),
+                inventory_mode=inventory_mode,
+                field_errors=field_errors,
+                rvtools_catalog_path=str(RVTOOLS_DIR).replace("\\", "/"),
                 inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
                 saved_assessments=list_saved_assessments(),
                 active_assessment_id=active_assessment_id,
@@ -5720,48 +5798,76 @@ def index() -> str:
 
     if request.method == "POST":
         action = request.form.get("action", "")
-
-        def clear_selected_inventory() -> None:
-            nonlocal selected_rvtools_file, rvtools_file_info, rvtools_import_summary
-            selected_rvtools_file = ""
-            rvtools_file_info = None
-            rvtools_import_summary = None
-            session.pop("selected_rvtools_file", None)
-            session.pop("rvtools_file_info", None)
-            session.pop("rvtools_import_summary", None)
-            save_app_state(_default_app_state())
-            clear_step4_snapshot()
+        requested_inventory_mode = str(request.form.get("inventory_mode", "")).strip().lower()
+        if requested_inventory_mode in {"upload", "manual"}:
+            inventory_mode = requested_inventory_mode
 
         def clear_rejected_inventory() -> None:
             nonlocal rvtools_rejected_info
             rvtools_rejected_info = None
             session.pop("rvtools_rejected_info", None)
 
-        def persist_rejected_inventory(file_info: dict[str, Any], reason: str) -> None:
+        def reject_inventory_candidate(
+            file_info: dict[str, Any],
+            reason: str,
+            field_id: str,
+            delete_candidate: bool,
+        ) -> None:
             nonlocal rvtools_rejected_info
-            clear_selected_inventory()
+            if delete_candidate:
+                candidate_path = Path(str(file_info.get("file_path") or ""))
+                try:
+                    candidate_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             rvtools_rejected_info = build_rejected_inventory_info(file_info, reason)
-            session["rvtools_rejected_info"] = rvtools_rejected_info
-            flash(f"Input not accepted for sizing: {rvtools_rejected_info['category']}. Review details below.", "rvtools_error")
+            field_errors[field_id] = "This file could not be used as VM inventory. Review Source Details."
+            flash(
+                f"Input not accepted for sizing: {rvtools_rejected_info['category']}. Your current inventory was kept.",
+                "rvtools_error",
+            )
 
-        def validate_and_select_inventory(path_text: str, file_info: dict[str, Any], success_message: str) -> None:
+        def validate_and_select_inventory(
+            path_text: str,
+            file_info: dict[str, Any],
+            success_message: str,
+            *,
+            field_id: str,
+            delete_candidate_on_failure: bool = False,
+            select_all_rows: bool = False,
+        ) -> bool:
             nonlocal selected_rvtools_file, rvtools_file_info, rvtools_import_summary
             try:
                 vm_rows, source = load_vms_from_vinfo(path_text)
+                candidate_summary = build_inventory_import_summary(vm_rows, source)
+                build_inventory_review_issues(vm_rows)
             except Exception as exc:
-                persist_rejected_inventory(file_info, str(exc))
-                return
+                reject_inventory_candidate(
+                    file_info,
+                    str(exc),
+                    field_id,
+                    delete_candidate_on_failure,
+                )
+                return False
 
             clear_rejected_inventory()
-            rvtools_import_summary = build_inventory_import_summary(vm_rows, source)
+            rvtools_import_summary = candidate_summary
             selected_rvtools_file = path_text
             rvtools_file_info = file_info
             session["selected_rvtools_file"] = selected_rvtools_file
             session["rvtools_file_info"] = rvtools_file_info
             session["rvtools_import_summary"] = rvtools_import_summary
-            save_app_state(_default_app_state())
+            replacement_state = _default_app_state()
+            if select_all_rows:
+                replacement_state["selected_vm_names"] = [
+                    str(row.get("name", ""))
+                    for row in vm_rows
+                    if str(row.get("name", ""))
+                ]
+            save_app_state(replacement_state)
             clear_step4_snapshot()
             flash(success_message, "rvtools_success")
+            return True
 
         if action == "save_customer_name":
             customer_name = normalize_customer_name(request.form.get("customer_name", ""))
@@ -5772,11 +5878,29 @@ def index() -> str:
                 session.pop("customer_name", None)
                 flash("Customer name cleared.", "customer_success")
 
+        elif action == "save_identity":
+            customer_name = normalize_customer_name(request.form.get("customer_name", ""))
+            active_assessment_name = normalize_assessment_name(request.form.get("assessment_name", ""))
+            active_assessment_notes = normalize_assessment_notes(request.form.get("assessment_notes", ""))
+            if customer_name:
+                session["customer_name"] = customer_name
+            else:
+                session.pop("customer_name", None)
+            if active_assessment_name:
+                session["active_assessment_name"] = active_assessment_name
+            else:
+                session.pop("active_assessment_name", None)
+            if active_assessment_notes:
+                session["active_assessment_notes"] = active_assessment_notes
+            else:
+                session.pop("active_assessment_notes", None)
+            flash("Assessment identity updated.", "success")
+
         elif action == "save_assessment":
             try:
                 saved_snapshot = save_current_assessment(
-                    request.form.get("assessment_name", ""),
-                    request.form.get("assessment_notes", ""),
+                    request.form.get("assessment_name", active_assessment_name),
+                    request.form.get("assessment_notes", active_assessment_notes),
                 )
             except Exception as exc:
                 flash(f"Assessment could not be saved: {exc}", "error")
@@ -5806,10 +5930,11 @@ def index() -> str:
             selected_currency = request.form.get("currency_code", "USD").upper().strip()
 
             if selected_currency not in SUPPORTED_CURRENCIES:
+                field_errors["currency_code"] = "Select a supported currency."
                 flash("Please select a supported currency.", "pricing_error")
                 return render_index_response()
 
-            def use_local_price_list_fallback(reason: str) -> bool:
+            def use_local_price_list_fallback(_reason: str) -> bool:
                 nonlocal selected_pricelist_file, selected_pricelist_info
                 fallback_file = find_downloaded_price_list_for_currency(selected_currency)
                 if not fallback_file:
@@ -5823,13 +5948,13 @@ def index() -> str:
                 session["selected_pricelist_file"] = source_file
                 remember_price_list_selection(source_file, fallback_currency or selected_currency)
                 selected_pricelist_info = {
-                    "file_path": source_file,
+                    **build_source_file_info(source_file),
                     "currency": fallback_currency or selected_currency,
                     "item_count": len(price_lookup_preview),
                 }
                 flash(
-                    f"Live {selected_currency} price-list download did not complete ({reason}). "
-                    f"Using existing local {selected_currency} price list: {source_file}.",
+                    f"Live {selected_currency} price-list download did not complete. "
+                    f"Using existing local {selected_currency} price list: {Path(source_file).name}.",
                     "pricing_info",
                 )
                 return True
@@ -5842,13 +5967,13 @@ def index() -> str:
                 selected_pricelist_file = str(saved_file).replace("\\", "/")
 
                 download_info = {
+                    **build_source_file_info(saved_file),
                     "currency": selected_currency,
-                    "file_path": str(saved_file),
                     "last_updated": payload.get("lastUpdated", "Unknown"),
                     "item_count": item_count,
                 }
                 selected_pricelist_info = {
-                    "file_path": selected_pricelist_file,
+                    **build_source_file_info(selected_pricelist_file),
                     "currency": selected_currency,
                     "item_count": item_count,
                 }
@@ -5862,6 +5987,7 @@ def index() -> str:
                 persist_downloaded_price_list(payload, "OCI price list downloaded successfully.", "pricing_success")
             except HTTPError as exc:
                 if not use_local_price_list_fallback(f"HTTP {exc.code}"):
+                    field_errors["currency_code"] = "The latest price list could not be downloaded for this currency."
                     flash(
                         f"Oracle API returned an HTTP error ({exc.code}). No local {selected_currency} price list was found.",
                         "pricing_error",
@@ -5873,6 +5999,7 @@ def index() -> str:
                 if reason and "CERTIFICATE_VERIFY_FAILED" in str(reason):
                     guidance = " Please install/update trusted CA certificates (or certifi)."
                 if not use_local_price_list_fallback(f"API timeout/connectivity issue{detail}"):
+                    field_errors["currency_code"] = "The pricing service could not be reached for this currency."
                     flash(
                         "No price list was downloaded because the Oracle pricing API could not be reached "
                         f"after several {PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS}-second attempts{detail}. "
@@ -5882,39 +6009,43 @@ def index() -> str:
                     )
             except (TimeoutError, ValueError, json.JSONDecodeError) as exc:
                 if not use_local_price_list_fallback(str(exc)):
+                    field_errors["currency_code"] = "The pricing response could not be processed for this currency."
                     flash(
                         f"Could not process OCI pricing response: {exc}. No local {selected_currency} price list was found.",
                         "pricing_error",
                     )
             except Exception as exc:  # pragma: no cover - fallback guard
+                field_errors["currency_code"] = "The latest price list could not be downloaded."
                 flash(f"Unexpected error: {exc}", "pricing_error")
 
         elif action == "select_rvtools_file":
-            selected_rvtools_file = request.form.get("rvtools_file", "").strip().replace("\\", "/")
-            if not selected_rvtools_file or selected_rvtools_file not in rvtools_files:
+            inventory_mode = "upload"
+            candidate_path = resolve_catalog_selection(request.form.get("rvtools_file", ""), rvtools_files)
+            if not candidate_path:
+                field_errors["rvtools_file"] = "Select an available inventory file."
                 flash("Please select a valid VM inventory export file.", "rvtools_error")
             else:
-                p = Path(selected_rvtools_file)
-                rvtools_file_info = {
-                    "file_path": selected_rvtools_file,
-                    "file_name": p.name,
-                    "size_kb": round(p.stat().st_size / 1024, 2),
-                }
+                candidate_info = build_source_file_info(candidate_path)
                 validate_and_select_inventory(
-                    selected_rvtools_file,
-                    rvtools_file_info,
+                    candidate_path,
+                    candidate_info,
                     "VM inventory export file selected and validated successfully.",
+                    field_id="rvtools_file",
                 )
 
         elif action == "upload_rvtools_file":
+            inventory_mode = "upload"
             upload = request.files.get("rvtools_upload")
             original_name = secure_filename(upload.filename if upload else "")
             suffix = Path(original_name).suffix.lower()
             if not upload or not original_name:
+                field_errors["rvtools_upload"] = "Choose an inventory file to upload."
                 flash("Please choose a VM inventory export file to upload.", "rvtools_error")
             elif original_name.startswith("~$") or original_name.startswith("."):
+                field_errors["rvtools_upload"] = "Temporary or hidden files cannot be used."
                 flash("Temporary or hidden workbook files cannot be used as VM inventory input.", "rvtools_error")
             elif suffix not in SUPPORTED_RVTOOLS_EXTENSIONS:
+                field_errors["rvtools_upload"] = "Use an .xlsx, .xlsm, or .csv inventory file."
                 flash("Only .xlsx, .xlsm, and .csv VM inventory files are supported.", "rvtools_error")
             else:
                 RVTOOLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -5927,16 +6058,13 @@ def index() -> str:
                         reused_existing = False
 
                 if target.exists() and reused_existing:
-                    selected_rvtools_file = str(target).replace("\\", "/")
-                    rvtools_file_info = {
-                        "file_path": selected_rvtools_file,
-                        "file_name": target.name,
-                        "size_kb": round(target.stat().st_size / 1024, 2),
-                    }
+                    candidate_path = str(target).replace("\\", "/")
+                    candidate_info = build_source_file_info(candidate_path)
                     validate_and_select_inventory(
-                        selected_rvtools_file,
-                        rvtools_file_info,
+                        candidate_path,
+                        candidate_info,
                         "VM inventory export file already exists in the rvtools catalog and was selected successfully.",
+                        field_id="rvtools_upload",
                     )
                 else:
                     if target.exists():
@@ -5945,58 +6073,63 @@ def index() -> str:
                         except (OSError, ValueError):
                             pass
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        target = RVTOOLS_DIR / f"{target.stem}_{timestamp}{target.suffix}"
-                    upload.save(target)
-                    selected_rvtools_file = str(target).replace("\\", "/")
-                    rvtools_file_info = {
-                        "file_path": selected_rvtools_file,
-                        "file_name": target.name,
-                        "size_kb": round(target.stat().st_size / 1024, 2),
-                    }
-                    validate_and_select_inventory(
-                        selected_rvtools_file,
-                        rvtools_file_info,
-                        "VM inventory export file uploaded, selected, and validated successfully.",
-                    )
+                        target = RVTOOLS_DIR / f"{target.stem}_{timestamp}_{uuid4().hex[:8]}{target.suffix}"
+                    try:
+                        upload.save(target)
+                    except Exception:
+                        try:
+                            target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        field_errors["rvtools_upload"] = "The inventory file could not be stored."
+                        flash("Inventory upload could not be stored. Your current inventory was kept.", "rvtools_error")
+                    else:
+                        candidate_path = str(target).replace("\\", "/")
+                        candidate_info = build_source_file_info(candidate_path)
+                        validate_and_select_inventory(
+                            candidate_path,
+                            candidate_info,
+                            "VM inventory export file uploaded, selected, and validated successfully.",
+                            field_id="rvtools_upload",
+                            delete_candidate_on_failure=True,
+                        )
 
         elif action == "create_manual_inventory":
+            inventory_mode = "manual"
             is_update = is_manual_inventory_path(selected_rvtools_file)
+            manual_sizing_values = request.form.to_dict()
             try:
                 manual_path, _generated_names = create_manual_inventory_csv_from_form()
-                vm_rows, source = load_vms_from_vinfo(str(manual_path))
-            except ValueError as exc:
+            except SetupFieldError as exc:
+                field_errors[exc.field_id] = str(exc)
                 flash(str(exc), "rvtools_error")
-            except Exception as exc:
-                flash(f"Manual workload summary could not be created: {exc}", "rvtools_error")
+            except Exception:
+                field_errors["manual_vm_count"] = "The manual summary could not be created."
+                flash("Manual workload summary could not be created. Your current inventory was kept.", "rvtools_error")
             else:
-                clear_rejected_inventory()
-                selected_rvtools_file = str(manual_path).replace("\\", "/")
-                rvtools_file_info = {
-                    "file_path": selected_rvtools_file,
-                    "file_name": manual_path.name,
-                    "size_kb": round(manual_path.stat().st_size / 1024, 2),
-                }
-                rvtools_import_summary = build_inventory_import_summary(vm_rows, source)
-                session["selected_rvtools_file"] = selected_rvtools_file
-                session["rvtools_file_info"] = rvtools_file_info
-                session["rvtools_import_summary"] = rvtools_import_summary
-                manual_state = _default_app_state()
-                manual_state["selected_vm_names"] = [str(row.get("name", "")) for row in vm_rows if str(row.get("name", ""))]
-                save_app_state(manual_state)
-                clear_step4_snapshot()
                 action_word = "updated" if is_update else "created"
-                flash(
-                    f"Manual workload summary {action_word} with {len(manual_state['selected_vm_names']):,} generated VM row(s).",
-                    "rvtools_success",
+                manual_candidate_path = str(manual_path).replace("\\", "/")
+                validate_and_select_inventory(
+                    manual_candidate_path,
+                    build_source_file_info(manual_candidate_path),
+                    f"Manual workload summary {action_word}.",
+                    field_id="manual_vm_count",
+                    delete_candidate_on_failure=True,
+                    select_all_rows=True,
                 )
 
         elif action == "select_pricelist":
-            chosen_price_file = str(request.form.get("price_list_file", "")).strip().replace("\\", "/")
+            chosen_price_file = resolve_catalog_selection(
+                request.form.get("price_list_file", ""),
+                list_downloaded_price_lists(),
+            )
             if not chosen_price_file:
+                field_errors["price_list_file"] = "Select an available OCI price list."
                 flash("Please select an OCI price list file.", "pricing_error")
             else:
                 refreshed_lists = list_downloaded_price_lists()
                 if chosen_price_file not in refreshed_lists:
+                    field_errors["price_list_file"] = "The selected OCI price list is no longer available."
                     flash("Selected OCI price list file is not available anymore.", "pricing_error")
                 else:
                     session["selected_pricelist_file"] = chosen_price_file
@@ -6013,7 +6146,12 @@ def index() -> str:
         selected_rvtools_file = str(session.get("selected_rvtools_file", ""))
         rvtools_file_info = session.get("rvtools_file_info")
         rvtools_import_summary = session.get("rvtools_import_summary")
-        rvtools_rejected_info = session.get("rvtools_rejected_info")
+        if not field_errors or action not in {
+            "upload_rvtools_file",
+            "select_rvtools_file",
+            "create_manual_inventory",
+        }:
+            rvtools_rejected_info = session.get("rvtools_rejected_info")
         selected_currency = str(session.get("selected_currency", "")).upper().strip()
         active_assessment_id = _clean_assessment_id(session.get("active_assessment_id", ""))
         active_assessment_name = normalize_assessment_name(session.get("active_assessment_name", ""))
@@ -6030,7 +6168,7 @@ def index() -> str:
             price_lookup_preview, selected_pricing_currency, source_file = load_price_lookup(selected_pricelist_file)
             if source_file:
                 selected_pricelist_info = {
-                    "file_path": source_file,
+                    **build_source_file_info(source_file),
                     "currency": selected_pricing_currency or "Unknown",
                     "item_count": len(price_lookup_preview),
                 }

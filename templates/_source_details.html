@@ -1,0 +1,75 @@
+{% if source_details_kind == "pricing" %}
+  <details class="source-details" data-source-details>
+    <summary>Source Details</summary>
+    <dl class="source-details__list">
+      <div>
+        <dt>API source</dt>
+        <dd><code>/cetools/api/v1/products/</code></dd>
+      </div>
+      {% if selected_pricelist_info %}
+        <div>
+          <dt>Active local file</dt>
+          <dd><code>{{ selected_pricelist_info.file_path }}</code></dd>
+        </div>
+        <div>
+          <dt>File name</dt>
+          <dd>{{ selected_pricelist_info.file_name }}</dd>
+        </div>
+      {% endif %}
+      {% if download_info %}
+        <div>
+          <dt>Latest saved file</dt>
+          <dd><code>{{ download_info.file_path }}</code></dd>
+        </div>
+        <div>
+          <dt>Oracle timestamp</dt>
+          <dd>{{ download_info.last_updated }}</dd>
+        </div>
+      {% endif %}
+    </dl>
+  </details>
+{% elif source_details_kind == "inventory" %}
+  <details class="source-details" data-source-details>
+    <summary>Source Details</summary>
+    <dl class="source-details__list">
+      <div>
+        <dt>Inventory catalog</dt>
+        <dd><code>{{ rvtools_catalog_path }}</code></dd>
+      </div>
+      {% if rvtools_file_info %}
+        <div>
+          <dt>Active local file</dt>
+          <dd><code>{{ rvtools_file_info.file_path }}</code></dd>
+        </div>
+        <div>
+          <dt>File size</dt>
+          <dd>{{ rvtools_file_info.size_kb }} KB</dd>
+        </div>
+      {% endif %}
+      {% if rvtools_import_summary %}
+        <div>
+          <dt>Detected source</dt>
+          <dd><code>{{ rvtools_import_summary.source }}</code></dd>
+        </div>
+      {% endif %}
+      {% if rvtools_rejected_info %}
+        <div>
+          <dt>Rejected candidate</dt>
+          <dd><code>{{ rvtools_rejected_info.file_path }}</code></dd>
+        </div>
+        <div>
+          <dt>Detected type</dt>
+          <dd>{{ rvtools_rejected_info.category }}</dd>
+        </div>
+        <div>
+          <dt>Validation result</dt>
+          <dd>{{ rvtools_rejected_info.reason }}</dd>
+        </div>
+        <div>
+          <dt>Recommended use</dt>
+          <dd>{{ rvtools_rejected_info.recommended_use }}</dd>
+        </div>
+      {% endif %}
+    </dl>
+  </details>
+{% endif %}

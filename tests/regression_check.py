@@ -553,7 +553,7 @@ def validate_price_list_dropdown_policy() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
         html = response.data.decode("utf-8")
-        price_select = re.search(r'<select id="price_list_file".*?</select>', html, re.S)
+        price_select = re.search(r'<select[^>]*id="price_list_file".*?</select>', html, re.S)
         price_option_count = len(re.findall(r'<option value="[^"]*oci_pricing_', price_select.group(0))) if price_select else 0
         check("price list dropdown capped at 10", price_option_count == 10, str(price_option_count))
         check(
@@ -561,6 +561,210 @@ def validate_price_list_dropdown_policy() -> None:
             all(f'value="{currency}"' in html for currency in ["USD", "EUR", "GBP", "CHF", "SEK", "NOK", "DKK"])
             and all(f'value="{currency}"' not in html for currency in ["AUD", "CAD", "JPY", "SGD"]),
         )
+
+
+def validate_stage1_setup_redesign() -> None:
+    price_file = find_price_file()
+
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["selected_pricelist_file"] = price_file
+            sess["selected_currency"] = "EUR"
+
+        response = client.get("/")
+        html = response.data.decode("utf-8")
+        assessment_section = re.search(
+            r'<section[^>]+id="assessment-identity".*?</section>',
+            html,
+            re.S,
+        )
+        pricing_section = re.search(
+            r'<section[^>]+id="oci-pricing".*?</section>',
+            html,
+            re.S,
+        )
+        inventory_section = re.search(
+            r'<section[^>]+id="inventory-source".*?</section>',
+            html,
+            re.S,
+        )
+
+        assessment_html = assessment_section.group(0) if assessment_section else ""
+        check(
+            "Stage 1 Assessment Identity controls are separate",
+            response.status_code == 200
+            and "Assessment Identity" in assessment_html
+            and 'id="assessment_name"' in assessment_html
+            and 'id="customer_name"' in assessment_html
+            and 'id="assessment_notes"' in assessment_html
+            and "Assessment name" in assessment_html
+            and "Customer / project name" in assessment_html
+            and ">Notes<" in assessment_html,
+        )
+
+        pricing_html = pricing_section.group(0) if pricing_section else ""
+        source_details = re.findall(
+            r'<details(?=[^>]*data-source-details)[^>]*>.*?</details>',
+            html,
+            re.S,
+        )
+        check(
+            "Stage 1 OCI Pricing summary and collapsed source details render",
+            "OCI Pricing" in pricing_html
+            and "Active" in pricing_html
+            and "EUR" in pricing_html
+            and "Pricing entries" in pricing_html
+            and "Source Details" in pricing_html
+            and source_details
+            and all(not re.match(r"<details[^>]*\sopen(?:\s|=|>)", details) for details in source_details),
+        )
+
+        inventory_html = inventory_section.group(0) if inventory_section else ""
+        check(
+            "Stage 1 inventory mode is a two-option radio control",
+            "Inventory Source" in inventory_html
+            and "<fieldset" in inventory_html
+            and "<legend" in inventory_html
+            and len(re.findall(r'name="inventory_mode"', inventory_html)) == 2
+            and 'value="upload"' in inventory_html
+            and 'value="manual"' in inventory_html,
+        )
+
+        details_pattern = r'<details(?=[^>]*data-source-details)[^>]*>.*?</details>'
+        html_outside_source_details = re.sub(details_pattern, "", html, flags=re.S)
+        check(
+            "Stage 1 hides absolute local paths outside Source Details",
+            str(app_module.DOWNLOADS_DIR) not in html_outside_source_details
+            and str(app_module.RVTOOLS_DIR) not in html_outside_source_details,
+        )
+
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "6",
+                "manual_total_vcpus": "25",
+                "manual_total_memory_gb": "96",
+                "manual_total_storage_gb": "1200",
+                "manual_supported_vm_count": "5",
+                "manual_unsupported_vm_count": "1",
+            },
+            follow_redirects=True,
+        )
+        manual_html = response.data.decode("utf-8")
+        check(
+            "existing manual summary stays editable with update action",
+            response.status_code == 200
+            and 'value="6"' in manual_html
+            and 'value="25"' in manual_html
+            and 'value="96"' in manual_html
+            and 'value="1200"' in manual_html
+            and 'value="5"' in manual_html
+            and "Update Summary" in manual_html,
+        )
+
+        with client.session_transaction() as sess:
+            prior_selected_file = str(sess.get("selected_rvtools_file", ""))
+            prior_file_info = dict(sess.get("rvtools_file_info", {}))
+            prior_import_summary = dict(sess.get("rvtools_import_summary", {}))
+        prior_inventory_bytes = Path(prior_selected_file).read_bytes()
+        prior_state = app_module.load_app_state()
+        prior_state["selected_vm_names"] = ["manual-vm-001", "manual-vm-003", "manual-vm-006"]
+        prior_state["step4_hybrid_placements"] = {
+            "manual-vm-001": "native",
+            "manual-vm-003": "ocvs",
+            "manual-vm-006": "native",
+        }
+        app_module.save_app_state(prior_state)
+        prior_state = app_module.load_app_state()
+
+        invalid_name = f"invalid_replacement_{uuid4().hex}.csv"
+        invalid_candidate = app_module.RVTOOLS_DIR / invalid_name
+        response = client.post(
+            "/",
+            data={
+                "action": "upload_rvtools_file",
+                "inventory_mode": "upload",
+                "rvtools_upload": (
+                    BytesIO(b"Part,Description,Unit Price\nA1,Not VM inventory,100\n"),
+                    invalid_name,
+                ),
+            },
+            content_type="multipart/form-data",
+        )
+        error_html = response.data.decode("utf-8")
+        with client.session_transaction() as sess:
+            selected_file_after_error = str(sess.get("selected_rvtools_file", ""))
+            file_info_after_error = dict(sess.get("rvtools_file_info", {}))
+            import_summary_after_error = dict(sess.get("rvtools_import_summary", {}))
+        state_after_error = app_module.load_app_state()
+
+        check(
+            "invalid replacement preserves selected source and inventory state",
+            response.status_code == 200
+            and selected_file_after_error == prior_selected_file
+            and file_info_after_error == prior_file_info
+            and import_summary_after_error == prior_import_summary
+            and state_after_error.get("selected_vm_names") == prior_state.get("selected_vm_names")
+            and state_after_error.get("step4_hybrid_placements") == prior_state.get("step4_hybrid_placements"),
+            f"selected={selected_file_after_error}, state={state_after_error}",
+        )
+        check(
+            "failed replacement keeps prior inventory and deletes candidate",
+            Path(prior_selected_file).exists()
+            and Path(prior_selected_file).read_bytes() == prior_inventory_bytes
+            and not invalid_candidate.exists(),
+            f"prior_exists={Path(prior_selected_file).exists()}, candidate_exists={invalid_candidate.exists()}",
+        )
+        check(
+            "Stage 1 field errors are described and linked",
+            'id="setup-error-summary"' in error_html
+            and 'role="alert"' in error_html
+            and 'tabindex="-1"' in error_html
+            and 'href="#rvtools_upload"' in error_html
+            and re.search(r'id="rvtools_upload"[^>]+aria-describedby="[^"]*rvtools_upload-error', error_html)
+            and 'id="rvtools_upload-error"' in error_html,
+        )
+
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "5",
+                "manual_total_vcpus": "20",
+                "manual_total_memory_gb": "64",
+                "manual_total_storage_gb": "500",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "2",
+            },
+        )
+        manual_error_html = response.data.decode("utf-8")
+        check(
+            "manual field errors retain submitted values and link to summary",
+            'href="#manual_supported_vm_count"' in manual_error_html
+            and re.search(
+                r'id="manual_supported_vm_count"[^>]+aria-describedby="[^"]*manual_supported_vm_count-error',
+                manual_error_html,
+            )
+            and 'id="manual_supported_vm_count-error"' in manual_error_html
+            and 'name="manual_vm_count"' in manual_error_html
+            and 'value="5"' in manual_error_html,
+        )
+
+    setup_js = ROOT / "static" / "js" / "setup.js"
+    source_details_template = ROOT / "templates" / "_source_details.html"
+    check("Stage 1 setup assets exist", setup_js.is_file() and source_details_template.is_file())
+    setup_js_text = setup_js.read_text(encoding="utf-8")
+    check(
+        "Stage 1 mode script preserves inactive values and manages panel state",
+        'input[name="inventory_mode"]' in setup_js_text
+        and ".hidden =" in setup_js_text
+        and 'setAttribute("aria-hidden"' in setup_js_text
+        and ".value =" not in setup_js_text,
+    )
 
 
 def validate_inventory_imports() -> None:
@@ -685,7 +889,7 @@ def validate_manual_sizing_input() -> None:
         )
         check(
             "manual sizing form prefilled after create",
-            b"Update Manual Inventory" in response.data
+            b"Update Summary" in response.data
             and b'name="manual_vm_count" type="number" min="1" step="1" value="6"' in response.data
             and b'name="manual_total_vcpus" type="number" min="1" step="1" value="25"' in response.data
             and b'name="manual_supported_vm_count" type="number" min="0" step="1" value="5"' in response.data,
@@ -1108,10 +1312,16 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
 
     with app_module.app.test_client() as client:
         response = client.get("/")
-        check("home route renders", response.status_code == 200 and b"Step 1 - Setup & Inventory" in response.data)
+        check(
+            "home route renders",
+            response.status_code == 200
+            and b"Assessment Identity" in response.data
+            and b"OCI Pricing" in response.data
+            and b"Inventory Source" in response.data,
+        )
         check(
             "no default price list before selection",
-            b"Active Price List" not in response.data and b"-- Select OCI price list --" in response.data,
+            b"Active Price List" not in response.data and b"Select a saved price list" in response.data,
         )
 
         response = client.post(
@@ -1136,7 +1346,7 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
         check(
             "inventory selection",
             response.status_code == 200
-            and b"Import Quality Check" in response.data
+            and b'aria-label="Selected inventory summary"' in response.data
             and b"Selected VM Inventory" in response.data,
         )
 
@@ -1605,6 +1815,7 @@ def main() -> None:
     validate_workspace_source_contracts()
     validate_unsupported_currency_workspace_shell()
     validate_shared_workspace_shell()
+    validate_stage1_setup_redesign()
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
     validate_saved_assessments()
