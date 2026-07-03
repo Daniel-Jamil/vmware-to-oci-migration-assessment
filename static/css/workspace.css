@@ -73,6 +73,32 @@
   color: var(--redwood-green-contrast);
 }
 
+.workspace-body button.scenario-tab {
+  background: var(--tab-soft);
+  border-color: var(--tab-accent);
+  color: var(--tab-strong);
+}
+
+.workspace-body button.scenario-tab:hover,
+.workspace-body button.scenario-tab:focus-visible {
+  background: var(--tab-accent);
+  border-color: var(--tab-accent);
+  color: #fff;
+}
+
+.workspace-body button.scenario-tab.is-active {
+  background: var(--tab-strong);
+  border-color: var(--tab-strong);
+  color: #fff;
+}
+
+.workspace-body button.scenario-tab.is-active:hover,
+.workspace-body button.scenario-tab.is-active:focus-visible {
+  background: var(--tab-accent);
+  border-color: var(--tab-accent);
+  color: #fff;
+}
+
 .skip-link {
   position: fixed;
   z-index: 1000;
@@ -322,6 +348,17 @@
   color: #ffffff;
 }
 
+.stage-nav__link.is-disabled {
+  cursor: not-allowed;
+  color: var(--workspace-muted);
+  opacity: .72;
+}
+
+.stage-nav__link.is-disabled:hover {
+  border-color: transparent;
+  background: transparent;
+}
+
 .stage-nav__number {
   width: 28px;
   height: 28px;
@@ -382,7 +419,8 @@
 }
 
 .stage-nav__status--blocked,
-.stage-nav__status--incomplete {
+.stage-nav__status--incomplete,
+.stage-nav__status--disabled {
   color: var(--workspace-error);
 }
 
@@ -557,6 +595,28 @@
   background: var(--workspace-primary-hover);
 }
 
+.workspace-action.is-disabled,
+.workspace-action.is-disabled:hover {
+  border-color: var(--workspace-line-strong);
+  background: #d8d5d2;
+  color: #5f5b57;
+  cursor: not-allowed;
+}
+
+.workspace-continue-disabled {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+}
+
+.workspace-continue-prerequisite {
+  max-width: 280px;
+  color: var(--workspace-review);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
 @media (max-width: 920px) {
   .workspace-header {
     grid-template-columns: minmax(0, 1fr) auto;
@@ -652,6 +712,39 @@
     gap: 3px;
   }
 
+  .workspace-body #main-workspace form,
+  .workspace-body #main-workspace fieldset,
+  .workspace-body #main-workspace .grid,
+  .workspace-body #main-workspace .card,
+  .workspace-body #main-workspace .redwood-panel,
+  .workspace-body #main-workspace .result,
+  .workspace-body #main-workspace .meta {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .workspace-body #main-workspace input,
+  .workspace-body #main-workspace select,
+  .workspace-body #main-workspace textarea,
+  .workspace-body #main-workspace button {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .workspace-body #main-workspace code {
+    overflow-wrap: anywhere;
+    max-width: 100%;
+    word-break: break-word;
+    white-space: normal;
+  }
+
+  .workspace-body #main-workspace .card,
+  .workspace-body #main-workspace .warning-review-card,
+  .workspace-body #main-workspace .scenario-panel {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
   .workspace-stage-actions {
     position: sticky;
     z-index: 10;
@@ -665,5 +758,15 @@
 
   .workspace-action {
     flex: 1 1 0;
+  }
+
+  .workspace-continue-disabled {
+    flex: 1 1 0;
+    justify-items: stretch;
+  }
+
+  .workspace-continue-prerequisite {
+    max-width: none;
+    text-align: left;
   }
 }

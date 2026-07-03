@@ -2452,6 +2452,7 @@ WORKSPACE_STAGE_MAP = {
         "url_values": {},
         "previous_stage": "",
         "continue_stage": "inventory",
+        "continue_presentation": "link",
     },
     "inventory": {
         "number": 2,
@@ -2460,6 +2461,7 @@ WORKSPACE_STAGE_MAP = {
         "url_values": {},
         "previous_stage": "setup",
         "continue_stage": "scenarios",
+        "continue_presentation": "form",
     },
     "scenarios": {
         "number": 3,
@@ -2468,6 +2470,7 @@ WORKSPACE_STAGE_MAP = {
         "url_values": {"tab": "native"},
         "previous_stage": "inventory",
         "continue_stage": "results",
+        "continue_presentation": "form",
     },
     "results": {
         "number": 4,
@@ -2476,6 +2479,7 @@ WORKSPACE_STAGE_MAP = {
         "url_values": {"tab": "price"},
         "previous_stage": "scenarios",
         "continue_stage": "",
+        "continue_presentation": "none",
     },
 }
 
@@ -2503,6 +2507,22 @@ def build_workspace_context(
     if not isinstance(workspace_readiness.get("stages"), dict):
         workspace_readiness["stages"] = {}
 
+    selected_inventory_source = bool(str(session.get("selected_rvtools_file", "")).strip())
+    app_state = load_app_state()
+    selected_vm_names = app_state.get("selected_vm_names", [])
+    has_selected_vms = bool(
+        isinstance(selected_vm_names, list)
+        and any(isinstance(vm_name, str) and vm_name.strip() for vm_name in selected_vm_names)
+    )
+    prerequisite_availability = {
+        "setup": True,
+        "inventory": selected_inventory_source,
+        "scenarios": selected_inventory_source and has_selected_vms,
+        "results": selected_inventory_source and has_selected_vms,
+    }
+    navigation_availability = dict(prerequisite_availability)
+    navigation_availability[stage_id] = True
+
     stage_status_labels = {
         "available": "Available",
         "not_started": "Not started",
@@ -2511,6 +2531,7 @@ def build_workspace_context(
         "complete": "Complete",
         "incomplete": "Incomplete",
         "blocked": "Blocked",
+        "disabled": "Prerequisites required",
     }
     readiness_stages = workspace_readiness["stages"]
     workspace_stages: list[dict[str, Any]] = []
@@ -2525,6 +2546,9 @@ def build_workspace_context(
         if mapped_status not in stage_status_labels:
             mapped_status = "available"
         is_current = mapped_id == stage_id
+        is_available = navigation_availability[mapped_id]
+        if not is_available:
+            mapped_status = "disabled"
         status_label = stage_status_labels[mapped_status]
         if not is_current and mapped_status == "available":
             status_label = "Next step" if int(mapped_stage["number"]) == int(WORKSPACE_STAGE_MAP[stage_id]["number"]) + 1 else "Available later"
@@ -2535,6 +2559,8 @@ def build_workspace_context(
                 "name": mapped_stage["name"],
                 "url": url_for(mapped_stage["endpoint"], **mapped_stage["url_values"]),
                 "is_current": is_current,
+                "available": is_available,
+                "is_disabled": not is_available,
                 "status": "current" if is_current else mapped_status,
                 "status_label": "Current stage" if is_current else status_label,
             }
@@ -2551,6 +2577,15 @@ def build_workspace_context(
     if continue_id:
         continue_stage = WORKSPACE_STAGE_MAP[continue_id]
         continue_url = url_for(continue_stage["endpoint"], **continue_stage["url_values"])
+    continue_presentation = str(stage["continue_presentation"])
+    continue_is_safe_link = bool(
+        continue_presentation == "link"
+        and continue_id
+        and prerequisite_availability.get(continue_id, False)
+    )
+    continue_unavailable_message = ""
+    if stage_id == "setup" and not prerequisite_availability["inventory"]:
+        continue_unavailable_message = "Add an inventory source to continue."
 
     assessment_name = normalize_assessment_name(
         values.get("active_assessment_name", session.get("active_assessment_name", ""))
@@ -2574,6 +2609,10 @@ def build_workspace_context(
             "workspace_is_saved": bool(active_assessment_id),
             "workspace_previous_url": previous_url,
             "workspace_continue_url": continue_url,
+            "workspace_continue_presentation": continue_presentation,
+            "workspace_continue_is_safe_link": continue_is_safe_link,
+            "workspace_continue_unavailable_message": continue_unavailable_message,
+            "workspace_can_export": prerequisite_availability["results"],
         }
     )
     return context

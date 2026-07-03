@@ -17,14 +17,18 @@
   const panel = menu.querySelector("[data-assessment-menu-panel]");
   if (!trigger || !panel) return;
 
-  function menuItems() {
-    return Array.from(panel.querySelectorAll('[role="menuitem"]:not([aria-disabled="true"])'));
+  function actionableItems() {
+    return Array.from(
+      panel.querySelectorAll(
+        'a[href]:not([aria-disabled="true"]), button:not([disabled]):not([aria-disabled="true"]), [tabindex]:not([tabindex="-1"]):not([aria-disabled="true"])'
+      )
+    );
   }
 
   function openMenu() {
     panel.hidden = false;
     trigger.setAttribute("aria-expanded", "true");
-    const firstItem = menuItems()[0];
+    const firstItem = actionableItems()[0];
     if (firstItem) firstItem.focus();
   }
 

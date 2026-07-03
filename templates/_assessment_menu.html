@@ -3,7 +3,6 @@
     class="assessment-menu__trigger"
     type="button"
     id="assessment-menu-trigger"
-    aria-haspopup="menu"
     aria-expanded="false"
     aria-controls="assessment-menu-panel"
     data-assessment-menu-trigger
@@ -14,14 +13,26 @@
   <div
     class="assessment-menu__panel"
     id="assessment-menu-panel"
-    role="menu"
+    role="region"
     aria-labelledby="assessment-menu-trigger"
     data-assessment-menu-panel
     hidden
   >
-    <a role="menuitem" href="{{ url_for('index') }}#saved-assessments">Save</a>
-    <a role="menuitem" href="{{ url_for('index') }}#saved-assessments">Open</a>
-    <span role="menuitem" aria-disabled="true" title="Portable assessment import is not available yet">Import</span>
-    <a role="menuitem" href="{{ url_for('step4', tab='price') }}#scenario-price">Export</a>
+    <a href="{{ url_for('index') }}#saved-assessments">Save</a>
+    <a href="{{ url_for('index') }}#saved-assessments">Open</a>
+    <span
+      data-assessment-import
+      aria-disabled="true"
+      title="Portable assessment import is not available yet"
+    >Import</span>
+    {% if workspace_can_export %}
+      <a data-assessment-export href="{{ url_for('step4', tab='price') }}#scenario-price">Export</a>
+    {% else %}
+      <span
+        data-assessment-export
+        aria-disabled="true"
+        title="Select an inventory source and at least one VM before exporting"
+      >Export</span>
+    {% endif %}
   </div>
 </div>

@@ -71,11 +71,22 @@
           {% else %}
             <span></span>
           {% endif %}
-          {% if workspace_continue_url %}
+          {% if workspace_continue_is_safe_link %}
             <a class="workspace-action workspace-action--primary" href="{{ workspace_continue_url }}">
               Continue
               <span aria-hidden="true">&#8594;</span>
             </a>
+          {% elif workspace_continue_presentation == "link" and workspace_continue_url %}
+            <div class="workspace-continue-disabled">
+              <span
+                class="workspace-action workspace-action--primary is-disabled"
+                aria-disabled="true"
+              >
+                Continue
+                <span aria-hidden="true">&#8594;</span>
+              </span>
+              <span class="workspace-continue-prerequisite">{{ workspace_continue_unavailable_message }}</span>
+            </div>
           {% endif %}
         </footer>
       {% endif %}

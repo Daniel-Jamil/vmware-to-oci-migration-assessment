@@ -6,6 +6,8 @@ import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -50,6 +52,61 @@ def check_close(name: str, actual: float, expected: float, tolerance: float = 0.
         abs(float(actual) - float(expected)) <= tolerance,
         f"actual={actual:.6f}, expected={expected:.6f}",
     )
+
+
+class WorkspaceMarkupParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.document_counts = {"html": 0, "head": 0, "body": 0}
+        self.stage_items: list[dict[str, object]] = []
+        self.mobile_options: list[dict[str, str | None]] = []
+        self.footer_controls: list[dict[str, object]] = []
+        self.roles: list[str] = []
+        self.assessment_trigger: dict[str, str | None] | None = None
+        self.assessment_panel: dict[str, str | None] | None = None
+        self.assessment_import: dict[str, object] | None = None
+        self.assessment_export: dict[str, object] | None = None
+        self._in_stage_select = False
+        self._in_stage_footer = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        classes = set(str(attributes.get("class", "")).split())
+        if tag in self.document_counts:
+            self.document_counts[tag] += 1
+        if attributes.get("role"):
+            self.roles.append(str(attributes["role"]))
+        if "stage-nav__link" in classes:
+            self.stage_items.append({"tag": tag, "attrs": attributes})
+        if tag == "select" and attributes.get("id") == "workspace-stage-select":
+            self._in_stage_select = True
+        elif tag == "option" and self._in_stage_select:
+            self.mobile_options.append(attributes)
+        if tag == "footer" and "workspace-stage-actions" in classes:
+            self._in_stage_footer = True
+        elif self._in_stage_footer and "workspace-action" in classes:
+            self.footer_controls.append({"tag": tag, "attrs": attributes})
+        if "data-assessment-menu-trigger" in attributes:
+            self.assessment_trigger = attributes
+        if "data-assessment-menu-panel" in attributes:
+            self.assessment_panel = attributes
+        if "data-assessment-import" in attributes:
+            self.assessment_import = {"tag": tag, "attrs": attributes}
+        if "data-assessment-export" in attributes:
+            self.assessment_export = {"tag": tag, "attrs": attributes}
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "select" and self._in_stage_select:
+            self._in_stage_select = False
+        if tag == "footer" and self._in_stage_footer:
+            self._in_stage_footer = False
+
+
+def parse_workspace_markup(response_data: bytes) -> WorkspaceMarkupParser:
+    parser = WorkspaceMarkupParser()
+    parser.feed(response_data.decode("utf-8", errors="replace"))
+    parser.close()
+    return parser
 
 
 def sheet_text_and_numbers(zf: zipfile.ZipFile, sheet_path: str) -> tuple[str, list[float], int]:
@@ -264,6 +321,219 @@ def validate_unsupported_currency_workspace_shell() -> None:
         and b"Step 1 of 4" in response.data
         and b"Please select a supported currency." in response.data,
         f"status={response.status_code}",
+    )
+
+
+def validate_workspace_context_contracts() -> None:
+    state_id = f"workspace_contract_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        app_module.save_app_state(app_module._default_app_state())
+
+        empty_setup = app_module.build_workspace_context("setup")
+        check(
+            "empty workspace prerequisite availability",
+            [stage.get("available") for stage in empty_setup["workspace_stages"]]
+            == [True, False, False, False]
+            and [stage.get("is_disabled") for stage in empty_setup["workspace_stages"]]
+            == [False, True, True, True]
+            and empty_setup.get("workspace_continue_presentation") == "link"
+            and empty_setup.get("workspace_continue_is_safe_link") is False
+            and bool(empty_setup.get("workspace_continue_unavailable_message")),
+            str(empty_setup),
+        )
+
+        app_module.session["selected_rvtools_file"] = str(CSV_INVENTORY)
+        inventory_only_scenarios = app_module.build_workspace_context("scenarios")
+        check(
+            "current stage stays available without full readiness",
+            [stage.get("available") for stage in inventory_only_scenarios["workspace_stages"]]
+            == [True, True, True, False]
+            and inventory_only_scenarios.get("workspace_continue_presentation") == "form"
+            and inventory_only_scenarios.get("workspace_continue_is_safe_link") is False
+            and bool(inventory_only_scenarios.get("workspace_continue_url")),
+            str(inventory_only_scenarios),
+        )
+
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = ["vm-app-01"]
+        app_module.save_app_state(state)
+        configured_setup = app_module.build_workspace_context("setup")
+        configured_inventory = app_module.build_workspace_context("inventory")
+        check(
+            "configured workspace prerequisite availability",
+            [stage.get("available") for stage in configured_setup["workspace_stages"]]
+            == [True, True, True, True]
+            and configured_setup.get("workspace_continue_is_safe_link") is True
+            and configured_inventory.get("workspace_continue_presentation") == "form"
+            and configured_inventory.get("workspace_continue_is_safe_link") is False
+            and bool(configured_inventory.get("workspace_continue_url"))
+            and configured_setup.get("workspace_can_export") is True,
+            f"setup={configured_setup}, inventory={configured_inventory}",
+        )
+
+
+def validate_workspace_shell_behavior() -> None:
+    expected_urls = ["/", "/step3", "/step4?tab=native", "/step4?tab=price"]
+
+    with app_module.app.test_client() as client:
+        empty_response = client.get("/")
+    empty_shell = parse_workspace_markup(empty_response.data)
+    empty_stage_signature = [
+        (
+            item["tag"],
+            item["attrs"].get("href"),
+            item["attrs"].get("aria-current"),
+            item["attrs"].get("aria-disabled"),
+        )
+        for item in empty_shell.stage_items
+    ]
+    empty_primary_controls = [
+        item
+        for item in empty_shell.footer_controls
+        if "workspace-action--primary" in str(item["attrs"].get("class", "")).split()
+    ]
+    check(
+        "empty Setup renders disabled prerequisite navigation",
+        empty_response.status_code == 200
+        and empty_shell.document_counts == {"html": 1, "head": 1, "body": 1}
+        and empty_stage_signature
+        == [
+            ("a", "/", "step", None),
+            ("span", None, None, "true"),
+            ("span", None, None, "true"),
+            ("span", None, None, "true"),
+        ]
+        and [option.get("value") for option in empty_shell.mobile_options] == expected_urls
+        and ["disabled" in option for option in empty_shell.mobile_options] == [False, True, True, True]
+        and len(empty_primary_controls) == 1
+        and empty_primary_controls[0]["tag"] != "a"
+        and empty_primary_controls[0]["attrs"].get("aria-disabled") == "true"
+        and empty_shell.assessment_export is not None
+        and empty_shell.assessment_export["tag"] == "span"
+        and empty_shell.assessment_export["attrs"].get("aria-disabled") == "true",
+        f"stages={empty_stage_signature}, options={empty_shell.mobile_options}, footer={empty_shell.footer_controls}",
+    )
+    check(
+        "assessment actions use disclosure semantics",
+        empty_shell.assessment_trigger is not None
+        and empty_shell.assessment_trigger.get("aria-expanded") == "false"
+        and empty_shell.assessment_trigger.get("aria-controls") == "assessment-menu-panel"
+        and "aria-haspopup" not in empty_shell.assessment_trigger
+        and empty_shell.assessment_panel is not None
+        and empty_shell.assessment_panel.get("role") == "region"
+        and "menu" not in empty_shell.roles
+        and "menuitem" not in empty_shell.roles
+        and empty_shell.assessment_import is not None
+        and empty_shell.assessment_import["tag"] == "span"
+        and empty_shell.assessment_import["attrs"].get("aria-disabled") == "true"
+        and bool(empty_shell.assessment_import["attrs"].get("title")),
+        f"trigger={empty_shell.assessment_trigger}, panel={empty_shell.assessment_panel}, roles={empty_shell.roles}",
+    )
+
+    inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
+    state_id = f"workspace_markup_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = [str(row["name"]) for row in inventory_rows]
+        app_module.save_app_state(state)
+
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(CSV_INVENTORY)
+            sess["selected_currency"] = "EUR"
+            sess["customer_name"] = "Workspace Contract Customer"
+
+        configured_responses = [
+            client.get("/"),
+            client.get("/step3"),
+            client.get("/step4?tab=native"),
+        ]
+
+    configured_shells = [parse_workspace_markup(response.data) for response in configured_responses]
+    for index, (response, shell) in enumerate(zip(configured_responses, configured_shells)):
+        check(
+            f"configured workspace shell {index + 1} has one document and exact stage links",
+            response.status_code == 200
+            and shell.document_counts == {"html": 1, "head": 1, "body": 1}
+            and [item["tag"] for item in shell.stage_items] == ["a", "a", "a", "a"]
+            and [item["attrs"].get("href") for item in shell.stage_items] == expected_urls
+            and [item["attrs"].get("aria-current") for item in shell.stage_items]
+            == ["step" if stage_index == index else None for stage_index in range(4)]
+            and ["disabled" in option for option in shell.mobile_options] == [False, False, False, False],
+            f"status={response.status_code}, stages={shell.stage_items}, options={shell.mobile_options}",
+        )
+
+    setup_primary_links = [
+        item
+        for item in configured_shells[0].footer_controls
+        if item["tag"] == "a"
+        and "workspace-action--primary" in str(item["attrs"].get("class", "")).split()
+    ]
+    check(
+        "configured Setup safely links to Inventory Review",
+        len(setup_primary_links) == 1
+        and setup_primary_links[0]["attrs"].get("href") == "/step3"
+        and configured_shells[0].assessment_export is not None
+        and configured_shells[0].assessment_export["tag"] == "a",
+        str(configured_shells[0].footer_controls),
+    )
+    for stage_name, shell in zip(["Inventory Review", "Scenario Configuration"], configured_shells[1:]):
+        check(
+            f"{stage_name} has no footer anchor bypass",
+            not any(
+                item["tag"] == "a"
+                and "workspace-action--primary" in str(item["attrs"].get("class", "")).split()
+                for item in shell.footer_controls
+            ),
+            str(shell.footer_controls),
+        )
+    check(
+        "form-driven stages retain their inner save controls",
+        b'id="continue_step4_form"' in configured_responses[1].data
+        and b"Save & Continue" in configured_responses[1].data
+        and b'id="step4-form"' in configured_responses[2].data
+        and b"Save Settings" in configured_responses[2].data,
+    )
+
+
+def validate_workspace_source_contracts() -> None:
+    workspace_css = (ROOT / "static" / "css" / "workspace.css").read_text(encoding="utf-8")
+    workspace_js = (ROOT / "static" / "js" / "workspace.js").read_text(encoding="utf-8")
+
+    scenario_rule_patterns = [
+        r"\.workspace-body button\.scenario-tab\s*\{[^}]*background:\s*var\(--tab-soft\);[^}]*border-color:\s*var\(--tab-accent\);[^}]*color:\s*var\(--tab-strong\);",
+        r"\.workspace-body button\.scenario-tab:hover,\s*\.workspace-body button\.scenario-tab:focus-visible\s*\{[^}]*background:\s*var\(--tab-accent\);[^}]*border-color:\s*var\(--tab-accent\);[^}]*color:\s*#fff;",
+        r"\.workspace-body button\.scenario-tab\.is-active\s*\{[^}]*background:\s*var\(--tab-strong\);[^}]*border-color:\s*var\(--tab-strong\);[^}]*color:\s*#fff;",
+        r"\.workspace-body button\.scenario-tab\.is-active:hover,\s*\.workspace-body button\.scenario-tab\.is-active:focus-visible\s*\{[^}]*background:\s*var\(--tab-accent\);[^}]*border-color:\s*var\(--tab-accent\);[^}]*color:\s*#fff;",
+    ]
+    check(
+        "late-loaded workspace scenario tab contrast overrides",
+        all(re.search(pattern, workspace_css, re.S) for pattern in scenario_rule_patterns),
+    )
+
+    mobile_contract_patterns = [
+        r"@media\s*\(max-width:\s*600px\)",
+        r"\.workspace-body #main-workspace form[^\{]*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;",
+        r"\.workspace-body #main-workspace (?:input|select|textarea)[^\{]*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;",
+        r"\.workspace-body #main-workspace code\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*max-width:\s*100%;",
+        r"\.workspace-body #main-workspace \.card[^\{]*\{[^}]*overflow-x:\s*auto;",
+        r"\.workspace-body #main-workspace \.warning-review-card[^\{]*\{[^}]*overflow-x:\s*auto;",
+    ]
+    check(
+        "390px workspace containment source contract",
+        all(re.search(pattern, workspace_css, re.S) for pattern in mobile_contract_patterns),
+    )
+    check(
+        "assessment disclosure JavaScript contract",
+        '[role="menuitem"]' not in workspace_js
+        and 'a[href]:not([aria-disabled="true"])' in workspace_js
+        and 'event.key === "Escape"' in workspace_js
+        and "closeMenu(true)" in workspace_js
+        and "!menu.contains(event.target)" in workspace_js,
     )
 
 
@@ -1330,6 +1600,9 @@ def main() -> None:
     )
 
     validate_inventory_imports()
+    validate_workspace_context_contracts()
+    validate_workspace_shell_behavior()
+    validate_workspace_source_contracts()
     validate_unsupported_currency_workspace_shell()
     validate_shared_workspace_shell()
     validate_manual_sizing_input()
