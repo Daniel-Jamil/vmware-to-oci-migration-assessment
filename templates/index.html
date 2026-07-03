@@ -180,10 +180,46 @@
       .field-hint { grid-column: 1; }
     }
   </style>
+  {% include "_redwood_theme.html" %}
 </head>
-<body>
-  <div class="container">
-    <h1>VMware to OCI Migration Assessment</h1>
+<body class="redwood-body">
+  <div class="redwood-app-shell">
+    <aside class="redwood-rail" aria-label="Assessment navigation">
+      <div>
+        <div class="redwood-brand">ORACLE</div>
+        <div class="redwood-kicker">Cloud assessment</div>
+        <div class="redwood-rail-title">VMware to OCI Migration Assessment</div>
+      </div>
+      <nav class="redwood-nav">
+        <a class="is-current" href="#assessment-setup">Setup & Inventory</a>
+        <a href="{{ url_for('step3') }}">Workload Scope</a>
+        <span>Migration Paths</span>
+        <span>Exports</span>
+      </nav>
+      <div class="redwood-panel" style="margin: 0; padding: .75rem;">
+        <div class="redwood-kicker">Assessment State</div>
+        <div class="redwood-status-grid" style="margin-top: .55rem;">
+          <div class="redwood-status-row"><span>Customer</span><strong>{{ customer_name or "Not set" }}</strong></div>
+          <div class="redwood-status-row"><span>OCI price list</span><strong>{{ selected_pricelist_info.currency if selected_pricelist_info else "Needed" }}</strong></div>
+          <div class="redwood-status-row"><span>Inventory</span><strong>{{ rvtools_file_info.file_name if rvtools_file_info else "Needed" }}</strong></div>
+          <div class="redwood-status-row">
+            <span>Review</span>
+            {% if inventory_review_issues %}
+              <strong class="redwood-pill redwood-pill-warning">{{ inventory_review_issues|length }} item(s)</strong>
+            {% else %}
+              <strong class="redwood-pill redwood-pill-success">Ready</strong>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="container redwood-main">
+    <div class="redwood-page-head">
+      <div class="redwood-kicker">Step 1 of 4</div>
+      <h1>Setup & Inventory</h1>
+      <p>Start here for new assessments. Set the customer, load OCI pricing, and choose either manual sizing or an inventory export before moving to workload scope.</p>
+    </div>
     <nav class="wizard-steps" aria-label="Assessment wizard">
       <a class="wizard-step is-current" href="#assessment-setup">
         <strong>Step 1</strong>
@@ -396,11 +432,93 @@
             <div class="flash success">Inventory quality check passed with no data warnings.</div>
           {% endif %}
         {% endif %}
+        {% if inventory_review_issues %}
+          <section class="warning-review" aria-label="Warning Review">
+            <h3>Warning Review</h3>
+            {% for issue in inventory_review_issues %}
+              <article class="warning-review-card" id="issue-{{ issue.id }}">
+                <div class="warning-review-head">
+                  <div>
+                    <span class="redwood-pill redwood-pill-warning">{{ issue.count }} VM(s)</span>
+                    <h4>{{ issue.title }}</h4>
+                    <p>{{ issue.detail }}</p>
+                  </div>
+                  <strong>{{ issue.default_action }}</strong>
+                </div>
+                <table class="warning-review-table">
+                  <thead>
+                    <tr>
+                      <th>VM</th>
+                      <th>Detected value</th>
+                      <th>Issue</th>
+                      <th>Recommendation</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for row in issue.vm_rows %}
+                      <tr>
+                        <td><strong>{{ row.vm_name }}</strong></td>
+                        <td>{{ row.detected_value }}</td>
+                        <td>{{ row.issue }}</td>
+                        <td>{{ row.recommendation }}</td>
+                        <td class="redwood-primary-link">{{ row.action }}</td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+                {% if issue.hidden_count %}
+                  <div class="field-hint" style="padding: .55rem .7rem; margin: 0;">{{ issue.hidden_count }} additional VM(s) hidden. Use Workload Scope or export to review the full list.</div>
+                {% endif %}
+              </article>
+            {% endfor %}
+          </section>
+        {% endif %}
         <p style="margin-top: 1rem;">
           <a class="btn" href="{{ url_for('step3') }}">Go to Step 2 - Workload Scope</a>
         </p>
       </div>
     {% endif %}
+    </main>
+    <aside class="redwood-action-rail" aria-label="Setup actions and warnings">
+      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
+        <h3>Next Actions</h3>
+        <div class="redwood-action-list">
+          {% if rvtools_file_info %}
+            <a class="btn" href="{{ url_for('step3') }}">Continue to Workload Scope</a>
+          {% else %}
+            <a class="btn" href="#inventory-source">Add Inventory Source</a>
+          {% endif %}
+          <a class="btn" href="#download_pricing_form">Review OCI Price List</a>
+        </div>
+      </section>
+      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
+        <div style="display: flex; justify-content: space-between; gap: .75rem; align-items: center;">
+          <h3 style="margin-bottom: 0;">Warnings</h3>
+          {% if inventory_review_issues %}
+            <span class="redwood-pill redwood-pill-warning">{{ inventory_review_issues|length }}</span>
+          {% else %}
+            <span class="redwood-pill redwood-pill-success">0</span>
+          {% endif %}
+        </div>
+        {% if inventory_review_issues %}
+          <div class="redwood-action-list" style="margin-top: .65rem;">
+            {% for issue in inventory_review_issues %}
+              <a class="review-warning" style="display: block; padding: .65rem; border: 1px solid var(--redwood-warning-line); border-left: 4px solid var(--redwood-warning); border-radius: var(--radius-sm);" href="#issue-{{ issue.id }}">
+                <strong>{{ issue.title }}</strong>
+                <span style="display: block; margin-top: .16rem; font-size: .82rem;">{{ issue.count }} affected VM(s) - review list</span>
+              </a>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p style="margin-bottom: 0;">No inventory review items detected.</p>
+        {% endif %}
+      </section>
+      <section class="redwood-panel" style="margin: 0; padding: .8rem;">
+        <h3>Color Rule</h3>
+        <p style="margin-bottom: 0;">Green/teal marks ready and recommended actions. Amber marks review items. Oracle red stays as a restrained brand accent.</p>
+      </section>
+    </aside>
   </div>
   <script>
     if (/^#scenario-(paths|native|ocvs|hybrid|price)$/.test(String(window.location.hash || ''))) {

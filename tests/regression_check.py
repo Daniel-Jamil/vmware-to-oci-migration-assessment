@@ -321,6 +321,12 @@ def validate_manual_sizing_input() -> None:
             and b"Manual Workload Summary" in response.data
             and b"manual_windows_vm_count" not in response.data,
         )
+        check(
+            "redwood setup shell renders",
+            b"redwood-app-shell" in response.data
+            and b"ORACLE" in response.data
+            and b"Setup & Inventory" in response.data,
+        )
 
         response = client.post(
             "/",
@@ -347,6 +353,14 @@ def validate_manual_sizing_input() -> None:
             and b'name="manual_vm_count" type="number" min="1" step="1" value="6"' in response.data
             and b'name="manual_total_vcpus" type="number" min="1" step="1" value="25"' in response.data
             and b'name="manual_supported_vm_count" type="number" min="0" step="1" value="5"' in response.data,
+        )
+        check(
+            "manual warning review lists affected vm",
+            b"Warning Review" in response.data
+            and b"Unsupported for OCI Native" in response.data
+            and b"manual-vm-006" in response.data
+            and b"Solaris 11.4" in response.data
+            and b"Set OCVS" in response.data,
         )
 
         with client.session_transaction() as sess:

@@ -1796,6 +1796,189 @@ def build_inventory_import_summary(vm_rows: list[dict[str, Any]], source: str) -
     }
 
 
+def _inventory_review_row(
+    row: dict[str, Any],
+    detected_value: str,
+    issue: str,
+    recommendation: str,
+    action: str,
+) -> dict[str, str]:
+    return {
+        "vm_name": str(row.get("name") or row.get("source_name") or "Unknown VM"),
+        "detected_value": detected_value,
+        "issue": issue,
+        "recommendation": recommendation,
+        "action": action,
+    }
+
+
+def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+
+    def add_issue(
+        issue_id: str,
+        title: str,
+        detail: str,
+        severity: str,
+        rows: list[dict[str, str]],
+        default_action: str,
+    ) -> None:
+        if not rows:
+            return
+        issues.append(
+            {
+                "id": issue_id,
+                "title": title,
+                "detail": detail,
+                "severity": severity,
+                "count": len(rows),
+                "default_action": default_action,
+                "vm_rows": rows[:50],
+                "hidden_count": max(0, len(rows) - 50),
+            }
+        )
+
+    supported_signatures = load_supported_os_signatures()
+    if supported_signatures:
+        unsupported_rows = [
+            _inventory_review_row(
+                row,
+                str(row.get("raw_os") or "Unknown / Empty"),
+                "Unsupported for OCI Native",
+                "Keep on OCVS, use Hybrid placement, or remediate the guest OS before Native migration.",
+                "Set OCVS",
+            )
+            for row in vm_rows
+            if not is_oci_supported_os(str(row.get("raw_os") or ""), supported_signatures)
+        ]
+        add_issue(
+            "unsupported-native",
+            "Unsupported for OCI Native",
+            "These VMs are not matched to the OCI-supported OS list and should be reviewed before using a Native-only path.",
+            "warning",
+            unsupported_rows,
+            "Review affected VMs",
+        )
+
+    missing_storage_rows = [
+        _inventory_review_row(
+            row,
+            "Empty / 0 storage",
+            "Missing storage value",
+            "Update the inventory source or manual sizing summary so storage pricing is based on real workload data.",
+            "Edit storage",
+        )
+        for row in vm_rows
+        if _is_empty_or_zero(row.get("provisioned_mib"))
+    ]
+    add_issue(
+        "missing-storage",
+        "Missing storage values",
+        "OCI Native costing applies a minimum block volume size when storage is missing, so review these rows.",
+        "warning",
+        missing_storage_rows,
+        "Review storage inputs",
+    )
+
+    missing_cpu_rows = [
+        _inventory_review_row(
+            row,
+            "Empty / 0 vCPU",
+            "Missing vCPU value",
+            "Update the inventory CPU/vCPU field before relying on shape sizing.",
+            "Edit vCPU",
+        )
+        for row in vm_rows
+        if _is_empty_or_zero(row.get("cpus"))
+    ]
+    add_issue(
+        "missing-cpu",
+        "Missing vCPU values",
+        "VM rows with missing vCPU values can distort OCI Native and OCVS sizing.",
+        "warning",
+        missing_cpu_rows,
+        "Review CPU inputs",
+    )
+
+    missing_memory_rows = [
+        _inventory_review_row(
+            row,
+            "Empty / 0 RAM",
+            "Missing RAM value",
+            "Update the inventory memory field before relying on shape sizing.",
+            "Edit RAM",
+        )
+        for row in vm_rows
+        if _is_empty_or_zero(row.get("memory_mb"))
+    ]
+    add_issue(
+        "missing-memory",
+        "Missing RAM values",
+        "VM rows with missing RAM values can distort OCI Native and OCVS sizing.",
+        "warning",
+        missing_memory_rows,
+        "Review RAM inputs",
+    )
+
+    unknown_os_rows = [
+        _inventory_review_row(
+            row,
+            str(row.get("raw_os") or "Unknown / Empty"),
+            "Unknown OS",
+            "Confirm guest OS so OCI Native support and Hybrid placement are accurate.",
+            "Review OS",
+        )
+        for row in vm_rows
+        if _is_unknown_os(row.get("raw_os"))
+    ]
+    add_issue(
+        "unknown-os",
+        "Unknown OS values",
+        "Unknown operating systems require manual review before final target placement.",
+        "warning",
+        unknown_os_rows,
+        "Review OS values",
+    )
+
+    source_name_counts: dict[str, int] = {}
+    for row in vm_rows:
+        source_name = str(row.get("source_name") or row.get("name") or "").strip()
+        if source_name:
+            source_name_counts[source_name] = source_name_counts.get(source_name, 0) + 1
+    duplicate_rows = [
+        _inventory_review_row(
+            row,
+            str(row.get("source_name") or row.get("name") or "Unknown VM"),
+            "Duplicate VM name",
+            "Keep the intended row or remove duplicate VM names in Workload Scope.",
+            "Review duplicate",
+        )
+        for row in vm_rows
+        if source_name_counts.get(str(row.get("source_name") or row.get("name") or "").strip(), 0) > 1
+    ]
+    add_issue(
+        "duplicate-vm-name",
+        "Duplicate VM names",
+        "Duplicate source VM names were kept with suffixes and should be reviewed before export.",
+        "warning",
+        duplicate_rows,
+        "Review duplicates",
+    )
+
+    return issues
+
+
+def build_inventory_review_issues_from_path(selected_path: Any) -> list[dict[str, Any]]:
+    clean_path = str(selected_path or "").strip()
+    if not clean_path:
+        return []
+    try:
+        vm_rows, _source = load_vms_from_vinfo(clean_path)
+    except Exception:
+        return []
+    return build_inventory_review_issues(vm_rows)
+
+
 def _parse_manual_sizing_int(form_key: str, label: str) -> int:
     raw_value = str(request.form.get(form_key, "")).strip()
     try:
@@ -5121,6 +5304,7 @@ def index() -> str:
                     rvtools_rejected_info=rvtools_rejected_info,
                     customer_name=customer_name,
                     manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
+                    inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
                 )
 
             def use_local_price_list_fallback(reason: str) -> bool:
@@ -5356,6 +5540,7 @@ def index() -> str:
         rvtools_rejected_info=rvtools_rejected_info,
         customer_name=customer_name,
         manual_sizing_form=build_manual_sizing_form(selected_rvtools_file),
+        inventory_review_issues=build_inventory_review_issues_from_path(selected_rvtools_file),
     )
 
 

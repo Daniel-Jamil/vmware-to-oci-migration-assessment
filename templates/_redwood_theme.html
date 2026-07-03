@@ -1,0 +1,335 @@
+<style>
+  :root {
+    --redwood-bg: #f6f4ef;
+    --redwood-surface: #fffefa;
+    --redwood-surface-soft: #faf7f4;
+    --redwood-text: #201a17;
+    --redwood-muted: #6b5b53;
+    --redwood-line: #ded6d1;
+    --redwood-line-strong: #b9aaa2;
+    --redwood-brand: #c74634;
+    --redwood-brand-soft: #fff1ee;
+    --redwood-green: #0f6b4f;
+    --redwood-green-soft: #edf8f3;
+    --redwood-green-line: #a8d9c4;
+    --redwood-warning: #8a5a00;
+    --redwood-warning-soft: #fff8ed;
+    --redwood-warning-line: #e6c18a;
+    --bg: var(--redwood-bg);
+    --panel: var(--redwood-surface);
+    --text: var(--redwood-text);
+    --muted: var(--redwood-muted);
+    --line: var(--redwood-line);
+    --line-strong: var(--redwood-line-strong);
+    --accent: var(--redwood-green);
+    --accent-2: #0a523d;
+    --success: var(--redwood-green);
+    --chart-native: #315f9f;
+    --chart-ocvs: #2d7c6f;
+    --chart-hybrid: var(--redwood-green);
+    --warning: var(--redwood-warning);
+    --surface: var(--redwood-surface);
+    --surface-soft: var(--redwood-surface-soft);
+    --accent-soft: var(--redwood-green-soft);
+    --accent-line: var(--redwood-green-line);
+    --radius: 8px;
+    --radius-sm: 6px;
+  }
+
+  body.redwood-body,
+  body {
+    background: var(--redwood-bg);
+    color: var(--redwood-text);
+    letter-spacing: 0;
+  }
+
+  body.redwood-body .container {
+    background: transparent;
+  }
+
+  .redwood-app-shell {
+    display: grid;
+    grid-template-columns: 228px minmax(0, 1fr) 320px;
+    gap: 1rem;
+    min-height: 100vh;
+    padding: 1rem;
+    background: var(--redwood-bg);
+    border-top: 5px solid var(--redwood-brand);
+  }
+
+  .redwood-main {
+    min-width: 0;
+    padding: 1rem;
+  }
+
+  .redwood-rail,
+  .redwood-action-rail,
+  .redwood-card,
+  .result,
+  .card,
+  .meta,
+  .summary,
+  .price-comparison,
+  .scenario-panel,
+  .ocvs-section,
+  .scenario-controls {
+    background: var(--redwood-surface);
+    border-color: var(--redwood-line);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 2px rgba(32, 26, 23, .08);
+  }
+
+  .redwood-rail,
+  .redwood-action-rail {
+    align-self: start;
+    position: sticky;
+    top: 1rem;
+    padding: .9rem;
+    display: grid;
+    gap: .8rem;
+  }
+
+  .redwood-brand {
+    font-size: 1.45rem;
+    font-weight: 900;
+    letter-spacing: .08em;
+    color: var(--redwood-text);
+  }
+
+  .redwood-kicker {
+    color: var(--redwood-muted);
+    font-size: .72rem;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+
+  .redwood-rail-title {
+    margin-top: .25rem;
+    color: var(--redwood-text);
+    font-weight: 900;
+    line-height: 1.15;
+  }
+
+  .redwood-nav {
+    display: grid;
+    gap: .35rem;
+  }
+
+  .redwood-nav a,
+  .redwood-nav span {
+    display: block;
+    padding: .58rem .65rem;
+    border-radius: var(--radius-sm);
+    color: var(--redwood-text);
+    text-decoration: none;
+    border: 1px solid transparent;
+  }
+
+  .redwood-nav .is-current {
+    background: var(--redwood-green-soft);
+    color: var(--redwood-green);
+    border-color: var(--redwood-green-line);
+    font-weight: 900;
+  }
+
+  .redwood-status-grid,
+  .redwood-action-list {
+    display: grid;
+    gap: .5rem;
+  }
+
+  .redwood-status-row {
+    display: flex;
+    justify-content: space-between;
+    gap: .7rem;
+    font-size: .84rem;
+  }
+
+  .redwood-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--redwood-line);
+    border-radius: 999px;
+    padding: .18rem .5rem;
+    font-size: .76rem;
+    font-weight: 900;
+    white-space: nowrap;
+  }
+
+  .redwood-pill-success {
+    color: var(--redwood-green);
+    background: var(--redwood-green-soft);
+    border-color: var(--redwood-green-line);
+  }
+
+  .redwood-pill-warning {
+    color: var(--redwood-warning);
+    background: var(--redwood-warning-soft);
+    border-color: var(--redwood-warning-line);
+  }
+
+  .redwood-page-head,
+  .redwood-panel {
+    background: var(--redwood-surface);
+    border: 1px solid var(--redwood-line);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin-bottom: .8rem;
+    box-shadow: 0 1px 2px rgba(32, 26, 23, .08);
+  }
+
+  .redwood-page-head h1,
+  .redwood-page-head h2 {
+    margin-bottom: .35rem;
+  }
+
+  .redwood-grid-two {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: .8rem;
+  }
+
+  .redwood-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: .5rem;
+    margin: .7rem 0;
+  }
+
+  .redwood-kpi {
+    background: var(--redwood-surface-soft);
+    border: 1px solid var(--redwood-line);
+    border-radius: var(--radius-sm);
+    padding: .65rem;
+  }
+
+  .redwood-kpi span {
+    display: block;
+    color: var(--redwood-muted);
+    font-size: .74rem;
+    font-weight: 900;
+    text-transform: uppercase;
+    margin-bottom: .2rem;
+  }
+
+  .redwood-kpi strong {
+    display: block;
+    font-size: 1.2rem;
+  }
+
+  button,
+  a.btn {
+    border-radius: var(--radius-sm);
+  }
+
+  button:not(.remove):not(.move-btn) {
+    background: var(--redwood-green);
+    border-color: var(--redwood-green);
+  }
+
+  button:not(.remove):not(.move-btn):hover {
+    background: #0a523d;
+    border-color: #0a523d;
+  }
+
+  a.btn:hover {
+    color: var(--redwood-green);
+    border-color: var(--redwood-green);
+  }
+
+  .flash.info,
+  .review-warning {
+    color: var(--redwood-warning);
+    background: var(--redwood-warning-soft);
+    border-color: var(--redwood-warning-line);
+  }
+
+  .flash.success {
+    color: var(--redwood-green);
+    background: var(--redwood-green-soft);
+    border-color: var(--redwood-green-line);
+  }
+
+  .inventory-catalog-note,
+  .result {
+    border-left-color: var(--redwood-green);
+  }
+
+  .warning-review {
+    margin-top: .9rem;
+    display: grid;
+    gap: .7rem;
+  }
+
+  .warning-review-card {
+    border: 1px solid var(--redwood-line);
+    border-radius: var(--radius);
+    background: var(--redwood-surface);
+    overflow: hidden;
+  }
+
+  .warning-review-head {
+    display: flex;
+    justify-content: space-between;
+    gap: .8rem;
+    align-items: flex-start;
+    padding: .75rem;
+    border-bottom: 1px solid var(--redwood-line);
+  }
+
+  .warning-review-head h4 {
+    margin: .18rem 0 .25rem;
+  }
+
+  .warning-review-head p {
+    margin: 0;
+    color: var(--redwood-muted);
+    font-size: .86rem;
+  }
+
+  .warning-review-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .86rem;
+  }
+
+  .warning-review-table th,
+  .warning-review-table td {
+    border: 0;
+    border-bottom: 1px solid #eee7e2;
+    padding: .52rem .6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  .warning-review-table th {
+    background: var(--redwood-surface-soft);
+    color: #4f443f;
+    font-weight: 900;
+  }
+
+  .warning-review-table tr:last-child td {
+    border-bottom: 0;
+  }
+
+  .redwood-primary-link {
+    color: var(--redwood-green);
+    font-weight: 900;
+  }
+
+  @media (max-width: 1180px) {
+    .redwood-app-shell {
+      grid-template-columns: 1fr;
+    }
+    .redwood-rail,
+    .redwood-action-rail {
+      position: static;
+    }
+    .redwood-grid-two,
+    .redwood-kpi-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

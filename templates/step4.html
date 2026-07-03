@@ -802,8 +802,9 @@
       .scenario-panel-actions { justify-content: flex-start; }
     }
   </style>
+  {% include "_redwood_theme.html" %}
 </head>
-<body>
+<body class="redwood-body">
   <div class="container">
     {% set currency_symbol_map = {
       'EUR': '€',
