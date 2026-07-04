@@ -771,6 +771,56 @@ class ReadinessTests(unittest.TestCase):
                     self.assertIn(response.status_code, {302, 303})
                     self.assertEqual(prior_state, state)
 
+        non_string_values = {
+            "integer": 1,
+            "list": ["native"],
+            "mapping": {"value": "native"},
+            "none": None,
+        }
+        for field_name, expected_error in (
+            ("recommendation", "Assessor recommendation must be text."),
+            ("recommendation_rationale", "Recommendation rationale must be text."),
+        ):
+            for value_label, malformed_value in non_string_values.items():
+                with self.subTest(field=field_name, value=value_label):
+                    form_values = {
+                        "action": "save_recommendation",
+                        "recommendation": "ocvs",
+                        "recommendation_rationale": "Keep the prior rationale.",
+                    }
+                    form_values[field_name] = malformed_value
+                    malformed_form = MultiDict(form_values.items())
+
+                    _parsed, errors = app_module.parse_recommendation_submission(
+                        malformed_form
+                    )
+
+                    with current_step4_client() as (_client, state):
+                        state["assessor_recommendation"] = "native"
+                        state["assessor_recommendation_rationale"] = "Prior rationale."
+                        prior_state = copy.deepcopy(state)
+                        with app_module.app.test_request_context(
+                            "/step4",
+                            method="POST",
+                        ):
+                            app_module.session["_app_instance_id"] = (
+                                app_module.APP_INSTANCE_ID
+                            )
+                            app_module.session["selected_rvtools_file"] = "fixture.csv"
+                            app_module.session["selected_pricelist_file"] = "prices.json"
+                            app_module.session["selected_currency"] = "EUR"
+                            app_module.session["customer_name"] = "Example Customer"
+                            app_module.session["active_assessment_name"] = (
+                                "Current assessment"
+                            )
+                            app_module.request.form = malformed_form
+                            route_result = app_module.step4()
+
+                        self.assertIsInstance(route_result, tuple)
+                        self.assertEqual(303, route_result[1])
+                        self.assertEqual(prior_state, state)
+                    self.assertIn(expected_error, errors)
+
     def test_recommendation_persistence_failure_keeps_prior_state(self) -> None:
         with current_step4_client() as (client, state), patch.object(
             app_module,

@@ -3061,6 +3061,25 @@ def parse_step4_scalar_submission(form: Any) -> tuple[dict[str, Any], list[str]]
     return parsed, errors
 
 
+def _single_string_form_value(
+    form: Any,
+    field_name: str,
+    *,
+    cardinality_error: str,
+    type_error: str,
+    errors: list[str],
+) -> str | None:
+    values = form.getlist(field_name)
+    if len(values) != 1:
+        errors.append(cardinality_error)
+        return None
+    value = values[0]
+    if not isinstance(value, str):
+        errors.append(type_error)
+        return None
+    return value
+
+
 def parse_recommendation_submission(form: Any) -> tuple[dict[str, str], list[str]]:
     """Validate the Results decision form without accepting scenario fields."""
     parsed = {"recommendation": "", "recommendation_rationale": ""}
@@ -3074,26 +3093,29 @@ def parse_recommendation_submission(form: Any) -> tuple[dict[str, str], list[str
     if len(action_values) != 1 or action_values[0] != "save_recommendation":
         errors.append("Submit exactly one valid recommendation action.")
 
-    recommendation_values = form.getlist("recommendation")
-    if len(recommendation_values) != 1:
-        errors.append("Submit exactly one assessor recommendation.")
-    else:
-        recommendation = str(recommendation_values[0]).strip()
+    recommendation_value = _single_string_form_value(
+        form,
+        "recommendation",
+        cardinality_error="Submit exactly one assessor recommendation.",
+        type_error="Assessor recommendation must be text.",
+        errors=errors,
+    )
+    if recommendation_value is not None:
+        recommendation = recommendation_value.strip()
         if recommendation not in RESULT_RECOMMENDATION_VALUES:
             errors.append("Choose a valid assessor recommendation.")
         else:
             parsed["recommendation"] = recommendation
 
-    rationale_values = form.getlist("recommendation_rationale")
-    if len(rationale_values) != 1:
-        errors.append("Submit exactly one recommendation rationale.")
-    else:
-        rationale = (
-            str(rationale_values[0])
-            .replace("\r\n", "\n")
-            .replace("\r", "\n")
-            .strip()
-        )
+    rationale_value = _single_string_form_value(
+        form,
+        "recommendation_rationale",
+        cardinality_error="Submit exactly one recommendation rationale.",
+        type_error="Recommendation rationale must be text.",
+        errors=errors,
+    )
+    if rationale_value is not None:
+        rationale = rationale_value.replace("\r\n", "\n").replace("\r", "\n").strip()
         if len(rationale) > 4000:
             errors.append("Recommendation rationale must be 4,000 characters or fewer.")
         else:

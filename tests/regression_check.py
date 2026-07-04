@@ -3589,6 +3589,57 @@ def validate_task7_native_scenario_workspace() -> None:
         str(invalid_results),
     )
 
+    malformed_recommendation_values = (
+        ("integer", 1),
+        ("list", ["native"]),
+        ("mapping", {"value": "native"}),
+        ("none", None),
+    )
+    malformed_type_results: list[tuple[str, bool]] = []
+    for field_name, expected_error in (
+        ("recommendation", "Assessor recommendation must be text."),
+        ("recommendation_rationale", "Recommendation rationale must be text."),
+    ):
+        for value_label, malformed_value in malformed_recommendation_values:
+            malformed_form_values = {
+                "action": "save_recommendation",
+                "recommendation": "ocvs",
+                "recommendation_rationale": task9_rationale,
+            }
+            malformed_form_values[field_name] = malformed_value
+            malformed_form = MultiDict(malformed_form_values.items())
+            _parsed, malformed_errors = app_module.parse_recommendation_submission(
+                malformed_form
+            )
+            before_state_bytes, before_snapshot_bytes = persistence_bytes()
+            with app_module.app.test_request_context("/step4", method="POST"):
+                app_module.session["_app_instance_id"] = app_module.APP_INSTANCE_ID
+                app_module.session["state_id"] = state_id
+                app_module.session["selected_rvtools_file"] = str(
+                    NATIVE_SCENARIO_INVENTORY
+                )
+                app_module.session["selected_pricelist_file"] = price_file
+                app_module.session["customer_name"] = "Task 7 Customer"
+                app_module.session["active_assessment_name"] = "Task 7 Assessment"
+                app_module.request.form = malformed_form
+                route_result = app_module.step4()
+            after_state_bytes, after_snapshot_bytes = persistence_bytes()
+            route_status = route_result[1] if isinstance(route_result, tuple) else 0
+            malformed_type_results.append(
+                (
+                    f"{field_name} {value_label}",
+                    expected_error in malformed_errors
+                    and route_status == 303
+                    and after_state_bytes == before_state_bytes
+                    and after_snapshot_bytes == before_snapshot_bytes,
+                )
+            )
+    check(
+        "Task 9 rejects non-string recommendation fields before normalization",
+        all(passed for _label, passed in malformed_type_results),
+        str(malformed_type_results),
+    )
+
     saved_response = client.post(
         "/",
         data={
