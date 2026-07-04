@@ -6908,6 +6908,27 @@ def _workbook_readiness_metadata(
             "affected_vm_names": affected_vm_names,
         }
 
+    if recommendation and not isinstance(scenario_values.get(recommendation), dict):
+        recommendation = ""
+        malformed = True
+
+    lowest_complete_scenario = source.get("lowest_complete_scenario")
+    if (
+        not isinstance(lowest_complete_scenario, str)
+        or lowest_complete_scenario not in {"", *recommendation_labels}
+    ):
+        lowest_complete_scenario = ""
+        malformed = True
+    elif lowest_complete_scenario:
+        lowest_scenario = scenarios[lowest_complete_scenario]
+        if not (
+            lowest_scenario["technical_eligibility"] == "eligible"
+            and lowest_scenario["pricing_state"] == "complete"
+            and lowest_scenario["rankable"] is True
+        ):
+            lowest_complete_scenario = ""
+            malformed = True
+
     seen_issue_ids: set[str] = set()
     issue_input_count = 0
 
@@ -6994,8 +7015,14 @@ def _workbook_readiness_metadata(
     return {
         "workbook_status": workbook_status,
         "readiness_label": readiness_label,
-        "recommendation": recommendation_labels.get(recommendation, "Not provided"),
+        "recommendation": recommendation_labels.get(
+            recommendation, "No recommendation yet"
+        ),
         "recommendation_rationale": rationale or "Not provided",
+        "lowest_complete_scenario_id": lowest_complete_scenario,
+        "lowest_complete_scenario": recommendation_labels.get(
+            lowest_complete_scenario, "No complete modeled price"
+        ),
         "native_remediation_status": (
             "Required" if native["remediation_required"] else "Not required"
         ),
@@ -7442,44 +7469,18 @@ def build_migration_price_workbook_xlsx(
     hybrid_native_count = integer(hybrid_placement_plan.get("native_count"))
     hybrid_ocvs_priced_count = integer(hybrid_placement_plan.get("ocvs_priced_count"))
     hybrid_review_count = integer(hybrid_placement_plan.get("review_count"))
-    native_compat_pct = percent(hybrid_native_count, total_vm_count)
-    ocvs_required_pct = percent(hybrid_ocvs_priced_count, total_vm_count)
-    best_cost_scenario = scenario_comparison.get("best", {})
-
-    if native_compat_pct >= 0.85 and str(best_cost_scenario.get("id")) == "native":
-        recommended_path = "OCI Native"
-        recommendation_reasons = [
-            "Lowest monthly OCI infrastructure cost",
-            "High OCI compatibility across the selected workload",
-            "Maximum modernization potential and reduced VMware dependency",
-        ]
-    elif ocvs_required_pct >= 0.60:
-        recommended_path = "OCVS"
-        recommendation_reasons = [
-            "Large portion of the estate requires VMware compatibility",
-            "Lowest migration complexity and minimal platform change",
-            "Useful when speed and operational continuity are primary drivers",
-        ]
-    elif hybrid_ocvs_priced_count > 0:
-        recommended_path = "Hybrid"
-        recommendation_reasons = [
-            f"{native_compat_pct:.0%} of workloads are placed on OCI Native",
-            f"{hybrid_ocvs_priced_count:,} workload(s) require OCVS placement",
-            "Balanced modernization, cost, and migration risk profile",
-        ]
-    else:
-        recommended_path = str(best_cost_scenario.get("label") or "OCI Native")
-        recommendation_reasons = [
-            "Lowest monthly OCI infrastructure cost",
-            "Current workload placement does not require an OCVS subset",
-            "Validate application dependencies before finalizing the path",
-        ]
-
-    recommendation_reason_text = "; ".join(recommendation_reasons)
     scenario_costs = scenario_cost_rows()
     monthly_values = [row[1] for row in scenario_costs]
     lowest_monthly = min(monthly_values, default=0.0)
     highest_monthly = max(monthly_values, default=0.0)
+    lowest_complete_scenario = scenario_by_id(
+        str(readiness_metadata["lowest_complete_scenario_id"])
+    )
+    lowest_complete_monthly: Any = (
+        money(lowest_complete_scenario.get("monthly_cost"))
+        if lowest_complete_scenario
+        else "Not available"
+    )
 
     ocvs_selected = ocvs_price["selected"]
     ocvs_totals = ocvs_price["totals"]
@@ -7559,18 +7560,26 @@ def build_migration_price_workbook_xlsx(
         row_styles,
         cell_styles,
         [
-            ["Lowest Cost Option", str(best_cost_scenario.get("label", "")), ""],
-            ["Lowest Monthly Cost", lowest_monthly, ""],
+            ["Assessor Decision", readiness_metadata["recommendation"], ""],
+            [
+                "Decision Rationale",
+                readiness_metadata["recommendation_rationale"],
+                "",
+            ],
+            [
+                "Lowest complete modeled price",
+                readiness_metadata["lowest_complete_scenario"],
+                "Descriptive price result from the central readiness model.",
+            ],
+            ["Lowest complete monthly cost", lowest_complete_monthly, ""],
             ["Cost Difference Between Options", highest_monthly - lowest_monthly, "Monthly gap between lowest and highest modeled path."],
-            ["Recommended Migration Path", recommended_path, ""],
-            ["Reason", recommendation_reason_text, ""],
         ],
-        currency_rows={2, 3},
+        currency_rows={4, 5},
     )
     add_note(
         rows,
         row_styles,
-        "Recommendation is indicative and should be validated with application dependencies, migration waves, commercial terms, and the official Oracle pricing tools before customer sign-off.",
+        "The assessor decision is separate from modeled price ranking. Validate application dependencies, migration waves, commercial terms, and official Oracle pricing before customer sign-off.",
     )
     add_section(rows, row_styles, "Migration Path Options")
     add_note(
@@ -7590,7 +7599,7 @@ def build_migration_price_workbook_xlsx(
             ["Estimated OCI infrastructure and licensing run-rate by migration path", "Professional services, project labor, training, downtime, application remediation"],
             ["Monthly, annual, and 3-year price exposure based on active assumptions", "Support uplift, contractual discounts outside the entered assumptions, and commercial quote adjustments"],
             ["Workload placement decisions and technical implications", "Backup retention, DR architecture, operational staffing, and full business case calculations"],
-            ["Recommended migration approach based on cost and placement fit", "Final commercial quotation or binding OCI Cost Estimator import"],
+            ["Assessor decision and modeled migration price context", "Final commercial quotation or binding OCI Cost Estimator import"],
         ],
     )
     executive_sheet = {
@@ -7611,11 +7620,19 @@ def build_migration_price_workbook_xlsx(
         row_styles,
         cell_styles,
         [
-            ["Lowest Cost Path", str(best_cost_scenario.get("label", "")), ""],
-            ["Lowest Monthly Cost", lowest_monthly, ""],
+            [
+                "Lowest complete modeled price",
+                readiness_metadata["lowest_complete_scenario"],
+                "Descriptive price result from the central readiness model.",
+            ],
+            ["Lowest complete monthly cost", lowest_complete_monthly, ""],
             ["Monthly Spread", highest_monthly - lowest_monthly, "Gap between lowest and highest modeled path."],
             ["3-Year Spread", (highest_monthly - lowest_monthly) * 36.0, "Straight 36-month infrastructure and licensing exposure gap."],
-            ["Recommended Path", recommended_path, recommendation_reason_text],
+            [
+                "Assessor Decision",
+                readiness_metadata["recommendation"],
+                readiness_metadata["recommendation_rationale"],
+            ],
         ],
         currency_rows={2, 3, 4},
     )

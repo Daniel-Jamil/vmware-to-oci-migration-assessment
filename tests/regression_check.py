@@ -509,6 +509,29 @@ def validate_current_readiness_routes() -> None:
         )
         return numeric_cells, formulas, calc_signature
 
+    def section_rows(
+        rows: list[list[str]],
+        start_title: str,
+        end_title: str,
+    ) -> list[list[str]]:
+        start_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if row and row[0] == start_title
+            ),
+            -1,
+        )
+        end_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if index > start_index and row and row[0] == end_title
+            ),
+            len(rows),
+        )
+        return rows[start_index + 1 : end_index] if start_index >= 0 else []
+
     app_module.build_assessment_readiness = tracked_builder
     try:
         with app_module.app.test_client() as client:
@@ -650,14 +673,35 @@ def validate_current_readiness_routes() -> None:
                 f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, cleared={export_marker_cleared}",
             )
             response.close()
+            draft_numeric_cells: dict[str, list[tuple[str, str]]] = {}
+            draft_formulas: dict[str, list[tuple[str, str]]] = {}
+            draft_calc_signature: tuple[tuple[str, ...], tuple[tuple[str, str], ...]] = ((), ())
             if exported_readiness_workbook:
                 with zipfile.ZipFile(exported_readiness_workbook) as zf:
                     sheet_map = workbook_sheet_map(zf)
+                    (
+                        draft_numeric_cells,
+                        draft_formulas,
+                        draft_calc_signature,
+                    ) = workbook_signatures(zf)
                     executive_rows = sheet_text_rows(
                         zf, sheet_map["Executive Summary"]
                     )
+                    price_rows = sheet_text_rows(
+                        zf, sheet_map["Price Comparison"]
+                    )
+                    decision_rows = section_rows(
+                        executive_rows,
+                        "Decision Readout",
+                        "Migration Path Options",
+                    )
                     executive_text = " ".join(
                         value for row in executive_rows for value in row
+                    )
+                    raw_workbook_xml = "\n".join(
+                        zf.read(name).decode("utf-8", errors="ignore")
+                        for name in zf.namelist()
+                        if name.endswith(".xml")
                     )
                     check(
                         "draft workbook includes readiness status and scenario completeness",
@@ -700,6 +744,26 @@ def validate_current_readiness_routes() -> None:
                         ),
                         executive_text,
                     )
+                    check(
+                        "draft workbook decision uses safe assessor choice and readiness price signal",
+                        any(
+                            row[:2] == ["Assessor Decision", "No recommendation yet"]
+                            for row in decision_rows
+                        )
+                        and any(
+                            row[:2]
+                            == ["Lowest complete modeled price", "OCI Native"]
+                            for row in decision_rows
+                        )
+                        and all(
+                            row[0]
+                            not in {"Recommended Migration Path", "Recommended Path"}
+                            for row in decision_rows + price_rows
+                            if row
+                        )
+                        and "Recommended Migration Path" not in raw_workbook_xml,
+                        str(decision_rows),
+                    )
                 Path(exported_readiness_workbook).unlink(missing_ok=True)
 
             with app_module.app.test_request_context("/"):
@@ -739,8 +803,21 @@ def validate_current_readiness_routes() -> None:
                     customer_ready_rows = sheet_text_rows(
                         zf, sheet_map["Executive Summary"]
                     )
+                    customer_price_rows = sheet_text_rows(
+                        zf, sheet_map["Price Comparison"]
+                    )
+                    customer_decision_rows = section_rows(
+                        customer_ready_rows,
+                        "Decision Readout",
+                        "Migration Path Options",
+                    )
                     executive_text = " ".join(
                         value for row in customer_ready_rows for value in row
+                    )
+                    raw_workbook_xml = "\n".join(
+                        zf.read(name).decode("utf-8", errors="ignore")
+                        for name in zf.namelist()
+                        if name.endswith(".xml")
                     )
                     check(
                         "customer-ready workbook status follows central readiness",
@@ -764,6 +841,40 @@ def validate_current_readiness_routes() -> None:
                             for row in customer_ready_rows
                         ),
                         executive_text,
+                    )
+                    check(
+                        "customer-ready workbook decision uses assessor Native instead of heuristic Hybrid",
+                        any(
+                            row[:2] == ["Assessor Decision", "OCI Native"]
+                            for row in customer_decision_rows
+                        )
+                        and not any(
+                            "Hybrid" in row for row in customer_decision_rows
+                        )
+                        and any(
+                            row[:2]
+                            == ["Lowest complete modeled price", "OCI Native"]
+                            for row in customer_decision_rows
+                        )
+                        and any(
+                            row[:2] == ["Assessor Decision", "OCI Native"]
+                            for row in customer_price_rows
+                        )
+                        and all(
+                            row[0]
+                            not in {"Recommended Migration Path", "Recommended Path"}
+                            for row in customer_decision_rows + customer_price_rows
+                            if row
+                        )
+                        and "Recommended Migration Path" not in raw_workbook_xml,
+                        str(customer_decision_rows),
+                    )
+                    check(
+                        "assessor decision metadata does not change workbook calculations",
+                        baseline_numeric_cells == draft_numeric_cells
+                        and baseline_formulas == draft_formulas
+                        and baseline_calc_signature == draft_calc_signature,
+                        f"pricing={baseline_numeric_cells == draft_numeric_cells}, formulas={baseline_formulas == draft_formulas}, calc={baseline_calc_signature == draft_calc_signature}",
                     )
                 Path(customer_ready_workbook).unlink(missing_ok=True)
 
@@ -885,7 +996,8 @@ def validate_current_readiness_routes() -> None:
                 malformed_metadata.get("workbook_status") == "Draft"
                 and malformed_metadata.get("readiness_label") == "Incomplete"
                 and malformed_metadata.get("customer_ready_export") is False
-                and malformed_metadata.get("recommendation") == "Not provided",
+                and malformed_metadata.get("recommendation")
+                == "No recommendation yet",
                 str(malformed_metadata),
             )
 
@@ -937,6 +1049,7 @@ def validate_workbook_readiness_metadata_safety() -> None:
             "scenarios": scenarios,
             "blocking_items": [],
             "advisory_items": [],
+            "lowest_complete_scenario": recommendation,
             "recommendation": recommendation,
         }
 
@@ -5890,6 +6003,11 @@ def validate_workbook(workbook_path: Path) -> None:
             if name.endswith(".xml")
         )
         check("no Excel error markers", not re.search(r"#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A", raw_xml))
+        check(
+            "workbook XML has no automatic migration recommendation labels",
+            "Recommended Migration Path" not in raw_xml
+            and "<t>Recommended Path</t>" not in raw_xml,
+        )
 
         sheet_map = workbook_sheet_map(zf)
         check("workbook sheet order", list(sheet_map.keys()) == expected_sheets, ", ".join(sheet_map.keys()))
@@ -5942,6 +6060,36 @@ def validate_workbook(workbook_path: Path) -> None:
             not in executive_xml,
         )
         executive_rows = sheet_text_rows(zf, sheet_map["Executive Summary"])
+        decision_rows = []
+        decision_start = next(
+            (
+                index
+                for index, row in enumerate(executive_rows)
+                if row and row[0] == "Decision Readout"
+            ),
+            -1,
+        )
+        decision_end = next(
+            (
+                index
+                for index, row in enumerate(executive_rows)
+                if index > decision_start
+                and row
+                and row[0] == "Migration Path Options"
+            ),
+            len(executive_rows),
+        )
+        if decision_start >= 0:
+            decision_rows = executive_rows[decision_start + 1 : decision_end]
+        check(
+            "executive decision readout uses assessor choice and readiness-derived price label",
+            any(row[:2] == ["Assessor Decision", "Hybrid"] for row in decision_rows)
+            and any(
+                row and row[0] == "Lowest complete modeled price"
+                for row in decision_rows
+            ),
+            str(decision_rows),
+        )
         check(
             "executive migration path cards exported horizontally",
             any(
