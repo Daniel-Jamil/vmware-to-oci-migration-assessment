@@ -24,6 +24,17 @@ def visible_page_text(markup: str) -> str:
     )
 
 
+def result_scenario_card(markup: str, scenario_id: str) -> str:
+    match = re.search(
+        rf'<article\b(?=[^>]*data-result-scenario="{re.escape(scenario_id)}")[^>]*>.*?</article>',
+        markup,
+        flags=re.S,
+    )
+    if match is None:
+        raise AssertionError(f"Results card not found for {scenario_id}")
+    return match.group(0)
+
+
 def complete_context() -> dict:
     return {
         "setup": {
@@ -570,6 +581,19 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(3, html.count("Technical eligibility"))
         self.assertEqual(3, html.count("Pricing completeness"))
         self.assertEqual(3, html.count("Modeled cost"))
+        self.assertEqual(3, html.count("Scenario readiness"))
+        for scenario_id, state, label, tone in (
+            ("native", "needs_attention", "Needs attention", "attention"),
+            ("ocvs", "incomplete", "Incomplete", "blocked"),
+            ("hybrid", "incomplete", "Incomplete", "blocked"),
+        ):
+            with self.subTest(scenario_id=scenario_id):
+                card = result_scenario_card(html, scenario_id)
+                self.assertIn(f'data-readiness-state="{state}"', card)
+                self.assertRegex(
+                    card,
+                    rf'(?s)result-status--{tone}"[^>]*>.*?{label}',
+                )
         for label in (
             "Monthly",
             "Annual",
@@ -596,9 +620,52 @@ class ReadinessTests(unittest.TestCase):
         self.assertIn('name="recommendation_rationale"', html)
         self.assertIn('maxlength="4000"', html)
         self.assertIn("Save assessment", html)
-        self.assertIn("Excel Export Draft", html)
+        self.assertRegex(
+            html,
+            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+        )
         self.assertNotIn("export_json", html)
         self.assertNotIn("Portable JSON", html)
+
+        ready_readiness = {
+            "overall_state": "draft_review_required",
+            "lowest_complete_scenario": "native",
+            "scenarios": {
+                scenario_id: {
+                    "state": "ready",
+                    "technical_eligibility": "eligible",
+                    "pricing_state": "complete",
+                    "rankable": True,
+                }
+                for scenario_id in ("native", "ocvs", "hybrid")
+            },
+        }
+        ready_views = [
+            {
+                "id": scenario_id,
+                "title": scenario_id.upper(),
+                "scenario": {"monthly_cost": 100.0},
+            }
+            for scenario_id in ("native", "ocvs", "hybrid")
+        ]
+        with app_module.app.test_request_context("/step4?tab=price"):
+            ready_results = app_module.build_results_page_context(
+                ready_readiness,
+                ready_views,
+                {},
+            )
+            ready_markup = app_module.render_template(
+                "_results_comparison.html",
+                results=ready_results,
+                pricing_symbol="$",
+            )
+        for scenario_id in ("native", "ocvs", "hybrid"):
+            ready_card = result_scenario_card(ready_markup, scenario_id)
+            self.assertIn('data-readiness-state="ready"', ready_card)
+            self.assertRegex(
+                ready_card,
+                r'(?s)result-status--ready"[^>]*>.*?Ready',
+            )
 
     def test_recommendation_save_persists_incomplete_selection_and_rationale(self) -> None:
         rationale = "Retain the legacy workload on OCVS during the first migration wave."
@@ -624,7 +691,10 @@ class ReadinessTests(unittest.TestCase):
         self.assertRegex(html, r'value="ocvs"\s+checked')
         self.assertIn(rationale, html)
         self.assertIn("Incomplete pricing", html)
-        self.assertIn("Excel Export Draft", html)
+        self.assertRegex(
+            html,
+            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+        )
 
     def test_recommendation_submission_rejects_invalid_payloads_transactionally(self) -> None:
         invalid_forms = {
@@ -736,7 +806,10 @@ class ReadinessTests(unittest.TestCase):
                 },
                 follow_redirects=True,
             )
-            self.assertIn(b"Excel Export Draft", draft_response.data)
+            self.assertRegex(
+                draft_response.data.decode("utf-8", errors="replace"),
+                r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+            )
 
             ready_response = client.post(
                 "/step4",
@@ -749,7 +822,23 @@ class ReadinessTests(unittest.TestCase):
             )
 
         self.assertEqual(200, ready_response.status_code)
-        self.assertIn(b"Excel Export Customer-ready", ready_response.data)
+        ready_html = ready_response.data.decode("utf-8", errors="replace")
+        self.assertRegex(
+            ready_html,
+            r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
+        )
+        for scenario_id, state, label, tone in (
+            ("native", "needs_attention", "Needs attention", "attention"),
+            ("ocvs", "incomplete", "Incomplete", "blocked"),
+            ("hybrid", "incomplete", "Incomplete", "blocked"),
+        ):
+            with self.subTest(scenario_id=scenario_id):
+                card = result_scenario_card(ready_html, scenario_id)
+                self.assertIn(f'data-readiness-state="{state}"', card)
+                self.assertRegex(
+                    card,
+                    rf'(?s)result-status--{tone}"[^>]*>.*?{label}',
+                )
         self.assertIn(rationale.encode(), ready_response.data)
         self.assertIn(b'role="status"', ready_response.data)
 

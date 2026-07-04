@@ -25,6 +25,7 @@
       <article
         class="result-scenario result-scenario--{{ scenario.id }}"
         data-result-scenario="{{ scenario.id }}"
+        data-readiness-state="{{ scenario.readiness_state }}"
         data-rankable="{{ 'true' if scenario.rankable else 'false' }}"
       >
         <header class="result-scenario__heading">
@@ -49,6 +50,12 @@
             <dt>Pricing completeness</dt>
             <dd class="result-status result-status--{{ scenario.pricing_tone }}">
               <span aria-hidden="true"></span>{{ scenario.pricing_label }}
+            </dd>
+          </div>
+          <div>
+            <dt>Scenario readiness</dt>
+            <dd class="result-status result-status--{{ scenario.readiness_tone }}">
+              <span aria-hidden="true"></span>{{ scenario.readiness_label }}
             </dd>
           </div>
           <div>

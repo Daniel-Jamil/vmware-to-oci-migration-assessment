@@ -3441,6 +3441,25 @@ def validate_task7_native_scenario_workspace() -> None:
         and price_html.count("Technical eligibility") == 3
         and price_html.count("Pricing completeness") == 3
         and price_html.count("Modeled cost") == 3
+        and price_html.count("Scenario readiness") == 3
+        and re.search(
+            r'data-result-scenario="native"[^>]*data-readiness-state="needs_attention".*?result-status--attention"[^>]*>.*?Needs attention',
+            price_html,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r'data-result-scenario="ocvs"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
+            price_html,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r'data-result-scenario="hybrid"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
+            price_html,
+            re.S,
+        )
+        is not None
         and all(
             label in price_html
             for label in (
@@ -3489,7 +3508,11 @@ def validate_task7_native_scenario_workspace() -> None:
         and 'aria-live="polite"' in price_html
         and 'value="save_assessment"' in price_html
         and 'value="export_excel"' in price_html
-        and "Excel Export Draft" in price_html
+        and re.search(
+            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+            price_html,
+        )
+        is not None
         and "export_json" not in price_html
         and "Portable JSON" not in price_html,
     )
@@ -3637,9 +3660,30 @@ def validate_task7_native_scenario_workspace() -> None:
         "Task 9 Native treatment unlocks only the customer-ready export label",
         positive_vcf_response.status_code in {302, 303}
         and ready_recommendation.status_code == 200
-        and "Excel Export Customer-ready" in ready_html
+        and re.search(
+            r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
+            ready_html,
+        )
+        is not None
         and native_rationale in ready_html
-        and 'data-result-scenario="native"' in ready_html
+        and re.search(
+            r'data-result-scenario="native"[^>]*data-readiness-state="needs_attention".*?result-status--attention"[^>]*>.*?Needs attention',
+            ready_html,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r'data-result-scenario="ocvs"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
+            ready_html,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r'data-result-scenario="hybrid"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
+            ready_html,
+            re.S,
+        )
+        is not None
         and "Technical eligibility" in ready_html
         and len(ready_ids) == len(set(ready_ids)),
         f"positive={positive_vcf_response.status_code}, duplicates={len(ready_ids) - len(set(ready_ids))}",
@@ -4744,7 +4788,11 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                     f"{route} controls render",
                     b"Save recommendation" in response.data
                     and b"Save assessment" in response.data
-                    and b"Excel Export Draft" in response.data,
+                    and re.search(
+                        rb'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+                        response.data,
+                    )
+                    is not None,
                 )
                 check(
                     f"{route} export status UI renders",

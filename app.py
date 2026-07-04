@@ -5778,6 +5778,11 @@ def build_results_page_context(
             ],
         },
     }
+    scenario_readiness_copy = {
+        "ready": ("Ready", "ready"),
+        "needs_attention": ("Needs attention", "attention"),
+        "incomplete": ("Incomplete", "blocked"),
+    }
 
     def amount(value: Any, fallback: float = 0.0) -> float:
         if isinstance(value, bool):
@@ -5799,6 +5804,10 @@ def build_results_page_context(
         if not isinstance(status, dict):
             status = {}
         copy_values = decision_copy[scenario_id]
+        readiness_state = str(status.get("state") or "incomplete")
+        if readiness_state not in scenario_readiness_copy:
+            readiness_state = "incomplete"
+        readiness_label, readiness_tone = scenario_readiness_copy[readiness_state]
 
         monthly_cost = amount(scenario.get("monthly_cost"))
         annual_cost = amount(scenario.get("yearly_cost"), monthly_cost * 12)
@@ -5847,6 +5856,9 @@ def build_results_page_context(
                 "technical_tone": "ready" if technically_eligible else "blocked",
                 "pricing_label": "Complete pricing" if pricing_complete else "Incomplete pricing",
                 "pricing_tone": "ready" if pricing_complete else "attention",
+                "readiness_state": readiness_state,
+                "readiness_label": readiness_label,
+                "readiness_tone": readiness_tone,
                 "modeled_cost_label": (
                     "Complete modeled amount"
                     if pricing_complete
@@ -5910,9 +5922,9 @@ def build_results_page_context(
         ],
         "customer_ready_export": readiness.get("customer_ready_export") is True,
         "excel_export_label": (
-            "Excel Export Customer-ready"
+            "Export Excel"
             if readiness.get("customer_ready_export") is True
-            else "Excel Export Draft"
+            else "Export Draft"
         ),
         "assessment_name": normalize_assessment_name(
             session.get("active_assessment_name", "")
