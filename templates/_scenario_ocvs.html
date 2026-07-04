@@ -1,0 +1,185 @@
+<div
+  class="ocvs-workspace"
+  data-ocvs-workspace
+  data-ocvs-readiness-state="{{ ocvs_display.state }}"
+  data-ocvs-rankable="{{ 'true' if ocvs_display.rankable else 'false' }}"
+  data-ocvs-commitment-term="{{ ocvs_display.commitment_term }}"
+  data-ocvs-term-discount-pct="{{ '%.2f'|format(ocvs_display.term_discount_pct) }}"
+  data-ocvs-infrastructure-subtotal="{{ '%.6f'|format(ocvs_display.infrastructure_subtotal) }}"
+>
+  <section class="scenario-decision" aria-labelledby="ocvs-decision-title">
+    <div>
+      <p class="native-section-label">Sizing outcome</p>
+      <h3 id="ocvs-decision-title">OCVS sizing decision</h3>
+      <p>The complete selected workload remains on VMware, sized against the selected OCVS node profile and current capacity policy.</p>
+    </div>
+    <dl class="scenario-decision__metrics" aria-label="OCVS sizing summary">
+      <div><dt>Workload</dt><dd>{{ "{:,}".format(ocvs_display.workload_count) }} VMs</dd></div>
+      <div><dt>Selected profile</dt><dd>{{ ocvs_selected.shape }}</dd></div>
+      <div><dt>Total nodes</dt><dd>{{ "{:,}".format(ocvs_selected.host_count) }}</dd></div>
+      <div><dt>Sizing basis</dt><dd>{{ ocvs_selected.constraint|capitalize }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="scenario-cost-summary" aria-labelledby="ocvs-cost-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Infrastructure and Licensing</p>
+        <h3 id="ocvs-cost-title">Monthly cost status</h3>
+      </div>
+      <span class="scenario-status scenario-status--{{ ocvs_display.status_tone }}">{{ ocvs_display.status_label }}</span>
+    </div>
+    <dl class="scenario-cost-grid">
+      <div>
+        <dt>Infrastructure subtotal</dt>
+        <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(ocvs_display.infrastructure_subtotal) }}</dd>
+        <small>BM.Compute and datastore after IaaS and term discounts</small>
+      </div>
+      <div>
+        <dt>VCF subtotal</dt>
+        <dd>
+          {% if ocvs_display.vcf_price_required %}
+            Unit price required
+          {% else %}
+            {{ pricing_symbol }}{{ "{:,.0f}".format(ocvs_display.vcf_subtotal) }}
+          {% endif %}
+        </dd>
+        <small>{{ "{:,}".format(vmware_license_summary.ocvs.physical_cores) }} physical cores</small>
+      </div>
+      <div class="scenario-cost-grid__total">
+        <dt>{{ ocvs_display.total_label }}</dt>
+        <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(ocvs_display.monthly_total) }}</dd>
+        <small><span>Cost / VM / month</span> <strong>{{ pricing_symbol }}{{ "{:,.0f}".format(view.scenario.cost_per_vm) }}</strong></small>
+      </div>
+      <div>
+        <dt>Commitment term</dt>
+        <dd>{{ ocvs_display.commitment_label }}</dd>
+        <small>{{ "%.0f"|format(ocvs_display.term_discount_pct) }}% selected-shape discount</small>
+      </div>
+    </dl>
+  </section>
+
+  <section class="ocvs-assumptions" aria-labelledby="ocvs-assumptions-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Commercial and capacity inputs</p>
+        <h3 id="ocvs-assumptions-title">Sizing Assumptions</h3>
+      </div>
+      <span>Shared with Hybrid OCVS subset sizing</span>
+    </div>
+    <div class="ocvs-assumption-groups">
+      <fieldset class="scenario-field-group">
+        <legend>Profile &amp; Term</legend>
+        <label class="native-field" for="ocvs_profile">
+          <span>OCVS node profile</span>
+          <select id="ocvs_profile" name="ocvs_profile" form="step4-form">
+            <option value="best_fit" {% if ocvs_profile_choice == 'best_fit' %}selected{% endif %}>Cost optimized</option>
+            {% for profile in ocvs_profiles %}
+              <option value="{{ profile.shape }}" {% if ocvs_profile_choice == profile.shape %}selected{% endif %}>{{ profile.label }} - {{ profile.shape }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="native-field" for="ocvs_commitment_term">
+          <span>Commitment term</span>
+          <select id="ocvs_commitment_term" name="ocvs_commitment_term" form="step4-form">
+            {% for option in ocvs_commitment_options %}
+              <option value="{{ option.value }}" {% if ocvs_commitment_term == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset class="scenario-field-group scenario-field-group--wide">
+        <legend>Capacity Policy</legend>
+        <div class="scenario-field-grid">
+          <label class="native-field" for="ocvs_vcpu_per_ocpu">
+            <span>vCPU per OCPU</span>
+            <input id="ocvs_vcpu_per_ocpu" name="ocvs_vcpu_per_ocpu" form="step4-form" type="number" min="1" max="16" step="0.1" value="{{ '%.1f'|format(ocvs_policy.vcpu_per_ocpu) }}" />
+          </label>
+          <label class="native-field" for="ocvs_cpu_headroom_pct">
+            <span>CPU headroom %</span>
+            <input id="ocvs_cpu_headroom_pct" name="ocvs_cpu_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(ocvs_policy.cpu_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="ocvs_memory_headroom_pct">
+            <span>RAM headroom %</span>
+            <input id="ocvs_memory_headroom_pct" name="ocvs_memory_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(ocvs_policy.memory_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="ocvs_storage_headroom_pct">
+            <span>Storage headroom %</span>
+            <input id="ocvs_storage_headroom_pct" name="ocvs_storage_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(ocvs_policy.storage_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="ocvs_dense_vsan_usable_pct">
+            <span>Dense vSAN usable %</span>
+            <input id="ocvs_dense_vsan_usable_pct" name="ocvs_dense_vsan_usable_pct" form="step4-form" type="number" min="10" max="95" step="1" value="{{ '%.0f'|format(ocvs_policy.dense_vsan_usable_pct) }}" />
+          </label>
+          <label class="native-field" for="ocvs_standard_storage_vpu">
+            <span>Standard storage VPU/GB</span>
+            <input id="ocvs_standard_storage_vpu" name="ocvs_standard_storage_vpu" form="step4-form" type="number" min="10" max="120" step="10" value="{{ ocvs_policy.standard_storage_vpu }}" />
+          </label>
+        </div>
+      </fieldset>
+
+      <fieldset class="scenario-field-group">
+        <legend>Resilience</legend>
+        <label class="native-field" for="ocvs_dr_nodes">
+          <span>Additional spare nodes</span>
+          <select id="ocvs_dr_nodes" name="ocvs_dr_nodes" form="step4-form">
+            {% for count in [0, 1, 2] %}
+              <option value="{{ count }}" {% if ocvs_dr_nodes == count %}selected{% endif %}>{{ count }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset class="scenario-field-group">
+        <legend>VCF Licensing</legend>
+        <label class="native-field" for="vmware_license_price_per_core_yearly">
+          <span>List price per physical core/year</span>
+          <input
+            id="vmware_license_price_per_core_yearly"
+            name="vmware_license_price_per_core_yearly"
+            form="step4-form"
+            type="number"
+            min="0"
+            max="1000000"
+            step="0.01"
+            value="{{ '%.2f'|format(vmware_license_price_per_core_yearly) }}"
+          />
+        </label>
+      </fieldset>
+    </div>
+  </section>
+
+  <section class="scenario-capacity" aria-labelledby="ocvs-capacity-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Sizing basis</p>
+        <h3 id="ocvs-capacity-title">Workload Capacity Requirements</h3>
+      </div>
+      <span>{{ ocvs_selected.label }}</span>
+    </div>
+    <dl class="scenario-capacity-grid">
+      <div><dt>vCPU</dt><dd>{{ "{:,}".format(ocvs_totals.vcpus) }}</dd><small>{{ ocvs_selected.hosts_by_cpu }} node(s) by CPU</small></div>
+      <div><dt>RAM</dt><dd>{{ "{:,}".format(ocvs_totals.memory_gb) }} GB</dd><small>{{ ocvs_selected.hosts_by_memory }} node(s) by RAM</small></div>
+      <div><dt>Storage</dt><dd>{{ "{:,}".format(ocvs_totals.storage_gb) }} GB</dd><small>{{ 'Block Volume datastore' if ocvs_selected.host_type == 'Standard' else (ocvs_selected.hosts_by_storage|string) ~ ' node(s) by storage' }}</small></div>
+      <div><dt>Physical cores</dt><dd>{{ "{:,}".format(vmware_license_summary.ocvs.physical_cores) }}</dd><small>{{ ocvs_selected.host_count }} x {{ ocvs_selected.ocpus_per_host }}</small></div>
+    </dl>
+
+    <div class="scenario-table-scroll" tabindex="0" aria-label="OCVS shape price comparison">
+      <table class="scenario-data-table">
+        <thead><tr><th>Shape</th><th>Nodes</th><th>Storage model</th><th>Infrastructure / month</th><th>Selection</th></tr></thead>
+        <tbody>
+          {% for row in ocvs_shape_comparison.rows %}
+            <tr {% if row.is_selected %}class="is-selected"{% endif %}>
+              <th scope="row">{{ row.shape }}</th>
+              <td>{{ row.host_count }}</td>
+              <td>{{ row.storage_model }}</td>
+              <td>{{ pricing_symbol }}{{ "{:,.0f}".format(row.total_monthly_cost) }}</td>
+              <td>{% if row.is_best_fit %}Cost optimized{% elif row.is_selected %}Selected{% else %}Available{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>

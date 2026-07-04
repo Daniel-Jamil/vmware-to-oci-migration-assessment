@@ -5,7 +5,9 @@
   const panels = Array.from(document.querySelectorAll("[data-scenario-panel]"));
   const scenarioForm = document.querySelector("[data-scenario-form]");
   const activeScenarioInput = document.getElementById("active_scenario");
-  const dirtyLiveRegion = document.querySelector("[data-scenario-dirty-live]");
+  const dirtyLiveRegions = Array.from(document.querySelectorAll(
+    "[data-scenario-dirty-live], .scenario-save-bar--compact > span",
+  ));
   const mainTitle = document.getElementById("step4-main-title");
   const stageSelect = document.getElementById("workspace-stage-select");
   const nativeRows = Array.from(document.querySelectorAll("[data-native-editor-row]"));
@@ -14,6 +16,7 @@
   const nativeMobileNext = document.querySelector("[data-native-mobile-next]");
   const nativeMobileStatus = document.querySelector("[data-native-mobile-status]");
   const nativeMobileMedia = window.matchMedia("(max-width: 767px)");
+  const hybridEditor = document.querySelector("[data-hybrid-editor]");
   const currentStageValue = stageSelect ? stageSelect.value : "";
   const titleByScenario = {
     native: "Migration to OCI Native",
@@ -29,7 +32,9 @@
   );
 
   function announce(message) {
-    if (dirtyLiveRegion) dirtyLiveRegion.textContent = message;
+    dirtyLiveRegions.forEach((region) => {
+      region.textContent = message;
+    });
   }
 
   function markDirty() {
@@ -137,6 +142,186 @@
   }
   nativeMobileMedia.addEventListener("change", renderNativeMobileRow);
   renderNativeMobileRow();
+
+  function initHybridEditor() {
+    if (!hybridEditor || hybridEditor.dataset.hybridInitialized === "true") return;
+    hybridEditor.dataset.hybridInitialized = "true";
+
+    const rows = Array.from(hybridEditor.querySelectorAll("[data-hybrid-row]"));
+    const search = hybridEditor.querySelector("[data-hybrid-search]");
+    const supportFilter = hybridEditor.querySelector("[data-hybrid-support-filter]");
+    const placementFilter = hybridEditor.querySelector("[data-hybrid-placement-filter]");
+    const bulkScope = hybridEditor.querySelector("[data-hybrid-bulk-scope]");
+    const bulkPlacement = hybridEditor.querySelector("[data-hybrid-bulk-placement]");
+    const bulkApply = hybridEditor.querySelector("[data-hybrid-bulk-apply]");
+    const bulkUndo = hybridEditor.querySelector("[data-hybrid-bulk-undo]");
+    const bulkStatus = hybridEditor.querySelector("[data-hybrid-bulk-status]");
+    const previousPage = hybridEditor.querySelector("[data-hybrid-page-previous]");
+    const nextPage = hybridEditor.querySelector("[data-hybrid-page-next]");
+    const pageStatus = hybridEditor.querySelector("[data-hybrid-page-status]");
+    const visibleSummary = hybridEditor.querySelector("[data-hybrid-visible-summary]");
+    const pageSize = Math.max(1, Number(hybridEditor.dataset.hybridPageSize || 25));
+    let currentPage = 1;
+    let filteredRows = rows.slice();
+    let pageRows = rows.slice(0, pageSize);
+    let hybridBulkSnapshot = null;
+
+    function placementSelect(row) {
+      return row.querySelector("[data-hybrid-placement-select]");
+    }
+
+    function updateHybridRow(row) {
+      const select = placementSelect(row);
+      if (!select) return;
+      const placement = select.value;
+      const recommended = row.dataset.hybridRecommended || "ocvs";
+      const pricedAs = row.querySelector("[data-hybrid-priced-as]");
+      const reason = row.querySelector("[data-hybrid-reason]");
+      row.dataset.hybridPlacement = placement;
+      if (pricedAs) pricedAs.textContent = placement === "native" ? "OCI Native" : "OCVS";
+      if (reason) {
+        if (placement === "review") {
+          reason.textContent = "Pending placement review; conservatively priced as OCVS";
+        } else if (placement === recommended) {
+          reason.textContent = "Matches the support-based recommendation";
+        } else {
+          reason.textContent = "Manual override from the support-based recommendation";
+        }
+      }
+    }
+
+    function renderHybridCounts() {
+      const counts = { native: 0, ocvs: 0, review: 0, manual: 0 };
+      rows.forEach((row) => {
+        const placement = row.dataset.hybridPlacement || "ocvs";
+        if (Object.prototype.hasOwnProperty.call(counts, placement)) counts[placement] += 1;
+        if (placement !== (row.dataset.hybridRecommended || "ocvs")) counts.manual += 1;
+      });
+      Object.entries(counts).forEach(([name, value]) => {
+        const output = hybridEditor.querySelector(`[data-hybrid-count="${name}"]`);
+        if (output) output.textContent = String(value);
+      });
+    }
+
+    function rowMatchesFilters(row) {
+      const searchValue = search ? search.value.trim().toLowerCase() : "";
+      const supportValue = supportFilter ? supportFilter.value : "all";
+      const placementValue = placementFilter ? placementFilter.value : "all";
+      return (
+        (!searchValue || (row.dataset.hybridSearchText || "").toLowerCase().includes(searchValue))
+        && (supportValue === "all" || row.dataset.hybridSupport === supportValue)
+        && (placementValue === "all" || row.dataset.hybridPlacement === placementValue)
+      );
+    }
+
+    function renderHybridEditor(resetPage) {
+      filteredRows = rows.filter(rowMatchesFilters);
+      const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+      if (resetPage) currentPage = 1;
+      currentPage = Math.min(Math.max(currentPage, 1), pageCount);
+      const start = (currentPage - 1) * pageSize;
+      pageRows = filteredRows.slice(start, start + pageSize);
+      const visibleSet = new Set(pageRows);
+      rows.forEach((row) => {
+        row.hidden = !visibleSet.has(row);
+      });
+      if (previousPage) previousPage.disabled = currentPage <= 1;
+      if (nextPage) nextPage.disabled = currentPage >= pageCount;
+      if (pageStatus) pageStatus.textContent = `Page ${currentPage} of ${pageCount}`;
+      if (visibleSummary) {
+        const first = filteredRows.length ? start + 1 : 0;
+        const last = Math.min(start + pageSize, filteredRows.length);
+        visibleSummary.textContent = `${first}-${last} of ${filteredRows.length} matching VM(s)`;
+      }
+      renderHybridCounts();
+    }
+
+    function rowsForBulkScope() {
+      const scope = bulkScope ? bulkScope.value : "page";
+      if (scope === "all") return rows;
+      if (scope === "filtered") return filteredRows;
+      return pageRows;
+    }
+
+    rows.forEach((row) => {
+      const select = placementSelect(row);
+      if (!select) return;
+      select.addEventListener("change", function () {
+        updateHybridRow(row);
+        renderHybridEditor(false);
+      });
+      updateHybridRow(row);
+    });
+
+    [search, supportFilter, placementFilter].forEach((control) => {
+      if (!control) return;
+      control.addEventListener(control === search ? "input" : "change", function () {
+        renderHybridEditor(true);
+      });
+    });
+
+    if (previousPage) {
+      previousPage.addEventListener("click", function () {
+        currentPage -= 1;
+        renderHybridEditor(false);
+      });
+    }
+    if (nextPage) {
+      nextPage.addEventListener("click", function () {
+        currentPage += 1;
+        renderHybridEditor(false);
+      });
+    }
+
+    if (bulkApply) {
+      bulkApply.addEventListener("click", function () {
+        const applied = bulkPlacement ? bulkPlacement.value : "";
+        if (!applied) {
+          if (bulkStatus) bulkStatus.textContent = "Choose a placement before applying.";
+          return;
+        }
+        const affectedRows = rowsForBulkScope()
+          .map((row) => ({ row, select: placementSelect(row) }))
+          .filter((item) => item.select && item.select.value !== applied);
+        hybridBulkSnapshot = affectedRows.map((item) => ({
+          row: item.row,
+          select: item.select,
+          before: item.select.value,
+          applied,
+        }));
+        hybridBulkSnapshot.forEach((item) => {
+          item.select.value = applied;
+          updateHybridRow(item.row);
+        });
+        if (bulkUndo) bulkUndo.disabled = hybridBulkSnapshot.length === 0;
+        if (bulkStatus) bulkStatus.textContent = `Applied to ${hybridBulkSnapshot.length} VM(s).`;
+        if (hybridBulkSnapshot.length) markDirty();
+        renderHybridEditor(false);
+      });
+    }
+
+    if (bulkUndo) {
+      bulkUndo.addEventListener("click", function () {
+        if (!hybridBulkSnapshot) return;
+        let restored = 0;
+        hybridBulkSnapshot.forEach((item) => {
+          if (item.select.value !== item.applied) return;
+          item.select.value = item.before;
+          updateHybridRow(item.row);
+          restored += 1;
+        });
+        if (bulkStatus) bulkStatus.textContent = `Restored ${restored} VM(s); later row edits were kept.`;
+        hybridBulkSnapshot = null;
+        bulkUndo.disabled = true;
+        if (restored) markDirty();
+        renderHybridEditor(false);
+      });
+    }
+
+    renderHybridEditor(true);
+  }
+
+  initHybridEditor();
 
   document.addEventListener(
     "click",

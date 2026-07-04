@@ -3513,6 +3513,185 @@ def validate_task7_native_scenario_workspace() -> None:
     )
 
 
+def validate_task8_ocvs_hybrid_configuration() -> None:
+    rows, _source = app_module.load_vms_from_vinfo(str(NATIVE_SCENARIO_INVENTORY))
+    selected_rows = rows[:75]
+    selected_names = [str(row["name"]) for row in selected_rows]
+    placements = {name: "native" for name in selected_names}
+    placements[selected_names[0]] = "ocvs"
+    placements[selected_names[1]] = "review"
+    expected_plan = app_module.build_hybrid_placement_plan(
+        [
+            {
+                "vm_name": str(row["name"]),
+                "os_name": str(row.get("raw_os") or "Unknown / Empty"),
+            }
+            for row in selected_rows
+        ],
+        placements,
+        app_module.load_supported_os_signatures(),
+    )
+    state_id = f"task8_ocvs_hybrid_{uuid4().hex}"
+    price_file = find_price_file()
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = selected_names
+        state["step4_hybrid_placements"] = placements
+        state["acknowledged_warning_ids"] = ["unsupported-native", "unknown-os"]
+        state["step4_ocvs_profile"] = "BM.Standard.E4.128"
+        state["step4_ocvs_commitment_term"] = "3_year"
+        state["step4_vmware_license_price_per_core_yearly"] = 0.0
+        app_module.save_app_state(state)
+
+    client = app_module.app.test_client()
+    with client.session_transaction() as sess:
+        sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+        sess["state_id"] = state_id
+        sess["selected_rvtools_file"] = str(NATIVE_SCENARIO_INVENTORY)
+        sess["selected_pricelist_file"] = price_file
+        sess["customer_name"] = "Task 8 Customer"
+        sess["active_assessment_name"] = "Task 8 Assessment"
+
+    zero_vcf_response = client.get("/step4?tab=ocvs")
+    zero_vcf_html = zero_vcf_response.data.decode("utf-8", errors="replace")
+    step4_source = (ROOT / "templates" / "step4.html").read_text(encoding="utf-8")
+    ocvs_partial = ROOT / "templates" / "_scenario_ocvs.html"
+    hybrid_partial = ROOT / "templates" / "_scenario_hybrid.html"
+    check(
+        "Task 8 extracts OCVS and Hybrid into scenario partials",
+        zero_vcf_response.status_code == 200
+        and ocvs_partial.exists()
+        and hybrid_partial.exists()
+        and '{% include "_scenario_ocvs.html" %}' in step4_source
+        and '{% include "_scenario_hybrid.html" %}' in step4_source,
+    )
+    check(
+        "OCVS groups the established controls under four decision headings",
+        all(
+            heading in zero_vcf_html
+            for heading in ("Profile &amp; Term", "Capacity Policy", "Resilience", "VCF Licensing")
+        )
+        and zero_vcf_html.count('name="ocvs_profile"') == 1
+        and zero_vcf_html.count('name="ocvs_commitment_term"') == 1
+        and zero_vcf_html.count('name="ocvs_vcpu_per_ocpu"') == 1
+        and zero_vcf_html.count('name="ocvs_cpu_headroom_pct"') == 1
+        and zero_vcf_html.count('name="ocvs_memory_headroom_pct"') == 1
+        and zero_vcf_html.count('name="ocvs_storage_headroom_pct"') == 1
+        and zero_vcf_html.count('name="ocvs_dense_vsan_usable_pct"') == 1
+        and zero_vcf_html.count('name="ocvs_standard_storage_vpu"') == 1
+        and zero_vcf_html.count('name="ocvs_dr_nodes"') == 1
+        and zero_vcf_html.count('name="vmware_license_price_per_core_yearly"') == 1,
+    )
+    selected_discount = app_module.ocvs_term_discount_pct("BM.Standard.E4.128", "3_year")
+    check(
+        "OCVS renders the selected shape term discount from the backend",
+        'data-ocvs-commitment-term="3_year"' in zero_vcf_html
+        and f'data-ocvs-term-discount-pct="{selected_discount:.2f}"' in zero_vcf_html
+        and f"{selected_discount:.0f}% selected-shape discount" in zero_vcf_html,
+    )
+    check(
+        "Zero VCF price preserves infrastructure subtotal but blocks ranking",
+        'data-ocvs-readiness-state="incomplete"' in zero_vcf_html
+        and 'data-ocvs-rankable="false"' in zero_vcf_html
+        and 'data-hybrid-rankable="false"' in zero_vcf_html
+        and re.search(r'data-ocvs-infrastructure-subtotal="[1-9][0-9.]*"', zero_vcf_html) is not None
+        and "Infrastructure subtotal" in zero_vcf_html
+        and "Unit price required" in zero_vcf_html
+        and "Partial monthly total" in zero_vcf_html
+        and "Pricing incomplete" in zero_vcf_html,
+    )
+
+    hybrid_response = client.get("/step4?tab=hybrid")
+    hybrid_html = hybrid_response.data.decode("utf-8", errors="replace")
+    check(
+        "Hybrid renders workload partitions subset sizing and override values",
+        hybrid_response.status_code == 200
+        and f'data-hybrid-native-count="{expected_plan["native_count"]}"' in hybrid_html
+        and f'data-hybrid-ocvs-count="{expected_plan["ocvs_count"]}"' in hybrid_html
+        and f'data-hybrid-review-count="{expected_plan["review_count"]}"' in hybrid_html
+        and f'data-hybrid-ocvs-priced-count="{expected_plan["ocvs_priced_count"]}"' in hybrid_html
+        and f'data-hybrid-manual-override-count="{expected_plan["manual_override_count"]}"' in hybrid_html
+        and "OCVS Subset Sizing" in hybrid_html
+        and "Shared OCVS assumptions" in hybrid_html
+        and 'href="/step4?tab=ocvs"' in hybrid_html,
+    )
+    check(
+        "Hybrid owns one keyed placement control per selected VM and no shared VCF input",
+        len(re.findall(r'<select\b[^>]*data-hybrid-placement-select', hybrid_html, re.S)) == len(selected_names)
+        and all(hybrid_html.count(f'name="hybrid_placement:{name}"') == 1 for name in selected_names)
+        and hybrid_html.count('name="vmware_license_price_per_core_yearly"') == 1,
+    )
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        before_spoof = app_module.load_app_state()
+    spoof_form = MultiDict([("action", "save"), ("active_scenario", "hybrid")])
+    for name in selected_names:
+        spoof_form.add(f"hybrid_placement:{name}", placements[name])
+    spoof_form.add("hybrid_placement:not-in-scope", "ocvs")
+    spoof_response = client.post("/step4", data=spoof_form, follow_redirects=False)
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        after_spoof = app_module.load_app_state()
+    check(
+        "Hybrid exact-scope keyed spoof rejects without partial mutation",
+        spoof_response.status_code in {302, 303} and after_spoof == before_spoof,
+        f"status={spoof_response.status_code}",
+    )
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        priced_state = app_module.load_app_state()
+        priced_state["step4_vmware_license_price_per_core_yearly"] = 360.0
+        app_module.save_app_state(priced_state)
+    positive_vcf_response = client.get("/step4?tab=ocvs")
+    positive_vcf_html = positive_vcf_response.data.decode("utf-8", errors="replace")
+    check(
+        "Positive VCF unit price restores OCVS and Hybrid rankability",
+        positive_vcf_response.status_code == 200
+        and 'data-ocvs-rankable="true"' in positive_vcf_html
+        and 'data-hybrid-rankable="true"' in positive_vcf_html
+        and 'data-ocvs-readiness-state="ready"' in positive_vcf_html
+        and "Complete monthly total" in positive_vcf_html
+        and "Unit price required" not in positive_vcf_html,
+    )
+
+    scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
+    scenario_css = (ROOT / "static" / "css" / "scenarios.css").read_text(encoding="utf-8")
+    check(
+        "Hybrid editor exposes search support placement scope bulk and surgical Undo hooks",
+        all(
+            token in hybrid_html
+            for token in (
+                'data-hybrid-search',
+                'data-hybrid-support-filter',
+                'data-hybrid-placement-filter',
+                'data-hybrid-bulk-scope',
+                'data-hybrid-bulk-placement',
+                'data-hybrid-bulk-apply',
+                'data-hybrid-bulk-undo',
+                "Current page",
+                "All filtered rows",
+                "All selected VMs",
+            )
+        )
+        and all(
+            token in scenario_js
+            for token in (
+                "hybridBulkSnapshot",
+                "data-hybrid-bulk-undo",
+                "affectedRows",
+                "renderHybridEditor",
+                "markDirty",
+            )
+        )
+        and ".hybrid-editor-scroll" in scenario_css
+        and "overflow-x: auto" in scenario_css,
+    )
+
+
 def validate_manual_sizing_input() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
@@ -4530,6 +4709,7 @@ def main() -> None:
     validate_inventory_review_transactions_and_step4_boundary()
     validate_large_inventory_review_containment()
     validate_task7_native_scenario_workspace()
+    validate_task8_ocvs_hybrid_configuration()
     workbook_path, workflow_state = run_workflow_and_export()
     validate_pricing_invariants(workflow_state)
     validate_workbook(workbook_path)

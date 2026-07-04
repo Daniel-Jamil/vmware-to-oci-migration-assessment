@@ -3922,7 +3922,15 @@ def build_hybrid_placement_plan(
     for source_row in vm_rows:
         vm_name = str(source_row.get("vm_name", "")).strip()
         os_name = str(source_row.get("os_name", ""))
+        is_unknown_os = _is_unknown_os(os_name)
         is_supported = bool(support_source_available and is_oci_supported_os(os_name, supported_signatures))
+        support_state = (
+            "review"
+            if is_unknown_os or not support_source_available
+            else "supported"
+            if is_supported
+            else "unsupported"
+        )
         recommended = "native" if is_supported else "ocvs"
         placement = normalize_hybrid_placement(selection.get(vm_name), recommended)
         effective_target = "native" if placement == "native" else "ocvs"
@@ -3956,6 +3964,7 @@ def build_hybrid_placement_plan(
                 "hybrid_recommended_label": HYBRID_PLACEMENT_LABELS.get(recommended, recommended),
                 "hybrid_manual_override": manual_override,
                 "hybrid_is_oci_supported": is_supported,
+                "hybrid_support_state": support_state,
                 "hybrid_reason": reason,
             }
         )
@@ -5015,8 +5024,17 @@ def build_price_analysis_from_rows(
     ocvs_host_count = int(ocvs_selected.get("host_count", 0) or 0)
     hybrid_ocvs_host_count = int(hybrid_ocvs_selected.get("host_count", 0) or 0)
     native_viable = bool(not vm_rows or baseline_monthly > 0.0)
-    ocvs_viable = bool(ocvs_host_count == 0 or bool(ocvs_selected.get("pricing_available", False)))
-    hybrid_viable = bool(hybrid_ocvs_host_count == 0 or bool(hybrid_ocvs_selected.get("pricing_available", False)))
+    vcf_is_priced = bool(vmware_license_summary.get("is_priced", False))
+    ocvs_physical_cores = int(vmware_license_summary["ocvs"].get("physical_cores", 0) or 0)
+    hybrid_physical_cores = int(vmware_license_summary["hybrid"].get("physical_cores", 0) or 0)
+    ocvs_viable = bool(
+        (ocvs_host_count == 0 or bool(ocvs_selected.get("pricing_available", False)))
+        and (ocvs_physical_cores == 0 or vcf_is_priced)
+    )
+    hybrid_viable = bool(
+        (hybrid_ocvs_host_count == 0 or bool(hybrid_ocvs_selected.get("pricing_available", False)))
+        and (hybrid_physical_cores == 0 or vcf_is_priced)
+    )
 
     scenario_rows = [
         {
@@ -5296,6 +5314,102 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         "customer_name": customer_name,
         **analysis,
     }, ""
+
+
+def build_scenario_configuration_display(
+    analysis: dict[str, Any],
+    readiness: dict[str, Any],
+    ocvs_commitment_term: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    readiness_scenarios = readiness.get("scenarios", {})
+    if not isinstance(readiness_scenarios, dict):
+        readiness_scenarios = {}
+
+    def readiness_display(scenario_id: str) -> dict[str, Any]:
+        item = readiness_scenarios.get(scenario_id, {})
+        if not isinstance(item, dict):
+            item = {}
+        state = str(item.get("state") or "incomplete")
+        pricing_state = str(item.get("pricing_state") or "incomplete")
+        rankable = bool(item.get("rankable", False))
+        if pricing_state != "complete":
+            status_label = "Pricing incomplete"
+            status_tone = "incomplete"
+        elif state == "ready":
+            status_label = "Ready"
+            status_tone = "ready"
+        else:
+            status_label = "Needs attention"
+            status_tone = "attention"
+        return {
+            "state": state,
+            "pricing_state": pricing_state,
+            "rankable": rankable,
+            "status_label": status_label,
+            "status_tone": status_tone,
+        }
+
+    ocvs_price = analysis["ocvs_price"]
+    hybrid_price = analysis["hybrid_ocvs_price"]
+    ocvs_selected = ocvs_price["selected"]
+    hybrid_selected = hybrid_price["selected"]
+    vmware_summary = analysis["vmware_license_summary"]
+    placement_plan = analysis["hybrid_placement_plan"]
+    supported_native = analysis["supported_native_summary"]
+
+    ocvs_status = readiness_display("ocvs")
+    ocvs_infrastructure_subtotal = float(ocvs_selected.get("total_monthly_cost", 0.0) or 0.0)
+    ocvs_vcf_subtotal = float(vmware_summary["ocvs"].get("monthly_cost", 0.0) or 0.0)
+    ocvs_display = {
+        **ocvs_status,
+        "workload_count": int(analysis.get("overall", {}).get("vm_count", 0) or 0),
+        "selected_shape": str(ocvs_selected.get("shape") or ""),
+        "selected_label": str(ocvs_selected.get("label") or ""),
+        "commitment_term": normalize_ocvs_commitment_term(ocvs_commitment_term),
+        "commitment_label": str(ocvs_selected.get("commitment_label") or ""),
+        "term_discount_pct": ocvs_term_discount_pct(
+            ocvs_selected.get("shape"),
+            ocvs_commitment_term,
+        ),
+        "infrastructure_subtotal": ocvs_infrastructure_subtotal,
+        "vcf_subtotal": ocvs_vcf_subtotal,
+        "monthly_total": ocvs_infrastructure_subtotal + ocvs_vcf_subtotal,
+        "total_label": "Complete monthly total" if ocvs_status["rankable"] else "Partial monthly total",
+        "vcf_price_required": bool(
+            int(vmware_summary["ocvs"].get("physical_cores", 0) or 0) > 0
+            and not bool(vmware_summary.get("is_priced", False))
+        ),
+    }
+
+    hybrid_status = readiness_display("hybrid")
+    hybrid_native_subtotal = float(supported_native.get("total_monthly_cost", 0.0) or 0.0)
+    hybrid_ocvs_subtotal = float(hybrid_selected.get("total_monthly_cost", 0.0) or 0.0)
+    hybrid_vcf_subtotal = float(vmware_summary["hybrid"].get("monthly_cost", 0.0) or 0.0)
+    hybrid_display = {
+        **hybrid_status,
+        "workload_count": len(placement_plan.get("rows", [])),
+        "native_count": int(placement_plan.get("native_count", 0) or 0),
+        "ocvs_count": int(placement_plan.get("ocvs_count", 0) or 0),
+        "review_count": int(placement_plan.get("review_count", 0) or 0),
+        "ocvs_priced_count": int(placement_plan.get("ocvs_priced_count", 0) or 0),
+        "manual_override_count": int(placement_plan.get("manual_override_count", 0) or 0),
+        "native_subtotal": hybrid_native_subtotal,
+        "ocvs_infrastructure_subtotal": hybrid_ocvs_subtotal,
+        "vcf_subtotal": hybrid_vcf_subtotal,
+        "monthly_total": hybrid_native_subtotal + hybrid_ocvs_subtotal + hybrid_vcf_subtotal,
+        "total_label": "Complete monthly total" if hybrid_status["rankable"] else "Partial monthly total",
+        "selected_shape": str(hybrid_selected.get("shape") or ""),
+        "commitment_label": str(hybrid_selected.get("commitment_label") or ""),
+        "shared_source": (
+            f"{ocvs_selected.get('shape', '')} / "
+            f"{ocvs_selected.get('commitment_label', OCVS_COMMITMENT_LABELS['payg'])}"
+        ),
+        "vcf_price_required": bool(
+            int(vmware_summary["hybrid"].get("physical_cores", 0) or 0) > 0
+            and not bool(vmware_summary.get("is_priced", False))
+        ),
+    }
+    return ocvs_display, hybrid_display
 
 
 def build_scenario_view(scenario_id: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -7894,7 +8008,7 @@ def step4() -> str:
                 request.form,
                 "hybrid_placement",
                 selected_vm_names,
-                selected_vm_names,
+                list(vm_index),
             )
         if "hybrid_vm_name" in request.form or "hybrid_placement" in request.form:
             hybrid_field_errors.append("Legacy positional Hybrid placement fields are not accepted.")
@@ -8561,6 +8675,11 @@ def step4() -> str:
         "change_summary": native_change_summary,
         "remediation_count": len(native_readiness.get("affected_vm_names", [])),
     }
+    ocvs_display, hybrid_display = build_scenario_configuration_display(
+        analysis,
+        readiness,
+        ocvs_commitment_term,
+    )
 
     return render_template(
         "step4.html",
@@ -8575,6 +8694,8 @@ def step4() -> str:
             native_vm_input_total=native_editor["workload_count"],
             native_editor=native_editor,
             native_header=native_header,
+            ocvs_display=ocvs_display,
+            hybrid_display=hybrid_display,
             native_shape_strategy_rows=native_shape_strategy_rows,
             overall=overall,
             shape_options=shape_options,

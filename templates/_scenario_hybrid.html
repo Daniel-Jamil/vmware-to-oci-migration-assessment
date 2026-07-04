@@ -1,0 +1,184 @@
+<div
+  class="hybrid-workspace"
+  data-hybrid-editor
+  data-hybrid-page-size="25"
+  data-hybrid-readiness-state="{{ hybrid_display.state }}"
+  data-hybrid-rankable="{{ 'true' if hybrid_display.rankable else 'false' }}"
+  data-hybrid-native-count="{{ hybrid_display.native_count }}"
+  data-hybrid-ocvs-count="{{ hybrid_display.ocvs_count }}"
+  data-hybrid-review-count="{{ hybrid_display.review_count }}"
+  data-hybrid-ocvs-priced-count="{{ hybrid_display.ocvs_priced_count }}"
+  data-hybrid-manual-override-count="{{ hybrid_display.manual_override_count }}"
+>
+  <section class="scenario-decision" aria-labelledby="hybrid-decision-title">
+    <div>
+      <p class="native-section-label">Placement basis</p>
+      <h3 id="hybrid-decision-title">Hybrid placement decision</h3>
+      <p>Each VM has one Stage 2 placement: Native, OCVS, or Review. Review remains conservatively priced in the OCVS subset.</p>
+    </div>
+    <dl class="scenario-decision__metrics" aria-label="Hybrid placement summary">
+      <div><dt>Native</dt><dd data-hybrid-count="native">{{ "{:,}".format(hybrid_display.native_count) }}</dd></div>
+      <div><dt>OCVS</dt><dd data-hybrid-count="ocvs">{{ "{:,}".format(hybrid_display.ocvs_count) }}</dd></div>
+      <div><dt>Review</dt><dd data-hybrid-count="review">{{ "{:,}".format(hybrid_display.review_count) }}</dd></div>
+      <div><dt>Manual overrides</dt><dd data-hybrid-count="manual">{{ "{:,}".format(hybrid_display.manual_override_count) }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="hybrid-shared-notice" aria-labelledby="hybrid-shared-title">
+    <div>
+      <p class="native-section-label">Shared OCVS assumptions</p>
+      <h3 id="hybrid-shared-title">OCVS controls are owned by the OCVS scenario</h3>
+      <p>Hybrid subset sizing currently uses {{ hybrid_display.shared_source }} for all OCVS-priced rows.</p>
+    </div>
+    <a class="scenario-secondary-action" href="{{ url_for('step4', tab='ocvs') }}" data-dirty-navigation>Open OCVS assumptions</a>
+  </section>
+
+  <section class="hybrid-summary" aria-labelledby="hybrid-summary-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Infrastructure and Licensing</p>
+        <h3 id="hybrid-summary-title">Hybrid monthly cost status</h3>
+      </div>
+      <span class="scenario-status scenario-status--{{ hybrid_display.status_tone }}">{{ hybrid_display.status_label }}</span>
+    </div>
+    <dl class="scenario-cost-grid scenario-cost-grid--hybrid">
+      <div><dt>Native subtotal</dt><dd>{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.native_subtotal) }}</dd><small>{{ hybrid_display.native_count }} VM(s)</small></div>
+      <div><dt>OCVS infrastructure</dt><dd>{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.ocvs_infrastructure_subtotal) }}</dd><small>{{ hybrid_display.ocvs_priced_count }} VM(s), including Review</small></div>
+      <div>
+        <dt>VCF subtotal</dt>
+        <dd>{% if hybrid_display.vcf_price_required %}Unit price required{% else %}{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.vcf_subtotal) }}{% endif %}</dd>
+        <small>{{ "{:,}".format(vmware_license_summary.hybrid.physical_cores) }} physical cores</small>
+      </div>
+      <div class="scenario-cost-grid__total">
+        <dt>{{ hybrid_display.total_label }}</dt>
+        <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.monthly_total) }}</dd>
+        <small><span>Cost / VM / month</span> <strong>{{ pricing_symbol }}{{ "{:,.0f}".format(view.scenario.cost_per_vm) }}</strong></small>
+      </div>
+    </dl>
+  </section>
+
+  <section class="hybrid-subset" aria-labelledby="hybrid-subset-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Conservative OCVS capacity</p>
+        <h3 id="hybrid-subset-title">OCVS Subset Sizing</h3>
+      </div>
+      <span>{{ hybrid_display.ocvs_priced_count }} OCVS-priced VM(s)</span>
+    </div>
+    <dl class="scenario-capacity-grid">
+      <div><dt>Selected profile</dt><dd>{{ hybrid_ocvs_price.selected.shape }}</dd><small>{{ hybrid_ocvs_price.selected.label }}</small></div>
+      <div><dt>Nodes</dt><dd>{{ "{:,}".format(hybrid_ocvs_price.selected.host_count) }}</dd><small>{{ hybrid_ocvs_price.selected.constraint|capitalize }} driven</small></div>
+      <div><dt>vCPU / RAM</dt><dd>{{ "{:,}".format(hybrid_ocvs_price.totals.vcpus) }} / {{ "{:,}".format(hybrid_ocvs_price.totals.memory_gb) }} GB</dd><small>OCVS-priced subset only</small></div>
+      <div><dt>Storage</dt><dd>{{ "{:,}".format(hybrid_ocvs_price.totals.storage_gb) }} GB</dd><small>{{ hybrid_ocvs_price.selected.host_type }} storage model</small></div>
+    </dl>
+  </section>
+
+  <section class="hybrid-placement" aria-labelledby="hybrid-placement-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Workload editor</p>
+        <h3 id="hybrid-placement-title">Hybrid Placement</h3>
+        <p>One keyed placement control is submitted for every selected VM.</p>
+      </div>
+      <span data-hybrid-visible-summary>{{ hybrid_display.workload_count }} matching VM(s)</span>
+    </div>
+
+    <div class="hybrid-filter-bar" aria-label="Hybrid placement filters">
+      <label class="native-field" for="hybrid-search">
+        <span>Search</span>
+        <input id="hybrid-search" type="search" placeholder="VM name or operating system" data-hybrid-search />
+      </label>
+      <label class="native-field" for="hybrid-support-filter">
+        <span>Native support</span>
+        <select id="hybrid-support-filter" data-hybrid-support-filter>
+          <option value="all">All support states</option>
+          <option value="supported">Supported</option>
+          <option value="unsupported">Not supported</option>
+          <option value="review">Review required</option>
+        </select>
+      </label>
+      <label class="native-field" for="hybrid-placement-filter">
+        <span>Placement</span>
+        <select id="hybrid-placement-filter" data-hybrid-placement-filter>
+          <option value="all">All placements</option>
+          <option value="native">Native</option>
+          <option value="ocvs">OCVS</option>
+          <option value="review">Review</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="hybrid-bulk-bar" aria-label="Hybrid bulk placement">
+      <label class="native-field" for="hybrid-bulk-scope">
+        <span>Apply to</span>
+        <select id="hybrid-bulk-scope" data-hybrid-bulk-scope>
+          <option value="page">Current page</option>
+          <option value="filtered">All filtered rows</option>
+          <option value="all">All selected VMs</option>
+        </select>
+      </label>
+      <label class="native-field" for="hybrid-bulk-placement">
+        <span>Placement</span>
+        <select id="hybrid-bulk-placement" data-hybrid-bulk-placement>
+          <option value="">Choose placement</option>
+          {% for option in hybrid_placement_options %}
+            <option value="{{ option.value }}">{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="scenario-secondary-action" type="button" data-hybrid-bulk-apply>Apply placement</button>
+      <button class="scenario-secondary-action" type="button" data-hybrid-bulk-undo disabled>Undo</button>
+      <span class="hybrid-bulk-status" data-hybrid-bulk-status role="status" aria-live="polite"></span>
+    </div>
+
+    <div class="hybrid-editor-scroll" tabindex="0" aria-label="Hybrid VM placement table">
+      <table class="hybrid-editor-table">
+        <thead>
+          <tr><th>VM</th><th>Operating system</th><th>Native support</th><th>Recommended</th><th>Placement</th><th>Priced as</th><th>Reason</th></tr>
+        </thead>
+        <tbody>
+          {% for row in hybrid_placement_plan.rows %}
+            <tr
+              data-hybrid-row
+              data-hybrid-search-text="{{ row.vm_name }} {{ row.os_name }}"
+              data-hybrid-support="{{ row.hybrid_support_state }}"
+              data-hybrid-placement="{{ row.hybrid_placement }}"
+              data-hybrid-recommended="{{ row.hybrid_recommended_placement }}"
+            >
+              <th scope="row" data-mobile-label="VM"><span class="hybrid-row-name">{{ row.vm_name }}</span></th>
+              <td data-mobile-label="Operating system"><span class="hybrid-row-os">{{ row.os_name }}</span></td>
+              <td data-mobile-label="Native support">
+                {% if row.hybrid_support_state == 'supported' %}Supported{% elif row.hybrid_support_state == 'unsupported' %}Not supported{% else %}Review required{% endif %}
+              </td>
+              <td data-mobile-label="Recommended">{{ row.hybrid_recommended_label }}</td>
+              <td data-mobile-label="Placement">
+                <label class="scenario-visually-hidden" for="hybrid-placement-{{ loop.index }}">Placement for {{ row.vm_name }}</label>
+                <select
+                  id="hybrid-placement-{{ loop.index }}"
+                  name="{{ row.hybrid_placement_field_name }}"
+                  form="step4-form"
+                  data-hybrid-placement-select
+                  required
+                >
+                  {% for option in hybrid_placement_options %}
+                    <option value="{{ option.value }}" {% if row.hybrid_placement == option.value %}selected{% endif %}>{{ option.label }}</option>
+                  {% endfor %}
+                </select>
+              </td>
+              <td data-mobile-label="Priced as" data-hybrid-priced-as>{{ 'OCI Native' if row.hybrid_effective_target == 'native' else 'OCVS' }}</td>
+              <td data-mobile-label="Reason" data-hybrid-reason>{{ row.hybrid_reason }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7">No selected VMs found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <nav class="hybrid-pagination" aria-label="Hybrid placement pages">
+      <button class="scenario-secondary-action" type="button" data-hybrid-page-previous>Previous</button>
+      <span data-hybrid-page-status>Page 1 of 1</span>
+      <button class="scenario-secondary-action" type="button" data-hybrid-page-next>Next</button>
+    </nav>
+  </section>
+</div>
