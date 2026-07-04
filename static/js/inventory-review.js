@@ -48,6 +48,7 @@
   }));
   let activeWarning = "all";
   let undoSnapshot = null;
+  let undoReturnFocus = null;
   let searchTimer = null;
 
   function isFilterActive() {
@@ -122,9 +123,11 @@
     if (!undoRegion || !undoMessage) return;
     undoMessage.textContent = message;
     undoRegion.hidden = !undoSnapshot;
+    if (undoButton) undoButton.disabled = !undoSnapshot;
   }
 
-  function runBulk(message, rowScope, change) {
+  function runBulk(trigger, message, rowScope, change) {
+    undoReturnFocus = trigger instanceof HTMLElement ? trigger : null;
     const changedRecords = [];
     rowScope.forEach((record) => {
       const changedState = change(record);
@@ -164,6 +167,7 @@
   if (selectAll) {
     selectAll.addEventListener("click", () => {
       runBulk(
+        selectAll,
         (changed) => `Included ${changed} VMs.`,
         rowRecords,
         (record) => {
@@ -181,6 +185,7 @@
   if (includeFiltered) {
     includeFiltered.addEventListener("click", () => {
       runBulk(
+        includeFiltered,
         (changed, scoped) => `Included ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
@@ -198,6 +203,7 @@
   if (excludeFiltered) {
     excludeFiltered.addEventListener("click", () => {
       runBulk(
+        excludeFiltered,
         (changed, scoped) => `Excluded ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
@@ -220,6 +226,7 @@
       }
       const selectedLabel = bulkPlacement.options[bulkPlacement.selectedIndex].text;
       runBulk(
+        applyPlacement,
         (changed, scoped) => `Applied ${selectedLabel} to ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
@@ -246,11 +253,19 @@
           syncPlacement(record, saved.placement);
         }
       });
+      const returnTarget = undoReturnFocus && document.contains(undoReturnFocus)
+        ? undoReturnFocus
+        : (bulkPlacement || selectAll || searchInput);
       undoSnapshot = null;
-      if (undoRegion) undoRegion.hidden = true;
+      undoReturnFocus = null;
       updateSelectionStatus();
       updateFilters();
-      undoButton.focus({ preventScroll: true });
+      if (undoMessage) undoMessage.textContent = "Bulk change undone.";
+      undoButton.disabled = true;
+      if (returnTarget) returnTarget.focus({ preventScroll: true });
+      window.setTimeout(() => {
+        if (!undoSnapshot && undoRegion) undoRegion.hidden = true;
+      }, 1200);
     });
   }
 

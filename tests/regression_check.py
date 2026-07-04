@@ -115,6 +115,92 @@ def parse_workspace_markup(response_data: bytes) -> WorkspaceMarkupParser:
     return parser
 
 
+class AccessibilityMarkupParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: list[str] = []
+        self.elements_by_id: dict[str, dict[str, str | None]] = {}
+        self.label_targets: set[str] = set()
+        self.controls: list[dict[str, object]] = []
+        self.tabs: list[dict[str, str | None]] = []
+        self.tabpanels: list[dict[str, str | None]] = []
+        self.sort_headers: list[dict[str, str | None]] = []
+        self._stack: list[tuple[str, dict[str, str | None]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        element_id = str(attributes.get("id") or "")
+        if element_id:
+            self.ids.append(element_id)
+            self.elements_by_id.setdefault(element_id, {"tag": tag, **attributes})
+
+        if tag == "label" and attributes.get("for"):
+            self.label_targets.add(str(attributes["for"]))
+
+        if tag in {"input", "select", "textarea"}:
+            input_type = str(attributes.get("type") or "").lower()
+            is_hidden = input_type == "hidden" or "hidden" in attributes
+            if not is_hidden:
+                self.controls.append(
+                    {
+                        "tag": tag,
+                        "attrs": attributes,
+                        "wrapped": any(parent_tag == "label" for parent_tag, _ in self._stack),
+                    }
+                )
+
+        if attributes.get("role") == "tab":
+            attributes["in_tablist"] = (
+                "true"
+                if any(parent_attrs.get("role") == "tablist" for _, parent_attrs in self._stack)
+                else "false"
+            )
+            self.tabs.append(attributes)
+        elif attributes.get("role") == "tabpanel":
+            self.tabpanels.append(attributes)
+
+        if "data-sort" in attributes:
+            header = next(
+                (parent_attrs for parent_tag, parent_attrs in reversed(self._stack) if parent_tag == "th"),
+                {},
+            )
+            self.sort_headers.append(header)
+
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self._stack.append((tag, attributes))
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index][0] == tag:
+                del self._stack[index:]
+                break
+
+    def unnamed_controls(self) -> list[str]:
+        unnamed: list[str] = []
+        for control in self.controls:
+            attrs = control["attrs"]
+            control_id = str(attrs.get("id") or "")
+            labelledby = str(attrs.get("aria-labelledby") or "").split()
+            has_name = bool(
+                control["wrapped"]
+                or attrs.get("aria-label")
+                or labelledby
+                or (control_id and control_id in self.label_targets)
+            )
+            if not has_name:
+                unnamed.append(
+                    f"{control['tag']}#{control_id or '-'}[name={attrs.get('name') or '-'}]"
+                )
+        return unnamed
+
+
+def parse_accessibility_markup(response_data: bytes) -> AccessibilityMarkupParser:
+    parser = AccessibilityMarkupParser()
+    parser.feed(response_data.decode("utf-8", errors="replace"))
+    parser.close()
+    return parser
+
+
 class VisibleTextOutsideDetailsParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -2339,6 +2425,218 @@ def validate_workspace_source_contracts() -> None:
         and 'event.key === "Escape"' in workspace_js
         and "closeMenu(true)" in workspace_js
         and "!menu.contains(event.target)" in workspace_js,
+    )
+
+
+def validate_task12_accessibility_and_responsive_contracts() -> None:
+    price_file = find_price_file()
+    inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
+    vm_names = [str(row["name"]) for row in inventory_rows]
+    state_id = f"task12_markup_{uuid4().hex}"
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = vm_names
+        state["step4_hybrid_placements"] = {
+            "vm-app-01": "native",
+            "vm-db-01": "native",
+            "vm-web-01": "native",
+            "vm-legacy-01": "ocvs",
+        }
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
+        state["assessor_recommendation"] = "hybrid"
+        state["assessor_recommendation_rationale"] = (
+            "Retain the legacy workload on OCVS while the supported estate moves to OCI Native."
+        )
+        app_module.save_app_state(state)
+
+    routes = {
+        "Setup": "/",
+        "Inventory": "/step3",
+        "Native": "/step4?tab=native",
+        "OCVS": "/step4?tab=ocvs",
+        "Hybrid": "/step4?tab=hybrid",
+        "Results": "/step4?tab=price",
+    }
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(CSV_INVENTORY)
+            sess["selected_pricelist_file"] = price_file
+            sess["selected_currency"] = "EUR"
+            sess["active_assessment_name"] = "Task 12 accessibility assessment"
+            sess["customer_name"] = "Task 12 responsive customer"
+        responses = {name: client.get(route) for name, route in routes.items()}
+
+    parsed = {
+        name: parse_accessibility_markup(response.data)
+        for name, response in responses.items()
+    }
+    check(
+        "Task 12 stage fixtures render for markup audit",
+        all(response.status_code == 200 for response in responses.values()),
+        str({name: response.status_code for name, response in responses.items()}),
+    )
+
+    unnamed_by_stage = {
+        name: parser.unnamed_controls()
+        for name, parser in parsed.items()
+        if parser.unnamed_controls()
+    }
+    check(
+        "Task 12 every rendered form control has an accessible name",
+        not unnamed_by_stage,
+        str(unnamed_by_stage),
+    )
+
+    broken_label_refs: dict[str, list[str]] = {}
+    for name, parser in parsed.items():
+        missing: list[str] = []
+        for control in parser.controls:
+            attrs = control["attrs"]
+            for reference in str(attrs.get("aria-labelledby") or "").split():
+                if reference not in parser.elements_by_id:
+                    missing.append(reference)
+        if missing:
+            broken_label_refs[name] = missing
+    check(
+        "Task 12 form-control aria-labelledby references resolve",
+        not broken_label_refs,
+        str(broken_label_refs),
+    )
+
+    duplicate_ids = {
+        name: sorted({element_id for element_id in parser.ids if parser.ids.count(element_id) > 1})
+        for name, parser in parsed.items()
+    }
+    duplicate_ids = {name: ids for name, ids in duplicate_ids.items() if ids}
+    check("Task 12 rendered stages have no duplicate IDs", not duplicate_ids, str(duplicate_ids))
+
+    inventory_parser = parsed["Inventory"]
+    check(
+        "Task 12 sortable inventory headers own initial aria-sort semantics",
+        bool(inventory_parser.sort_headers)
+        and all(header.get("aria-sort") in {"none", "ascending", "descending"} for header in inventory_parser.sort_headers),
+        str(inventory_parser.sort_headers),
+    )
+
+    scenario_parser = parsed["Native"]
+    panels_by_id = {
+        str(panel.get("id") or ""): panel
+        for panel in scenario_parser.tabpanels
+        if panel.get("id")
+    }
+    tabs_by_id = {
+        str(tab.get("id") or ""): tab
+        for tab in scenario_parser.tabs
+        if tab.get("id")
+    }
+    tabs_valid = all(
+        tab.get("in_tablist") == "true"
+        and tab.get("aria-selected") in {"true", "false"}
+        and tab.get("tabindex") in {"0", "-1"}
+        and str(tab.get("aria-controls") or "") in panels_by_id
+        and panels_by_id[str(tab.get("aria-controls"))].get("aria-labelledby") == tab.get("id")
+        for tab in scenario_parser.tabs
+    )
+    panels_valid = all(
+        str(panel.get("aria-labelledby") or "") in tabs_by_id
+        and tabs_by_id[str(panel.get("aria-labelledby"))].get("aria-controls") == panel.get("id")
+        for panel in scenario_parser.tabpanels
+    )
+    check(
+        "Task 12 tablist tabs and tabpanels have reciprocal relationships",
+        len(scenario_parser.tabs) == 3
+        and len(scenario_parser.tabpanels) == 3
+        and tabs_valid
+        and panels_valid,
+        f"tabs={scenario_parser.tabs}, panels={scenario_parser.tabpanels}",
+    )
+
+    setup_html = responses["Setup"].data.decode("utf-8", errors="replace")
+    inventory_html = responses["Inventory"].data.decode("utf-8", errors="replace")
+    native_html = responses["Native"].data.decode("utf-8", errors="replace")
+    hybrid_html = responses["Hybrid"].data.decode("utf-8", errors="replace")
+    results_html = responses["Results"].data.decode("utf-8", errors="replace")
+    check(
+        "Task 12 flash dirty selection and Undo messages are live regions",
+        all(
+            parser.elements_by_id.get("workspace-status", {}).get("role") == "status"
+            and parser.elements_by_id.get("workspace-status", {}).get("aria-live") == "polite"
+            for parser in parsed.values()
+        )
+        and re.search(r'data-selection-status(?=[^>]*role="status")(?=[^>]*aria-live="polite")', inventory_html)
+        and re.search(r'id="inventory-undo"(?=[^>]*role="status")(?=[^>]*aria-live="polite")', inventory_html)
+        and len(re.findall(r'data-scenario-dirty-live(?=[^>]*role="status")(?=[^>]*aria-live="polite")', native_html)) == 3,
+    )
+    check(
+        "Task 12 status meaning is exposed with text beyond color",
+        'class="results-readiness__indicator" aria-hidden="true"' in results_html
+        and len(re.findall(r'class="result-status result-status--[^\"]+"', results_html)) >= 3
+        and "Technical eligibility" in results_html
+        and "Pricing completeness" in results_html
+        and "Scenario readiness" in results_html,
+    )
+
+    submitted_control_counts = {
+        "inventory-included": inventory_html.count('name="included_vm_names"'),
+        "inventory-placement": len(re.findall(r'name="placement:[^"]+"', inventory_html)),
+        "native-name": len(re.findall(r'<input[^>]+name="vm_name"', native_html)),
+        "native-shape": len(re.findall(r'<select[^>]+name="oci_shape"', native_html)),
+        "native-ocpu": len(re.findall(r'<input[^>]+name="vm_ocpu"', native_html)),
+        "native-burst": len(re.findall(r'<select[^>]+name="vm_burst"', native_html)),
+        "native-vpu": len(re.findall(r'<select[^>]+name="vm_vpu"', native_html)),
+        "native-license": len(re.findall(r'<(?:input|select)[^>]+name="vm_os_license"', native_html)),
+        "hybrid-placement": len(re.findall(r'name="hybrid_placement:[^"]+"', hybrid_html)),
+    }
+    check(
+        "Task 12 mobile editors keep one submitted control DOM",
+        all(count == len(vm_names) for count in submitted_control_counts.values()),
+        f"expected={len(vm_names)}, counts={submitted_control_counts}",
+    )
+
+    workspace_css = (ROOT / "static" / "css" / "workspace.css").read_text(encoding="utf-8")
+    inventory_js = (ROOT / "static" / "js" / "inventory-review.js").read_text(encoding="utf-8")
+    scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
+    check(
+        "Task 12 sticky mobile actions reserve matching main-content padding",
+        re.search(r"--workspace-mobile-action-reserve:\s*[0-9]+px", workspace_css)
+        and re.search(r"#main-workspace\s*\{[^}]*padding-bottom:\s*var\(--workspace-mobile-action-reserve\)", workspace_css, re.S)
+        and re.search(r"\.workspace-stage-actions\s*\{[^}]*min-height:\s*var\(--workspace-mobile-action-reserve\)", workspace_css, re.S),
+    )
+    check(
+        "Task 12 mobile stage actions stay in document flow without covering controls",
+        re.search(r"\.workspace-stage-actions\s*\{[^}]*position:\s*static;", workspace_css, re.S),
+    )
+    check(
+        "Task 12 inventory sort updates header aria-sort semantics",
+        'header.setAttribute("aria-sort", ascending ? "ascending" : "descending")' in inventory_js
+        and 'control.header.setAttribute("aria-sort", "none")' in inventory_js,
+    )
+    check(
+        "Task 12 Inventory bulk Undo returns focus to its initiating toolbar control",
+        "undoReturnFocus" in inventory_js
+        and "returnTarget.focus" in inventory_js
+        and "undoButton.focus" not in inventory_js,
+    )
+    workspace_js = (ROOT / "static" / "js" / "workspace.js").read_text(encoding="utf-8")
+    dialog_disclosure_contracts = {
+        "dialog role": 'role="dialog"' in native_html,
+        "modal state": 'aria-modal="true"' in native_html,
+        "dialog focus target": 'tabindex="-1"' in native_html,
+        "dialog Escape": 'event.key === "Escape"' in scenario_js,
+        "dialog return focus": "dialogReturnFocus" in scenario_js,
+        "dialog initial focus": "focusDialog" in scenario_js,
+        "dialog Tab trap": 'event.key !== "Tab"' in scenario_js,
+        "menu Escape": 'event.key === "Escape"' in workspace_js,
+        "menu return focus": "closeMenu(true)" in workspace_js,
+        "source details": "<details" in setup_html and "<summary" in setup_html,
+    }
+    check(
+        "Task 12 dialogs and disclosures implement Escape and focus return",
+        all(dialog_disclosure_contracts.values()),
+        str(dialog_disclosure_contracts),
     )
 
 
@@ -6311,6 +6609,7 @@ def main() -> None:
     validate_workspace_context_contracts()
     validate_workspace_shell_behavior()
     validate_workspace_source_contracts()
+    validate_task12_accessibility_and_responsive_contracts()
     validate_unsupported_currency_workspace_shell()
     validate_pricing_fallback_filename_concealment()
     validate_catalog_choice_tokens()

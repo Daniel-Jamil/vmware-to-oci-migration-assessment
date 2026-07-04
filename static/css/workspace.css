@@ -20,6 +20,7 @@
   --workspace-radius: 8px;
   --workspace-header-height: 64px;
   --workspace-rail-width: 264px;
+  --workspace-mobile-action-reserve: 0px;
 }
 
 .workspace-body {
@@ -551,6 +552,7 @@
 
 #main-workspace {
   min-width: 0;
+  padding-bottom: var(--workspace-mobile-action-reserve);
 }
 
 #main-workspace > .container,
@@ -570,6 +572,7 @@
 }
 
 .workspace-stage-actions {
+  min-height: var(--workspace-mobile-action-reserve);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -672,6 +675,10 @@
 }
 
 @media (max-width: 600px) {
+  .workspace-workarea {
+    --workspace-mobile-action-reserve: 0px;
+  }
+
   .workspace-header {
     gap: 8px;
     padding: 8px 12px;
@@ -746,9 +753,7 @@
   }
 
   .workspace-stage-actions {
-    position: sticky;
-    z-index: 10;
-    bottom: 0;
+    position: static;
     margin-right: -14px;
     margin-left: -14px;
     padding: 10px 14px;

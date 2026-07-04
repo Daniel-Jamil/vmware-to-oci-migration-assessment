@@ -15,6 +15,12 @@
   const nativeMobileStatus = document.querySelector("[data-native-mobile-status]");
   const nativeMobileMedia = window.matchMedia("(max-width: 767px)");
   const hybridEditor = document.querySelector("[data-hybrid-editor]");
+  const dialogBackdrop = document.getElementById("shape-strategy-modal");
+  const shapeStrategyDialog = dialogBackdrop ? dialogBackdrop.querySelector('[role="dialog"]') : null;
+  const openShapeStrategy = document.getElementById("open-shape-strategy");
+  const closeShapeStrategyControls = dialogBackdrop
+    ? Array.from(dialogBackdrop.querySelectorAll("#close-shape-strategy, #cancel-shape-strategy, #apply-shape-strategy"))
+    : [];
   const currentStageValue = stageSelect ? stageSelect.value : "";
   const titleByScenario = {
     native: "Migration to OCI Native",
@@ -24,6 +30,7 @@
   let dirty = false;
   let submitting = false;
   let navigationConfirmed = false;
+  let dialogReturnFocus = null;
   let activeNativeRowIndex = Math.max(
     0,
     nativeRows.findIndex((row) => row.getAttribute("data-native-mobile-active") === "true"),
@@ -84,6 +91,77 @@
       }),
     );
   }
+
+  function dialogFocusableElements() {
+    if (!shapeStrategyDialog) return [];
+    return Array.from(
+      shapeStrategyDialog.querySelectorAll(
+        'button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => !element.hidden);
+  }
+
+  function focusDialog() {
+    if (!shapeStrategyDialog) return;
+    const firstControl = dialogFocusableElements()[0];
+    (firstControl || shapeStrategyDialog).focus({ preventScroll: true });
+  }
+
+  function openAccessibleDialog() {
+    if (!dialogBackdrop || !shapeStrategyDialog) return;
+    dialogReturnFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : openShapeStrategy;
+    dialogBackdrop.style.display = "flex";
+    dialogBackdrop.setAttribute("aria-hidden", "false");
+    window.requestAnimationFrame(focusDialog);
+  }
+
+  function closeAccessibleDialog() {
+    if (!dialogBackdrop) return;
+    dialogBackdrop.style.display = "none";
+    dialogBackdrop.setAttribute("aria-hidden", "true");
+    const returnTarget = dialogReturnFocus && document.contains(dialogReturnFocus)
+      ? dialogReturnFocus
+      : openShapeStrategy;
+    dialogReturnFocus = null;
+    if (returnTarget) returnTarget.focus({ preventScroll: true });
+  }
+
+  if (openShapeStrategy) openShapeStrategy.addEventListener("click", openAccessibleDialog);
+  closeShapeStrategyControls.forEach((control) => {
+    control.addEventListener("click", closeAccessibleDialog);
+  });
+  if (dialogBackdrop) {
+    dialogBackdrop.addEventListener("click", function (event) {
+      if (event.target === dialogBackdrop) closeAccessibleDialog();
+    });
+  }
+
+  document.addEventListener("keydown", function (event) {
+    if (!dialogBackdrop || dialogBackdrop.getAttribute("aria-hidden") !== "false") return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeAccessibleDialog();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = dialogFocusableElements();
+    if (!focusable.length) {
+      event.preventDefault();
+      focusDialog();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === shapeStrategyDialog)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
 
   function updateNativeMobileButton(button, targetIndex, direction) {
     if (!button) return;

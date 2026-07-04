@@ -864,7 +864,7 @@
     <div id="export-status" class="export-status" role="status" aria-live="polite" hidden></div>
 
     <div id="shape-strategy-modal" class="modal-backdrop" aria-hidden="true">
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shape-strategy-title">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shape-strategy-title" tabindex="-1">
         <div class="modal-header">
           <strong id="shape-strategy-title">Set default shape strategy</strong>
           <button type="button" id="close-shape-strategy" class="btn-secondary">Cancel</button>
@@ -873,16 +873,24 @@
           <p style="margin-top:0;">Choose default OCI target shape and burst per unique OS. Apply stages the strategy; Save Settings applies it to all selected VMs.</p>
           <div id="shape-strategy-grid" class="modal-grid">
             {% for item in native_shape_strategy_rows %}
-              <label class="strategy-os-label">
+              <div class="strategy-os-label">
                 <strong>{{ item.os_name }}</strong>
                 <small>{{ "{:,}".format(item.vm_count) }} VM(s)</small>
-              </label>
-              <select data-os-name="{{ item.os_name }}" data-role="shape">
+              </div>
+              <select
+                data-os-name="{{ item.os_name }}"
+                data-role="shape"
+                aria-label="Default OCI target shape for {{ item.os_name }}"
+              >
                 {% for shape_name in shape_options %}
                   <option value="{{ shape_name }}" {% if item.shape == shape_name %}selected{% endif %}>{{ shape_name }}</option>
                 {% endfor %}
               </select>
-              <select data-os-name="{{ item.os_name }}" data-role="burst">
+              <select
+                data-os-name="{{ item.os_name }}"
+                data-role="burst"
+                aria-label="Default burst setting for {{ item.os_name }}"
+              >
                 {% for burst_value in ['100%', '50%', '12.5%'] %}
                   <option value="{{ burst_value }}" {% if item.burst == burst_value or (item.burst == '1:1' and burst_value == '100%') %}selected{% endif %}>{{ burst_value }}</option>
                 {% endfor %}
@@ -908,7 +916,7 @@
         <section
           id="scenario-panel-paths"
           class="scenario-panel {% if active_scenario == 'paths' %}is-active{% endif %}"
-          role="tabpanel"
+          role="region"
           aria-label="Migration paths overview"
           data-scenario-panel="paths"
           {% if active_scenario != 'paths' %}hidden{% endif %}
@@ -1197,7 +1205,7 @@
         <section
           id="scenario-panel-price"
           class="scenario-panel {% if active_scenario == 'price' %}is-active{% endif %}"
-          role="tabpanel"
+          role="region"
           aria-label="Results and price comparison"
           data-scenario-panel="price"
           {% if active_scenario != 'price' %}hidden{% endif %}
