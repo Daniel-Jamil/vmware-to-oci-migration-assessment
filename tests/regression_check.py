@@ -4788,21 +4788,24 @@ def validate_portable_assessments() -> None:
         "source_vinfo_csv": str(source_inventory).replace("\\", "/"),
         "vm_settings": {
             "vm-app-01": {
-                "shape": "VM.Standard.E5.Flex",
-                "ocpus": 2,
+                "selected": True,
+                "oci_shape": "VM.Standard.E5.Flex",
+                "ocpu": 2,
                 "burst": "100%",
                 "vpu": 20,
                 "os_license": "BYOL",
+                "hybrid_placement": "native",
             },
             "vm-db-01": {
-                "shape": "VM.Standard.E5.Flex",
-                "ocpus": 4,
+                "selected": True,
+                "oci_shape": "VM.Standard.E5.Flex",
+                "ocpu": 4,
                 "burst": "50%",
                 "vpu": 30,
                 "os_license": "BYOL",
+                "hybrid_placement": "native",
             },
         },
-        "iaas_discount_pct": 17.5,
         "ocvs_commitment_term": "3_year",
     }
     with app_module.app.test_request_context("/"):
@@ -4899,6 +4902,9 @@ def validate_portable_assessments() -> None:
         imported_state = json.loads(imported_state_path.read_text(encoding="utf-8"))
         imported_step4 = json.loads(imported_step4_path.read_text(encoding="utf-8"))
         restored_rows, _ = app_module.load_vms_from_vinfo(imported_inventory)
+        generated_inventory = json.loads(
+            Path(imported_inventory).read_text(encoding="utf-8")
+        )
         restored_prices, restored_currency, _ = app_module.load_price_lookup(
             imported_pricing
         )
@@ -4916,8 +4922,8 @@ def validate_portable_assessments() -> None:
             and f"imported_assessments/{imported_id}" in imported_inventory.replace(
                 "\\", "/"
             )
-            and [row.get("name") for row in restored_rows]
-            == [row.get("name") for row in inventory_rows]
+            and restored_rows == package.get("inventory", {}).get("rows")
+            and generated_inventory.get("inventory") == package.get("inventory")
             and bool(restored_prices)
             and restored_currency == "EUR"
             and imported_state.get("selected_vm_names") == selected_names

@@ -150,6 +150,8 @@ OCI_PRICE_MAPPING_PATH = Path("OCI-PriceMapping")
 OCVS_TERM_DISCOUNTS_PATH = Path("config/ocvs_term_discounts.json")
 APP_STATE_DIR = Path("downloads/app_state")
 SAVED_ASSESSMENT_SCHEMA_VERSION = 1
+IMPORTED_INVENTORY_FORMAT = "vmware_to_oci_normalized_inventory"
+IMPORTED_INVENTORY_SCHEMA_VERSION = 1
 PRICE_LIST_DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_VISIBLE_PRICE_LISTS = 10
 NATIVE_VM_INPUT_ROW_LIMIT = 50
@@ -539,6 +541,16 @@ def _write_json_atomically(file_path: Path, payload: Any) -> None:
             temporary_file.unlink(missing_ok=True)
         except OSError:
             app.logger.exception("Temporary JSON cleanup failed")
+
+
+def _write_new_json_atomically(file_path: Path, payload: Any) -> None:
+    """Publish a complete JSON file without replacing an existing path."""
+    temporary_file = file_path.with_name(f".{file_path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.link(temporary_file, file_path)
+    finally:
+        temporary_file.unlink(missing_ok=True)
 
 
 def _read_optional_file_bytes(file_path: Path) -> tuple[bool, bytes]:
@@ -1105,48 +1117,34 @@ def _next_imported_assessment_name(value: Any) -> str:
         suffix_index += 1
 
 
+def _allocate_imported_assessment_paths(
+    assessment_name: str,
+) -> tuple[str, Path, Path]:
+    for _attempt in range(1000):
+        assessment_id = _new_assessment_id(assessment_name)
+        snapshot_file = _saved_assessment_file_path(assessment_id)
+        if snapshot_file is None:
+            continue
+        import_dir = DOWNLOADS_DIR / "imported_assessments" / assessment_id
+        if not snapshot_file.exists() and not import_dir.exists():
+            return assessment_id, import_dir, snapshot_file
+    raise PortableAssessmentError(
+        "A unique local assessment id could not be allocated for this import."
+    )
+
+
 def _write_imported_inventory(
     file_path: Path,
-    rows: list[dict[str, Any]],
+    inventory: dict[str, Any],
 ) -> None:
-    headers = [
-        "VM",
-        "Powerstate",
-        "Template",
-        "OS according to the configuration file",
-        "CPUs",
-        "Memory",
-        "Provisioned MiB",
-    ]
-    temporary_file = file_path.with_name(f".{file_path.name}.{uuid4().hex}.tmp")
-    try:
-        with temporary_file.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(headers)
-            for row in rows:
-                power_state = str(row.get("power_state") or "").strip().lower()
-                serialized_power = (
-                    "poweredOn"
-                    if power_state == "on"
-                    else ("" if power_state == "unknown" else "poweredOff")
-                )
-                writer.writerow(
-                    [
-                        str(row.get("name") or ""),
-                        serialized_power,
-                        "False",
-                        str(row.get("raw_os") or row.get("mapped_os") or ""),
-                        row.get("cpus", 0),
-                        row.get("memory_mb", 0),
-                        row.get("provisioned_mib", 0),
-                    ]
-                )
-        os.replace(temporary_file, file_path)
-    finally:
-        try:
-            temporary_file.unlink(missing_ok=True)
-        except OSError:
-            app.logger.exception("Imported inventory temporary file cleanup failed")
+    _write_json_atomically(
+        file_path,
+        {
+            "format": IMPORTED_INVENTORY_FORMAT,
+            "schema_version": IMPORTED_INVENTORY_SCHEMA_VERSION,
+            "inventory": inventory,
+        },
+    )
 
 
 def import_portable_assessment(package: Any) -> dict[str, Any]:
@@ -1156,19 +1154,16 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
     inventory = validated["inventory"]
     pricing = validated["pricing"]
     imported_name = _next_imported_assessment_name(assessment.get("name"))
-    assessment_id = _new_assessment_id(imported_name)
-    import_dir = DOWNLOADS_DIR / "imported_assessments" / assessment_id
-    inventory_file = import_dir / "normalized_inventory.csv"
+    assessment_id, import_dir, snapshot_file = _allocate_imported_assessment_paths(
+        imported_name
+    )
+    inventory_file = import_dir / "normalized_inventory.json"
     currency = str(
         assessment.get("selected_currency") or pricing.get("currency") or ""
     ).upper().strip()
     pricing_file = import_dir / (
         f"oci_pricing_{currency or 'imported'}_portable.json"
     )
-    snapshot_file = _saved_assessment_file_path(assessment_id)
-    if snapshot_file is None:
-        raise PortableAssessmentError("A new local assessment id could not be created.")
-
     prior_session = copy.deepcopy(dict(session))
     prior_state_id = str(prior_session.get("state_id") or "").strip()
     prior_state_file = (
@@ -1189,9 +1184,12 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
     rows = list(inventory.get("rows") or [])
     pricing_document = dict(pricing.get("document") or {})
     now = datetime.now().isoformat(timespec="seconds")
+    created_import_dir = False
+    created_snapshot = False
     try:
         import_dir.mkdir(parents=True, exist_ok=False)
-        _write_imported_inventory(inventory_file, rows)
+        created_import_dir = True
+        _write_imported_inventory(inventory_file, inventory)
         _write_json_atomically(pricing_file, pricing_document)
 
         generated_rows: list[dict[str, Any]] = []
@@ -1200,9 +1198,7 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
             generated_rows, generated_source = load_vms_from_vinfo(
                 str(inventory_file).replace("\\", "/")
             )
-            expected_names = [str(row.get("name") or "") for row in rows]
-            generated_names = [str(row.get("name") or "") for row in generated_rows]
-            if generated_names != expected_names:
+            if generated_rows != rows:
                 raise PortableAssessmentError(
                     "The imported inventory could not be reconstructed exactly."
                 )
@@ -1243,7 +1239,8 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
             "step4_snapshot": step4_snapshot,
             "last_export_file": "",
         }
-        _write_json_atomically(snapshot_file, snapshot)
+        _write_new_json_atomically(snapshot_file, snapshot)
+        created_snapshot = True
         load_result = load_saved_assessment(assessment_id)
         if not load_result.get("ok"):
             raise PortableAssessmentError(
@@ -1265,14 +1262,16 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
             app.logger.exception("Imported assessment persistence rollback failed")
         session.clear()
         session.update(copy.deepcopy(prior_session))
-        try:
-            snapshot_file.unlink(missing_ok=True)
-        except OSError:
-            app.logger.exception("Imported assessment snapshot cleanup failed")
-        try:
-            shutil.rmtree(import_dir, ignore_errors=True)
-        except OSError:
-            app.logger.exception("Imported assessment artifact cleanup failed")
+        if created_snapshot:
+            try:
+                snapshot_file.unlink(missing_ok=True)
+            except OSError:
+                app.logger.exception("Imported assessment snapshot cleanup failed")
+        if created_import_dir:
+            try:
+                shutil.rmtree(import_dir, ignore_errors=True)
+            except OSError:
+                app.logger.exception("Imported assessment artifact cleanup failed")
         raise
 
     return {
@@ -2439,10 +2438,50 @@ def parse_vinfo_from_xlsx(xlsx_path: Path) -> tuple[list[dict[str, str]], str]:
     )
 
 
+def _load_imported_normalized_inventory(
+    selected: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    imported_root = (DOWNLOADS_DIR / "imported_assessments").resolve()
+    try:
+        resolved = selected.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("The imported normalized inventory file is missing.") from exc
+    if (
+        resolved.name != "normalized_inventory.json"
+        or imported_root not in resolved.parents
+    ):
+        raise ValueError("JSON inventory is only supported for generated imports.")
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("The imported normalized inventory file is invalid.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("The imported normalized inventory file is invalid.")
+    if (
+        payload.get("format") != IMPORTED_INVENTORY_FORMAT
+        or payload.get("schema_version") != IMPORTED_INVENTORY_SCHEMA_VERSION
+    ):
+        raise ValueError("The imported normalized inventory format is unsupported.")
+    canonical = build_portable_package(
+        {},
+        payload.get("inventory", {}),
+        {},
+        exported_at="1970-01-01T00:00:00Z",
+    )
+    rows = canonical["inventory"]["rows"]
+    _validate_loaded_inventory_rows(rows)
+    source_path = str(selected).replace("\\", "/")
+    source = f"{source_path}::Portable normalized inventory"
+    return rows, source
+
+
 def load_vms_from_vinfo(selected_path: str) -> tuple[list[dict[str, Any]], str]:
     """Load VM rows from a supported RVTools or VMwareInventory export."""
     selected = Path(selected_path)
     mapping_config = load_os_mapping_config()
+
+    if selected.suffix.lower() == ".json":
+        return _load_imported_normalized_inventory(selected)
 
     def _build_vm_rows(records: list[dict[str, str]]) -> list[dict[str, Any]]:
         def _first_value(rec: dict[str, str], *keys: str) -> str:

@@ -13,17 +13,72 @@ MAX_PACKAGE_BYTES = 25 * 1024 * 1024
 MAX_VM_ROWS = 100000
 MAX_TEXT_LENGTH = 4000
 
-_MAX_JSON_DEPTH = 40
 _MAX_NUMBER = 1_000_000_000_000_000.0
-_LOCAL_ONLY_KEYS = {
-    "file_path",
-    "last_export_file",
-    "local_id",
-    "path",
-    "selected_pricelist_file",
-    "selected_rvtools_file",
-    "source_path",
-    "source_vinfo_csv",
+
+_APP_STATE_TEXT_LIST_FIELDS = {
+    "selected_vm_names",
+    "acknowledged_warning_ids",
+}
+_APP_STATE_TEXT_MAP_FIELDS = {
+    "step4_os_shapes",
+    "step4_vm_shapes",
+    "step4_vm_bursts",
+    "step4_vm_os_license",
+    "step4_hybrid_placements",
+}
+_APP_STATE_NUMBER_MAP_FIELDS = {
+    "step4_vm_ocpus",
+    "step4_vm_vpus",
+}
+_APP_STATE_TEXT_FIELDS = {
+    "assessor_recommendation",
+    "assessor_recommendation_rationale",
+    "step4_ocvs_profile",
+    "step4_ocvs_commitment_term",
+}
+_APP_STATE_NUMBER_FIELDS = {
+    "step4_iaas_discount_pct",
+    "step4_vmware_license_price_per_core_yearly",
+    "step4_ocvs_dr_nodes",
+}
+_OCVS_POLICY_FIELDS = {
+    "vcpu_per_ocpu",
+    "cpu_headroom_pct",
+    "memory_headroom_pct",
+    "storage_headroom_pct",
+    "dense_vsan_usable_pct",
+    "standard_storage_vpu",
+}
+_INVENTORY_SUMMARY_NUMBER_FIELDS = {
+    "vm_count",
+    "total_vcpus",
+    "total_memory_gb",
+    "total_storage_gb",
+    "unknown_power_count",
+    "unknown_os_count",
+    "missing_cpu_count",
+    "missing_memory_count",
+    "missing_storage_count",
+    "duplicate_name_count",
+    "duplicate_row_count",
+}
+_SNAPSHOT_TEXT_FIELDS = {
+    "ocvs_profile",
+    "ocvs_commitment_term",
+}
+_SNAPSHOT_NUMBER_FIELDS = {
+    "ocvs_dr_nodes",
+    "vmware_license_price_per_core_yearly",
+}
+_SNAPSHOT_VM_TEXT_FIELDS = {
+    "oci_shape",
+    "burst",
+    "os_license",
+    "hybrid_placement",
+}
+_SNAPSHOT_VM_NUMBER_FIELDS = {
+    "ocpu",
+    "vpu",
 }
 
 
@@ -53,52 +108,6 @@ def _clean_display_filename(value: Any, field: str) -> str:
     clean = _clean_text(value, field).replace("\\", "/").rsplit("/", 1)[-1]
     clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", clean).strip(" ._")
     return clean[:255]
-
-
-def _is_local_only_key(key: str) -> bool:
-    normalized = key.strip().lower()
-    return (
-        normalized in _LOCAL_ONLY_KEYS
-        or normalized.endswith("_file_path")
-        or normalized.endswith("_local_path")
-    )
-
-
-def _clean_json_value(value: Any, field: str, *, depth: int = 0) -> Any:
-    if depth > _MAX_JSON_DEPTH:
-        raise PortableAssessmentError(f"{field} is nested too deeply.")
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return _clean_text(value, field)
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise PortableAssessmentError(f"{field} must contain finite numbers.")
-        if value < 0:
-            raise PortableAssessmentError(f"{field} cannot contain negative numbers.")
-        if value > _MAX_NUMBER:
-            raise PortableAssessmentError(f"{field} contains a number that is too large.")
-        return value
-    if isinstance(value, list):
-        return [
-            _clean_json_value(item, f"{field}[{index}]", depth=depth + 1)
-            for index, item in enumerate(value)
-        ]
-    if isinstance(value, Mapping):
-        cleaned: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise PortableAssessmentError(f"{field} contains a non-text key.")
-            _clean_text(key, f"{field} key")
-            if _is_local_only_key(key):
-                continue
-            cleaned[key] = _clean_json_value(
-                item,
-                f"{field}.{key}",
-                depth=depth + 1,
-            )
-        return cleaned
-    raise PortableAssessmentError(f"{field} contains an unsupported JSON value.")
 
 
 def _clean_timestamp(value: Any, field: str, *, required: bool = False) -> str:
@@ -147,6 +156,245 @@ def _clean_vm_number(value: Any, field: str) -> int | float:
     return int(number) if number.is_integer() else number
 
 
+def _clean_text_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list):
+        raise PortableAssessmentError(f"{field} must be a JSON array.")
+    return [
+        _clean_text(item, f"{field}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def _clean_text_map(value: Any, field: str) -> dict[str, str]:
+    mapping = _require_mapping(value, field)
+    cleaned: dict[str, str] = {}
+    for key, item in mapping.items():
+        clean_key = _clean_text(key, f"{field} key")
+        if clean_key:
+            cleaned[clean_key] = _clean_text(item, f"{field}.{clean_key}")
+    return cleaned
+
+
+def _clean_number_map(value: Any, field: str) -> dict[str, int | float]:
+    mapping = _require_mapping(value, field)
+    cleaned: dict[str, int | float] = {}
+    for key, item in mapping.items():
+        clean_key = _clean_text(key, f"{field} key")
+        if clean_key:
+            cleaned[clean_key] = _clean_vm_number(item, f"{field}.{clean_key}")
+    return cleaned
+
+
+def _clean_ocvs_policy(value: Any, field: str) -> dict[str, int | float]:
+    policy = _require_mapping(value, field)
+    return {
+        key: _clean_vm_number(policy[key], f"{field}.{key}")
+        for key in _OCVS_POLICY_FIELDS
+        if key in policy
+    }
+
+
+def _clean_app_state(value: Any) -> dict[str, Any]:
+    state = _require_mapping(value, "assessment.app_state")
+    cleaned: dict[str, Any] = {}
+    for key in _APP_STATE_TEXT_LIST_FIELDS:
+        if key in state:
+            cleaned[key] = _clean_text_list(
+                state[key],
+                f"assessment.app_state.{key}",
+            )
+    for key in _APP_STATE_TEXT_MAP_FIELDS:
+        if key in state:
+            cleaned[key] = _clean_text_map(
+                state[key],
+                f"assessment.app_state.{key}",
+            )
+    for key in _APP_STATE_NUMBER_MAP_FIELDS:
+        if key in state:
+            cleaned[key] = _clean_number_map(
+                state[key],
+                f"assessment.app_state.{key}",
+            )
+    for key in _APP_STATE_TEXT_FIELDS:
+        if key in state:
+            cleaned[key] = _clean_text(
+                state[key],
+                f"assessment.app_state.{key}",
+            )
+    for key in _APP_STATE_NUMBER_FIELDS:
+        if key in state:
+            cleaned[key] = _clean_vm_number(
+                state[key],
+                f"assessment.app_state.{key}",
+            )
+    if "step4_ocvs_policy" in state:
+        cleaned["step4_ocvs_policy"] = _clean_ocvs_policy(
+            state["step4_ocvs_policy"],
+            "assessment.app_state.step4_ocvs_policy",
+        )
+    if "step4_last_updated_at" in state:
+        cleaned["step4_last_updated_at"] = _clean_timestamp(
+            state["step4_last_updated_at"],
+            "assessment.app_state.step4_last_updated_at",
+        )
+    return cleaned
+
+
+def _clean_snapshot_vm_settings(value: Any) -> dict[str, dict[str, Any]]:
+    settings = _require_mapping(value, "assessment.step4_snapshot.vm_settings")
+    cleaned: dict[str, dict[str, Any]] = {}
+    for vm_name, raw_config in settings.items():
+        clean_name = _clean_text(
+            vm_name,
+            "assessment.step4_snapshot.vm_settings key",
+        )
+        config = _require_mapping(
+            raw_config,
+            f"assessment.step4_snapshot.vm_settings.{clean_name}",
+        )
+        clean_config: dict[str, Any] = {}
+        if "selected" in config:
+            if not isinstance(config["selected"], bool):
+                raise PortableAssessmentError(
+                    f"assessment.step4_snapshot.vm_settings.{clean_name}.selected must be a boolean."
+                )
+            clean_config["selected"] = config["selected"]
+        for key in _SNAPSHOT_VM_TEXT_FIELDS:
+            if key in config:
+                clean_config[key] = _clean_text(
+                    config[key],
+                    f"assessment.step4_snapshot.vm_settings.{clean_name}.{key}",
+                )
+        for key in _SNAPSHOT_VM_NUMBER_FIELDS:
+            if key in config:
+                clean_config[key] = _clean_vm_number(
+                    config[key],
+                    f"assessment.step4_snapshot.vm_settings.{clean_name}.{key}",
+                )
+        if clean_name and clean_config:
+            cleaned[clean_name] = clean_config
+    return cleaned
+
+
+def _clean_step4_snapshot(value: Any) -> dict[str, Any]:
+    snapshot = _require_mapping(value, "assessment.step4_snapshot")
+    cleaned: dict[str, Any] = {}
+    if "saved_at" in snapshot:
+        cleaned["saved_at"] = _clean_timestamp(
+            snapshot["saved_at"],
+            "assessment.step4_snapshot.saved_at",
+        )
+    for key in _SNAPSHOT_TEXT_FIELDS:
+        if key in snapshot:
+            cleaned[key] = _clean_text(
+                snapshot[key],
+                f"assessment.step4_snapshot.{key}",
+            )
+    for key in _SNAPSHOT_NUMBER_FIELDS:
+        if key in snapshot:
+            cleaned[key] = _clean_vm_number(
+                snapshot[key],
+                f"assessment.step4_snapshot.{key}",
+            )
+    if "ocvs_policy" in snapshot:
+        cleaned["ocvs_policy"] = _clean_ocvs_policy(
+            snapshot["ocvs_policy"],
+            "assessment.step4_snapshot.ocvs_policy",
+        )
+    if "vm_settings" in snapshot:
+        cleaned["vm_settings"] = _clean_snapshot_vm_settings(
+            snapshot["vm_settings"]
+        )
+    return cleaned
+
+
+def _clean_inventory_summary(value: Any) -> dict[str, Any]:
+    summary = _require_mapping(value, "inventory.import_summary")
+    cleaned: dict[str, Any] = {
+        key: _clean_vm_number(summary[key], f"inventory.import_summary.{key}")
+        for key in _INVENTORY_SUMMARY_NUMBER_FIELDS
+        if key in summary
+    }
+    if "warning_messages" in summary:
+        cleaned["warning_messages"] = _clean_text_list(
+            summary["warning_messages"],
+            "inventory.import_summary.warning_messages",
+        )
+    return cleaned
+
+
+def _clean_pricing_document(value: Any) -> dict[str, Any]:
+    document = _require_mapping(value, "pricing.document")
+    cleaned: dict[str, Any] = {}
+    if "lastUpdated" in document:
+        cleaned["lastUpdated"] = _clean_text(
+            document["lastUpdated"],
+            "pricing.document.lastUpdated",
+        )
+    if "items" not in document:
+        return cleaned
+    items = document["items"]
+    if not isinstance(items, list):
+        raise PortableAssessmentError("pricing.document.items must be a JSON array.")
+    cleaned_items: list[dict[str, Any]] = []
+    for item_index, raw_item in enumerate(items):
+        item = _require_mapping(raw_item, f"pricing.document.items[{item_index}]")
+        clean_item: dict[str, Any] = {}
+        if "displayName" in item:
+            clean_item["displayName"] = _clean_text(
+                item["displayName"],
+                f"pricing.document.items[{item_index}].displayName",
+            )
+        if "currencyCodeLocalizations" in item:
+            localizations = item["currencyCodeLocalizations"]
+            if not isinstance(localizations, list):
+                raise PortableAssessmentError(
+                    f"pricing.document.items[{item_index}].currencyCodeLocalizations must be a JSON array."
+                )
+            clean_localizations: list[dict[str, Any]] = []
+            for localization_index, raw_localization in enumerate(localizations):
+                localization = _require_mapping(
+                    raw_localization,
+                    f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}]",
+                )
+                clean_localization: dict[str, Any] = {}
+                if "currencyCode" in localization:
+                    clean_localization["currencyCode"] = _clean_currency(
+                        localization["currencyCode"],
+                        f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].currencyCode",
+                    )
+                if "prices" in localization:
+                    prices = localization["prices"]
+                    if not isinstance(prices, list):
+                        raise PortableAssessmentError(
+                            f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices must be a JSON array."
+                        )
+                    clean_prices: list[dict[str, Any]] = []
+                    for price_index, raw_price in enumerate(prices):
+                        price = _require_mapping(
+                            raw_price,
+                            f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}]",
+                        )
+                        clean_price: dict[str, Any] = {}
+                        if "model" in price:
+                            clean_price["model"] = _clean_text(
+                                price["model"],
+                                f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}].model",
+                            )
+                        if "value" in price:
+                            clean_price["value"] = _clean_vm_number(
+                                price["value"],
+                                f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}].value",
+                            )
+                        clean_prices.append(clean_price)
+                    clean_localization["prices"] = clean_prices
+                clean_localizations.append(clean_localization)
+            clean_item["currencyCodeLocalizations"] = clean_localizations
+        cleaned_items.append(clean_item)
+    cleaned["items"] = cleaned_items
+    return cleaned
+
+
 def _clean_assessment(value: Any) -> dict[str, Any]:
     assessment = _require_mapping(value, "assessment")
     app_state = assessment.get("app_state", {})
@@ -172,11 +420,8 @@ def _clean_assessment(value: Any) -> dict[str, Any]:
             assessment.get("selected_currency", ""),
             "assessment.selected_currency",
         ),
-        "app_state": _clean_json_value(app_state, "assessment.app_state"),
-        "step4_snapshot": _clean_json_value(
-            step4_snapshot,
-            "assessment.step4_snapshot",
-        ),
+        "app_state": _clean_app_state(app_state),
+        "step4_snapshot": _clean_step4_snapshot(step4_snapshot),
     }
 
 
@@ -261,10 +506,7 @@ def _clean_inventory(value: Any) -> dict[str, Any]:
             inventory.get("source_label", ""),
             "inventory.source_label",
         ),
-        "import_summary": _clean_json_value(
-            import_summary,
-            "inventory.import_summary",
-        ),
+        "import_summary": _clean_inventory_summary(import_summary),
         "rows": rows,
     }
 
@@ -278,10 +520,7 @@ def _clean_pricing(value: Any) -> dict[str, Any]:
     else:
         document = {}
     _require_mapping(document, "pricing.document")
-    clean_document = _clean_json_value(document, "pricing.document")
-    items = clean_document.get("items") if isinstance(clean_document, dict) else None
-    if items is not None and not isinstance(items, list):
-        raise PortableAssessmentError("pricing.document.items must be a JSON array.")
+    clean_document = _clean_pricing_document(document)
     return {
         "currency": _clean_currency(
             pricing.get("currency", ""),
@@ -300,11 +539,6 @@ def _clean_source(value: Any) -> dict[str, Any]:
         return {}
     source = _require_mapping(value, "source")
     cleaned: dict[str, Any] = {}
-    if "assessment_id" in source:
-        cleaned["assessment_id"] = _clean_text(
-            source.get("assessment_id"),
-            "source.assessment_id",
-        )
     if "application_schema_version" in source:
         version = source.get("application_schema_version")
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:

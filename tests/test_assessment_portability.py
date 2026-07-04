@@ -26,7 +26,17 @@ def valid_sections() -> tuple[dict, dict, dict]:
         },
         "step4_snapshot": {
             "saved_at": "2026-07-04T09:30:00",
-            "vm_settings": {"app-01": {"shape": "VM.Standard.E5.Flex"}},
+            "vm_settings": {
+                "app-01": {
+                    "selected": True,
+                    "oci_shape": "VM.Standard.E5.Flex",
+                    "ocpu": 2,
+                    "burst": "100%",
+                    "vpu": 20,
+                    "os_license": "BYOL",
+                    "hybrid_placement": "native",
+                }
+            },
         },
     }
     inventory = {
@@ -137,14 +147,15 @@ def isolated_portability_client():
             "source_vinfo_csv": str(inventory_path).replace("\\", "/"),
             "vm_settings": {
                 "app-01": {
-                    "shape": "VM.Standard.E5.Flex",
-                    "ocpus": 2,
+                    "selected": True,
+                    "oci_shape": "VM.Standard.E5.Flex",
+                    "ocpu": 2,
                     "burst": "100%",
                     "vpu": 20,
                     "os_license": "BYOL",
+                    "hybrid_placement": "native",
                 }
             },
-            "iaas_discount_pct": 12.5,
             "ocvs_commitment_term": "3_year",
         }
         (app_state / f"{state_id}_step4_snapshot.json").write_text(
@@ -287,8 +298,8 @@ class PortableAssessmentTests(unittest.TestCase):
             lambda package, text: package["inventory"]["rows"][0].update(
                 raw_os=text
             ),
-            lambda package, text: package["pricing"]["document"].update(
-                marker=text
+            lambda package, text: package["pricing"]["document"]["items"][0].update(
+                displayName=text
             ),
         )
         oversized = "x" * (portability.MAX_TEXT_LENGTH + 1)
@@ -350,8 +361,325 @@ class PortableAssessmentTests(unittest.TestCase):
         self.assertNotIn("last_export_file", serialized)
         self.assertNotIn("source_vinfo_csv", serialized)
 
+    def test_nested_allowlists_drop_unknown_paths_ids_and_export_fields(self) -> None:
+        package = valid_package()
+        package["unexpected_root"] = {"inventory_path": "/private/root.csv"}
+        package["source"].update(
+            assessment_id="sender-local-id",
+            local_id="sender-local-id-2",
+            generated_export_path="/private/source-export.xlsx",
+            arbitrary_nested={"keep_me": False},
+        )
+        assessment = package["assessment"]
+        assessment.update(
+            inventory_path="/private/assessment-inventory.csv",
+            generated_export_path="/private/assessment-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        app_state = assessment["app_state"]
+        app_state.update(
+            step4_vm_shapes={"app-01": "VM.Standard.E5.Flex"},
+            step4_ocvs_policy={
+                "vcpu_per_ocpu": 4.0,
+                "cpu_headroom_pct": 20.0,
+                "memory_headroom_pct": 20.0,
+                "storage_headroom_pct": 25.0,
+                "dense_vsan_usable_pct": 50.0,
+                "standard_storage_vpu": 10,
+                "inventory_path": "/private/policy-inventory.csv",
+                "unknown_policy": 99,
+            },
+            assessor_recommendation="hybrid",
+            assessor_recommendation_rationale="Retain the database on OCVS.",
+            inventory_path="/private/app-state-inventory.csv",
+            generated_export_path="/private/app-state-export.xlsx",
+            arbitrary_nested={"nested": {"unknown": True}},
+        )
+        snapshot = assessment["step4_snapshot"]
+        snapshot.update(
+            source_vinfo_csv="/private/source.csv",
+            inventory_path="/private/snapshot-inventory.csv",
+            generated_export_path="/private/snapshot-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        snapshot["vm_settings"]["app-01"].update(
+            inventory_path="/private/vm-inventory.csv",
+            generated_export_path="/private/vm-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        package["inventory"].update(
+            inventory_path="/private/inventory-section.csv",
+            generated_export_path="/private/inventory-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        package["inventory"]["import_summary"].update(
+            inventory_path="/private/summary-inventory.csv",
+            generated_export_path="/private/summary-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        package["inventory"]["rows"][0].update(
+            inventory_path="/private/row-inventory.csv",
+            generated_export_path="/private/row-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        document = package["pricing"]["document"]
+        document.update(
+            inventory_path="/private/pricing-inventory.csv",
+            generated_export_path="/private/pricing-export.xlsx",
+            arbitrary_nested={"unknown": "drop"},
+        )
+        price_item = document["items"][0]
+        price_item["arbitrary_nested"] = {"unknown": "drop"}
+        localization = price_item["currencyCodeLocalizations"][0]
+        localization["inventory_path"] = "/private/localization.csv"
+        localization["prices"][0]["generated_export_path"] = "/private/price.xlsx"
+
+        validated = portability.validate_portable_package(package)
+        serialized = portability.dumps_portable_package(validated)
+
+        self.assertEqual(
+            {"application_schema_version": 1},
+            validated["source"],
+        )
+        self.assertEqual(
+            {
+                "selected_vm_names",
+                "step4_hybrid_placements",
+                "step4_iaas_discount_pct",
+                "step4_vm_shapes",
+                "step4_ocvs_policy",
+                "assessor_recommendation",
+                "assessor_recommendation_rationale",
+            },
+            set(validated["assessment"]["app_state"]),
+        )
+        self.assertEqual(
+            {
+                "vcpu_per_ocpu",
+                "cpu_headroom_pct",
+                "memory_headroom_pct",
+                "storage_headroom_pct",
+                "dense_vsan_usable_pct",
+                "standard_storage_vpu",
+            },
+            set(
+                validated["assessment"]["app_state"]["step4_ocvs_policy"]
+            ),
+        )
+        self.assertEqual(
+            {"saved_at", "vm_settings"},
+            set(validated["assessment"]["step4_snapshot"]),
+        )
+        self.assertEqual(
+            {
+                "selected",
+                "oci_shape",
+                "ocpu",
+                "burst",
+                "vpu",
+                "os_license",
+                "hybrid_placement",
+            },
+            set(
+                validated["assessment"]["step4_snapshot"]["vm_settings"][
+                    "app-01"
+                ]
+            ),
+        )
+        self.assertEqual(
+            {"vm_count", "warning_messages"},
+            set(validated["inventory"]["import_summary"]),
+        )
+        self.assertEqual(
+            {"items"},
+            set(validated["pricing"]["document"]),
+        )
+        self.assertEqual(
+            {"displayName", "currencyCodeLocalizations"},
+            set(validated["pricing"]["document"]["items"][0]),
+        )
+        for forbidden in (
+            "inventory_path",
+            "generated_export_path",
+            "local_id",
+            "assessment_id",
+            "arbitrary_nested",
+            "/private/",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
 
 class PortableAssessmentRouteTests(unittest.TestCase):
+    def test_imported_inventory_reload_preserves_every_normalized_field(self) -> None:
+        with isolated_portability_client() as fixture:
+            assessment, inventory, pricing = valid_sections()
+            inventory["rows"] = [
+                {
+                    "name": "duplicate-app [2]",
+                    "source_name": "duplicate-app",
+                    "duplicate_index": 2,
+                    "power_state": "Unknown",
+                    "raw_os": "Vendor Guest OS 9",
+                    "mapped_os": "Preserved Mapped OS",
+                    "cpus": 3.5,
+                    "memory_mb": 6144,
+                    "provisioned_mib": 77777,
+                }
+            ]
+            inventory["import_summary"] = {
+                "vm_count": 1,
+                "duplicate_name_count": 1,
+                "duplicate_row_count": 1,
+                "warning_messages": ["Duplicate provenance retained."],
+            }
+            package = portability.build_portable_package(
+                assessment,
+                inventory,
+                pricing,
+                exported_at="2026-07-04T10:15:00Z",
+            )
+
+            response = fixture["client"].post(
+                "/",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(portability.dumps_portable_package(package).encode("utf-8")),
+                        "normalized.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+            with fixture["client"].session_transaction() as sess:
+                imported_inventory = str(sess.get("selected_rvtools_file", ""))
+
+            reloaded_rows, reloaded_source = app_module.load_vms_from_vinfo(
+                imported_inventory
+            )
+            generated_payload = json.loads(
+                Path(imported_inventory).read_text(encoding="utf-8")
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(package["inventory"]["rows"], reloaded_rows)
+            self.assertEqual(package["inventory"], generated_payload["inventory"])
+            self.assertEqual(
+                imported_inventory,
+                reloaded_source.rsplit("::", 1)[0],
+            )
+
+    def test_import_id_allocation_skips_directory_and_snapshot_collisions(self) -> None:
+        with isolated_portability_client() as fixture:
+            package = valid_package()
+            imported_root = fixture["downloads"] / "imported_assessments"
+            directory_collision_id = "existing_import_directory"
+            directory_collision = imported_root / directory_collision_id
+            directory_collision.mkdir(parents=True)
+            directory_marker = directory_collision / "preserved.txt"
+            directory_marker.write_bytes(b"preserve existing import artifacts")
+            snapshot_collision_id = "existing_saved_snapshot"
+            saved_dir = fixture["app_state"] / "saved_assessments"
+            saved_dir.mkdir()
+            snapshot_collision = saved_dir / f"{snapshot_collision_id}.json"
+            snapshot_collision.write_bytes(b'{"preserve":"existing snapshot"}\n')
+            allocated_id = "collision_free_import"
+
+            with patch.object(
+                app_module,
+                "_new_assessment_id",
+                side_effect=[
+                    directory_collision_id,
+                    snapshot_collision_id,
+                    allocated_id,
+                ],
+            ) as id_generator:
+                response = fixture["client"].post(
+                    "/",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(package).encode(
+                                    "utf-8"
+                                )
+                            ),
+                            "portable.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            with fixture["client"].session_transaction() as sess:
+                active_id = str(sess.get("active_assessment_id", ""))
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(3, id_generator.call_count)
+            self.assertEqual(allocated_id, active_id)
+            self.assertEqual(
+                b"preserve existing import artifacts",
+                directory_marker.read_bytes(),
+            )
+            self.assertEqual(
+                b'{"preserve":"existing snapshot"}\n',
+                snapshot_collision.read_bytes(),
+            )
+            self.assertTrue((imported_root / allocated_id).is_dir())
+            self.assertTrue((saved_dir / f"{allocated_id}.json").is_file())
+
+    def test_late_snapshot_collision_is_preserved_and_owned_artifacts_roll_back(self) -> None:
+        with isolated_portability_client() as fixture:
+            package = valid_package()
+            collision_id = "late_snapshot_collision"
+            saved_dir = fixture["app_state"] / "saved_assessments"
+            saved_dir.mkdir()
+            collision_snapshot = saved_dir / f"{collision_id}.json"
+            collision_bytes = b'{"preserve":"late collision"}\n'
+            imported_root = fixture["downloads"] / "imported_assessments"
+            real_writer = app_module._write_imported_inventory
+
+            def create_late_collision(
+                file_path: Path,
+                inventory: dict,
+            ) -> None:
+                real_writer(file_path, inventory)
+                collision_snapshot.write_bytes(collision_bytes)
+
+            with fixture["client"].session_transaction() as sess:
+                before_session = copy.deepcopy(dict(sess))
+            with (
+                patch.object(
+                    app_module,
+                    "_new_assessment_id",
+                    return_value=collision_id,
+                ),
+                patch.object(
+                    app_module,
+                    "_write_imported_inventory",
+                    side_effect=create_late_collision,
+                ),
+            ):
+                response = fixture["client"].post(
+                    "/",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(package).encode(
+                                    "utf-8"
+                                )
+                            ),
+                            "portable.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            with fixture["client"].session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"current assessment was kept", response.data)
+            self.assertEqual(before_session, after_session)
+            self.assertEqual(collision_bytes, collision_snapshot.read_bytes())
+            self.assertFalse((imported_root / collision_id).exists())
+
     def test_unsaved_export_is_self_contained_without_creating_local_snapshot(self) -> None:
         with isolated_portability_client() as fixture:
             response = fixture["client"].post(
