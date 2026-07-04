@@ -2393,7 +2393,28 @@ def validate_workspace_shell_behavior() -> None:
 
 def validate_workspace_source_contracts() -> None:
     workspace_css = (ROOT / "static" / "css" / "workspace.css").read_text(encoding="utf-8")
+    scenario_css = (ROOT / "static" / "css" / "scenarios.css").read_text(encoding="utf-8")
+    results_css = (ROOT / "static" / "css" / "results.css").read_text(encoding="utf-8")
     workspace_js = (ROOT / "static" / "js" / "workspace.js").read_text(encoding="utf-8")
+    redwood_theme = (ROOT / "templates" / "_redwood_theme.html").read_text(encoding="utf-8")
+
+    secondary_button_exclusions = [
+        r"button:not\(\.remove\):not\(\.move-btn\):not\(\.btn-secondary\):not\(\.scenario-tab\)\s*\{",
+        r"button:not\(\.remove\):not\(\.move-btn\):not\(\.btn-secondary\):not\(\.scenario-tab\):hover\s*\{",
+    ]
+    check(
+        "Task 12 Redwood primary-button rules preserve secondary controls",
+        all(re.search(pattern, redwood_theme) for pattern in secondary_button_exclusions),
+    )
+
+    check(
+        "Task 12 scenario and Results focus rings use the opaque workspace focus color",
+        all(
+            "outline: 3px solid var(--workspace-focus);" in stylesheet
+            and "rgb(47 107 69 / 28%)" not in stylesheet
+            for stylesheet in (scenario_css, results_css)
+        ),
+    )
 
     scenario_rule_patterns = [
         r"\.workspace-body button\.scenario-tab\s*\{[^}]*background:\s*var\(--tab-soft\);[^}]*border-color:\s*var\(--tab-accent\);[^}]*color:\s*var\(--tab-strong\);",

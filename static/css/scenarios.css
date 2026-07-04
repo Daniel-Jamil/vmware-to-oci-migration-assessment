@@ -103,7 +103,7 @@ body {
 .scenario-primary-action:focus-visible,
 .scenario-secondary-action:focus-visible,
 .native-editor :is(input, select, a, button):focus-visible {
-  outline: 3px solid rgb(47 107 69 / 28%);
+  outline: 3px solid var(--workspace-focus);
   outline-offset: 2px;
 }
 

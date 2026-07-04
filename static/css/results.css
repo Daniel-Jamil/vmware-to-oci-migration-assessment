@@ -433,7 +433,7 @@ body {
 .recommendation-rationale textarea:focus-visible,
 .results-button:focus-visible,
 .recommendation-actions button:focus-visible {
-  outline: 3px solid rgb(47 107 69 / 28%);
+  outline: 3px solid var(--workspace-focus);
   outline-offset: 2px;
 }
 
