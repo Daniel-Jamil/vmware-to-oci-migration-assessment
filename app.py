@@ -8240,6 +8240,24 @@ def step4() -> str:
             elif any(normalize_burst_value(value) not in valid_burst_values for value in native_strategy_bursts):
                 native_post_errors.append("Choose a valid burst for every default shape strategy row.")
 
+        submitted_vmware_license_price = vmware_license_price_per_core_yearly
+        if "vmware_license_price_per_core_yearly" in request.form:
+            vmware_license_raw = str(
+                request.form.get("vmware_license_price_per_core_yearly", "")
+            ).strip()
+            try:
+                submitted_vmware_license_price = float(vmware_license_raw)
+            except (TypeError, ValueError):
+                submitted_vmware_license_price = math.nan
+            if (
+                not math.isfinite(submitted_vmware_license_price)
+                or submitted_vmware_license_price < 0.0
+                or submitted_vmware_license_price > 1_000_000.0
+            ):
+                native_post_errors.append(
+                    "Enter a valid VCF list price per physical core/year."
+                )
+
         scenario_setting_fields = (
             "iaas_discount_pct",
             "vmware_license_price_per_core_yearly",
@@ -8286,9 +8304,6 @@ def step4() -> str:
             return redirect(step4_tab_redirect(active_scenario, **request.form))
 
         iaas_discount_raw = str(request.form.get("iaas_discount_pct", iaas_discount_pct)).strip()
-        vmware_license_raw = str(
-            request.form.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly)
-        ).strip()
         ocvs_profile_choice = normalize_ocvs_profile(request.form.get("ocvs_profile", ocvs_profile_choice))
         ocvs_commitment_term = normalize_ocvs_commitment_term(
             request.form.get("ocvs_commitment_term", ocvs_commitment_term)
@@ -8309,12 +8324,7 @@ def step4() -> str:
         except (TypeError, ValueError):
             iaas_discount_pct = 0.0
         iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
-        vmware_license_price_per_core_yearly = _bounded_float(
-            vmware_license_raw,
-            0.0,
-            0.0,
-            1_000_000.0,
-        )
+        vmware_license_price_per_core_yearly = submitted_vmware_license_price
 
         updated_shapes = dict(vm_shape_selection)
         updated_ocpus = dict(vm_ocpu_selection)

@@ -3641,25 +3641,129 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         f"status={spoof_response.status_code}",
     )
 
+    rows_by_name = {str(row["name"]): row for row in selected_rows}
+    native_page_names = sorted(selected_names, key=str.lower)[:50]
+    ocvs_policy = app_module.normalize_ocvs_policy({})
+
+    def ocvs_save_form(
+        vcf_price: str,
+        *,
+        native_ocpu: str = "3",
+        dr_nodes: str = "0",
+    ) -> MultiDict:
+        form = MultiDict(
+            [
+                ("action", "save"),
+                ("active_scenario", "ocvs"),
+                ("native_page", "1"),
+                ("native_page_size", "50"),
+                ("native_search", ""),
+                ("native_support", "all"),
+                ("iaas_discount_pct", "0"),
+                ("ocvs_profile", "BM.Standard.E4.128"),
+                ("ocvs_commitment_term", "3_year"),
+                ("ocvs_vcpu_per_ocpu", str(ocvs_policy["vcpu_per_ocpu"])),
+                ("ocvs_cpu_headroom_pct", str(ocvs_policy["cpu_headroom_pct"])),
+                ("ocvs_memory_headroom_pct", str(ocvs_policy["memory_headroom_pct"])),
+                ("ocvs_storage_headroom_pct", str(ocvs_policy["storage_headroom_pct"])),
+                ("ocvs_dense_vsan_usable_pct", str(ocvs_policy["dense_vsan_usable_pct"])),
+                ("ocvs_standard_storage_vpu", str(ocvs_policy["standard_storage_vpu"])),
+                ("ocvs_dr_nodes", dr_nodes),
+                ("vmware_license_price_per_core_yearly", vcf_price),
+            ]
+        )
+        form.setlist("vm_name", native_page_names)
+        form.setlist("oci_shape", ["E6"] * len(native_page_names))
+        form.setlist("vm_ocpu", [native_ocpu] * len(native_page_names))
+        form.setlist("vm_burst", ["50%"] * len(native_page_names))
+        form.setlist("vm_vpu", ["20"] * len(native_page_names))
+        form.setlist(
+            "vm_os_license",
+            [
+                "BYOL"
+                if "windows server" in str(rows_by_name[name].get("raw_os", "")).lower()
+                else ""
+                for name in native_page_names
+            ],
+        )
+        for name in selected_names:
+            form.add(f"hybrid_placement:{name}", placements[name])
+        return form
+
+    positive_vcf_post = client.post(
+        "/step4",
+        data=ocvs_save_form("360.00"),
+        follow_redirects=False,
+    )
+    positive_vcf_response = client.get(positive_vcf_post.headers.get("Location", ""))
+    positive_vcf_html = positive_vcf_response.data.decode("utf-8", errors="replace")
+    positive_hybrid_response = client.get("/step4?tab=hybrid")
+    positive_hybrid_html = positive_hybrid_response.data.decode("utf-8", errors="replace")
     with app_module.app.test_request_context("/"):
         app_module.session["state_id"] = state_id
         priced_state = app_module.load_app_state()
-        priced_state["step4_vmware_license_price_per_core_yearly"] = 360.0
-        app_module.save_app_state(priced_state)
-    positive_vcf_response = client.get("/step4?tab=ocvs")
-    positive_vcf_html = positive_vcf_response.data.decode("utf-8", errors="replace")
+        priced_snapshot = app_module.load_step4_snapshot()
     check(
-        "Positive VCF unit price restores OCVS and Hybrid rankability",
+        "OCVS POST persists positive VCF pricing through the normal save transaction",
+        positive_vcf_post.status_code in {302, 303}
+        and positive_vcf_post.headers.get("Location", "").endswith("/step4?tab=ocvs")
+        and priced_state.get("step4_vmware_license_price_per_core_yearly") == 360.0
+        and priced_snapshot.get("vmware_license_price_per_core_yearly") == 360.0,
+        f"status={positive_vcf_post.status_code}, location={positive_vcf_post.headers.get('Location')}",
+    )
+    check(
+        "Redirected OCVS and reloaded Hybrid become pricing-complete and rankable",
         positive_vcf_response.status_code == 200
+        and positive_hybrid_response.status_code == 200
         and 'data-ocvs-rankable="true"' in positive_vcf_html
-        and 'data-hybrid-rankable="true"' in positive_vcf_html
         and 'data-ocvs-readiness-state="ready"' in positive_vcf_html
-        and "Complete monthly total" in positive_vcf_html
-        and "Unit price required" not in positive_vcf_html,
+        and 'data-hybrid-rankable="true"' in positive_hybrid_html
+        and 'data-hybrid-readiness-state="ready"' in positive_hybrid_html
+        and positive_vcf_html.count("Complete monthly total") >= 2
+        and positive_hybrid_html.count("Complete monthly total") >= 2
+        and "Unit price required" not in positive_vcf_html
+        and "Unit price required" not in positive_hybrid_html,
+    )
+    check(
+        "VCF pricing remains single-owned by OCVS and is consumed by Hybrid",
+        positive_vcf_html.count('name="vmware_license_price_per_core_yearly"') == 1
+        and positive_hybrid_html.count('name="vmware_license_price_per_core_yearly"') == 1
+        and re.search(
+            r'name="vmware_license_price_per_core_yearly"[^>]*value="360\.00"',
+            positive_hybrid_html,
+            re.S,
+        )
+        is not None
+        and 'data-hybrid-rankable="true"' in positive_hybrid_html,
+    )
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        before_invalid_vcf = app_module.load_app_state()
+        before_invalid_snapshot = app_module.load_step4_snapshot()
+    invalid_vcf_response = client.post(
+        "/step4",
+        data=ocvs_save_form("not-a-price", native_ocpu="4", dr_nodes="2"),
+        follow_redirects=False,
+    )
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        after_invalid_vcf = app_module.load_app_state()
+        after_invalid_snapshot = app_module.load_step4_snapshot()
+    invalid_vcf_redirect = client.get(invalid_vcf_response.headers.get("Location", ""))
+    check(
+        "Invalid VCF form value rejects the whole OCVS save transaction",
+        invalid_vcf_response.status_code in {302, 303}
+        and after_invalid_vcf == before_invalid_vcf
+        and after_invalid_snapshot == before_invalid_snapshot
+        and b"valid VCF list price" in invalid_vcf_redirect.data,
+        f"status={invalid_vcf_response.status_code}, location={invalid_vcf_response.headers.get('Location')}",
     )
 
     scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
     scenario_css = (ROOT / "static" / "css" / "scenarios.css").read_text(encoding="utf-8")
+    # Task 8 browser probes at 390/1280 verified page/filtered/all bulk scope,
+    # Undo, and preservation of later row edits. Task 12 owns automated events.
     check(
         "Hybrid editor exposes search support placement scope bulk and surgical Undo hooks",
         all(
@@ -3683,6 +3787,12 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
                 "hybridBulkSnapshot",
                 "data-hybrid-bulk-undo",
                 "affectedRows",
+                "function rowsForBulkScope()",
+                'if (scope === "all") return rows;',
+                'if (scope === "filtered") return filteredRows;',
+                "return pageRows;",
+                "if (item.select.value !== item.applied) return;",
+                "later row edits were kept",
                 "renderHybridEditor",
                 "markDirty",
             )
