@@ -1147,6 +1147,29 @@ def _write_imported_inventory(
     )
 
 
+def _expected_portable_price_lookup(
+    document: dict[str, Any],
+) -> tuple[dict[str, float], str]:
+    lookup: dict[str, float] = {}
+    currency = ""
+    for item in document.get("items", []):
+        localizations = item["currencyCodeLocalizations"]
+        localization = localizations[0]
+        prices = localization["prices"]
+        selected_price = next(
+            (
+                price
+                for price in prices
+                if str(price["model"]).upper() == "PAY_AS_YOU_GO"
+            ),
+            prices[0],
+        )
+        lookup[str(item["displayName"])] = float(selected_price["value"])
+        if not currency:
+            currency = str(localization["currencyCode"])
+    return lookup, currency
+
+
 def import_portable_assessment(package: Any) -> dict[str, Any]:
     """Materialize and load a validated package as a new local assessment."""
     validated = validate_portable_package(package)
@@ -1158,9 +1181,12 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
         imported_name
     )
     inventory_file = import_dir / "normalized_inventory.json"
-    currency = str(
-        assessment.get("selected_currency") or pricing.get("currency") or ""
-    ).upper().strip()
+    pricing_document = dict(pricing.get("document") or {})
+    has_pricing = bool(pricing_document.get("items"))
+    expected_price_lookup, expected_currency = _expected_portable_price_lookup(
+        pricing_document
+    )
+    currency = expected_currency if has_pricing else ""
     pricing_file = import_dir / (
         f"oci_pricing_{currency or 'imported'}_portable.json"
     )
@@ -1182,7 +1208,6 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
     }
 
     rows = list(inventory.get("rows") or [])
-    pricing_document = dict(pricing.get("document") or {})
     now = datetime.now().isoformat(timespec="seconds")
     created_import_dir = False
     created_snapshot = False
@@ -1190,7 +1215,23 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
         import_dir.mkdir(parents=True, exist_ok=False)
         created_import_dir = True
         _write_imported_inventory(inventory_file, inventory)
-        _write_json_atomically(pricing_file, pricing_document)
+        if has_pricing:
+            _write_json_atomically(pricing_file, pricing_document)
+            pricing_path = str(pricing_file).replace("\\", "/")
+            loaded_lookup, loaded_currency, loaded_source = load_price_lookup(
+                pricing_path
+            )
+            if (
+                not loaded_lookup
+                or loaded_lookup != expected_price_lookup
+                or loaded_currency.upper().strip() != currency
+                or loaded_source != pricing_path
+            ):
+                raise PortableAssessmentError(
+                    "The imported pricing could not be reconstructed exactly."
+                )
+        else:
+            pricing_path = ""
 
         generated_rows: list[dict[str, Any]] = []
         generated_source = ""
@@ -1211,9 +1252,7 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
         else:
             step4_snapshot.pop("source_vinfo_csv", None)
 
-        has_pricing = bool(pricing_document.get("items"))
         inventory_path = str(inventory_file).replace("\\", "/") if rows else ""
-        pricing_path = str(pricing_file).replace("\\", "/") if has_pricing else ""
         snapshot = {
             "schema_version": SAVED_ASSESSMENT_SCHEMA_VERSION,
             "id": assessment_id,
@@ -1246,6 +1285,15 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
             raise PortableAssessmentError(
                 "The imported assessment could not be loaded after reconstruction."
             )
+        if not has_pricing:
+            session.pop("selected_pricelist_file", None)
+            session.pop("selected_currency", None)
+            preferences = load_preferences()
+            cleared_preferences = copy.deepcopy(preferences)
+            cleared_preferences.pop("last_selected_pricelist_file", None)
+            cleared_preferences.pop("last_selected_currency", None)
+            if cleared_preferences != preferences:
+                save_preferences(cleared_preferences)
     except Exception:
         failed_state_id = str(session.get("state_id") or "").strip()
         try:

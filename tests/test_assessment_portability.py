@@ -324,6 +324,173 @@ class PortableAssessmentTests(unittest.TestCase):
             ):
                 portability.validate_portable_package(package)
 
+    def test_nonempty_pricing_requires_complete_loader_schema(self) -> None:
+        def item(package: dict) -> dict:
+            return package["pricing"]["document"]["items"][0]
+
+        cases = (
+            ("empty item", lambda package: package["pricing"]["document"].update(items=[{}])),
+            (
+                "non-object item",
+                lambda package: package["pricing"]["document"].update(
+                    items=["invalid"]
+                ),
+            ),
+            (
+                "missing pricing currency",
+                lambda package: package["pricing"].update(currency=""),
+            ),
+            ("missing display name", lambda package: item(package).pop("displayName")),
+            ("empty display name", lambda package: item(package).update(displayName="")),
+            ("non-text display name", lambda package: item(package).update(displayName=42)),
+            (
+                "missing localizations",
+                lambda package: item(package).pop("currencyCodeLocalizations"),
+            ),
+            (
+                "empty localizations",
+                lambda package: item(package).update(currencyCodeLocalizations=[]),
+            ),
+            (
+                "non-array localizations",
+                lambda package: item(package).update(
+                    currencyCodeLocalizations={}
+                ),
+            ),
+            (
+                "non-object localization",
+                lambda package: item(package).update(
+                    currencyCodeLocalizations=["invalid"]
+                ),
+            ),
+            (
+                "malformed localization",
+                lambda package: item(package).update(currencyCodeLocalizations=[{}]),
+            ),
+            (
+                "missing currency",
+                lambda package: item(package)["currencyCodeLocalizations"][0].pop(
+                    "currencyCode"
+                ),
+            ),
+            (
+                "invalid currency",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    currencyCode="EU"
+                ),
+            ),
+            (
+                "non-text currency",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    currencyCode=42
+                ),
+            ),
+            (
+                "mismatched currency",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    currencyCode="USD"
+                ),
+            ),
+            (
+                "missing prices",
+                lambda package: item(package)["currencyCodeLocalizations"][0].pop(
+                    "prices"
+                ),
+            ),
+            (
+                "empty prices",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    prices=[]
+                ),
+            ),
+            (
+                "non-array prices",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    prices={}
+                ),
+            ),
+            (
+                "non-object price",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    prices=["invalid"]
+                ),
+            ),
+            (
+                "malformed price",
+                lambda package: item(package)["currencyCodeLocalizations"][0].update(
+                    prices=[{}]
+                ),
+            ),
+            (
+                "missing model",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].pop("model"),
+            ),
+            (
+                "empty model",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(model=""),
+            ),
+            (
+                "non-text model",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(model=42),
+            ),
+            (
+                "missing value",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].pop("value"),
+            ),
+            (
+                "non-number value",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(value="0.031"),
+            ),
+            (
+                "boolean value",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(value=True),
+            ),
+            (
+                "NaN value",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(value=float("nan")),
+            ),
+            (
+                "negative value",
+                lambda package: item(package)["currencyCodeLocalizations"][0][
+                    "prices"
+                ][0].update(value=-0.031),
+            ),
+        )
+
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                package = valid_package()
+                mutate(package)
+                with self.assertRaises(portability.PortableAssessmentError):
+                    portability.validate_portable_package(package)
+
+    def test_empty_pricing_items_are_valid_without_currency(self) -> None:
+        package = valid_package()
+        package["pricing"] = {
+            "currency": "",
+            "source_file_name": "",
+            "document": {"items": []},
+        }
+
+        validated = portability.validate_portable_package(package)
+
+        self.assertEqual("", validated["pricing"]["currency"])
+        self.assertEqual({"items": []}, validated["pricing"]["document"])
+
     def test_rejects_serialized_package_over_size_limit(self) -> None:
         package = valid_package()
 
@@ -510,6 +677,219 @@ class PortableAssessmentTests(unittest.TestCase):
 
 
 class PortableAssessmentRouteTests(unittest.TestCase):
+    @staticmethod
+    def _file_tree_bytes(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    def test_empty_pricing_import_clears_prior_selection_and_preferences(self) -> None:
+        with isolated_portability_client() as fixture:
+            package = valid_package()
+            package["pricing"]["document"] = {"items": []}
+            preferences_path = fixture["app_state"] / "preferences.json"
+            preferences_path.write_text(
+                json.dumps(
+                    {
+                        "last_selected_pricelist_file": str(
+                            fixture["pricing_path"]
+                        ).replace("\\", "/"),
+                        "last_selected_currency": "EUR",
+                        "unrelated_preference": "preserve",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            response = fixture["client"].post(
+                "/",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(
+                            portability.dumps_portable_package(package).encode(
+                                "utf-8"
+                            )
+                        ),
+                        "no-pricing.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+
+            with fixture["client"].session_transaction() as sess:
+                imported_session = dict(sess)
+            imported_id = str(imported_session.get("active_assessment_id", ""))
+            imported_snapshot = json.loads(
+                (
+                    fixture["app_state"]
+                    / "saved_assessments"
+                    / f"{imported_id}.json"
+                ).read_text(encoding="utf-8")
+            )
+            preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+            import_dir = fixture["downloads"] / "imported_assessments" / imported_id
+
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"Assessment imported", response.data)
+            self.assertNotIn("selected_pricelist_file", imported_session)
+            self.assertNotIn("selected_currency", imported_session)
+            self.assertEqual("", imported_snapshot["selected_pricelist_file"])
+            self.assertEqual("", imported_snapshot["selected_currency"])
+            self.assertNotIn("last_selected_pricelist_file", preferences)
+            self.assertNotIn("last_selected_currency", preferences)
+            self.assertEqual("preserve", preferences["unrelated_preference"])
+            self.assertEqual([], list(import_dir.glob("oci_pricing_*.json")))
+
+    def test_malformed_pricing_rejection_preserves_every_local_byte(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Preserve pricing baseline",
+                    "assessment_notes": "Malformed pricing must not change this.",
+                },
+            )
+
+            def partial_item(package: dict) -> None:
+                package["pricing"]["document"]["items"] = [
+                    {"displayName": "Incomplete"}
+                ]
+
+            def empty_item(package: dict) -> None:
+                package["pricing"]["document"]["items"] = [{}]
+
+            def nan_price(package: dict) -> None:
+                package["pricing"]["document"]["items"][0][
+                    "currencyCodeLocalizations"
+                ][0]["prices"][0]["value"] = float("nan")
+
+            def negative_price(package: dict) -> None:
+                package["pricing"]["document"]["items"][0][
+                    "currencyCodeLocalizations"
+                ][0]["prices"][0]["value"] = -1
+
+            for label, mutate in (
+                ("empty item", empty_item),
+                ("partial item", partial_item),
+                ("NaN price", nan_price),
+                ("negative price", negative_price),
+            ):
+                with self.subTest(label=label):
+                    package = valid_package()
+                    mutate(package)
+                    with client.session_transaction() as sess:
+                        before_session = copy.deepcopy(dict(sess))
+                    before_files = self._file_tree_bytes(fixture["app_state"].parent)
+
+                    response = client.post(
+                        "/",
+                        data={
+                            "action": "import_assessment",
+                            "assessment_file": (
+                                BytesIO(json.dumps(package).encode("utf-8")),
+                                "malformed-pricing.json",
+                            ),
+                        },
+                        content_type="multipart/form-data",
+                    )
+
+                    with client.session_transaction() as sess:
+                        after_session = dict(sess)
+                    self.assertEqual(200, response.status_code)
+                    self.assertEqual(before_session, after_session)
+                    self.assertEqual(
+                        before_files,
+                        self._file_tree_bytes(fixture["app_state"].parent),
+                    )
+                    imported_root = (
+                        fixture["downloads"] / "imported_assessments"
+                    )
+                    self.assertFalse(
+                        imported_root.exists() and any(imported_root.iterdir())
+                    )
+
+    def test_valid_pricing_materialization_roundtrips_loader_lookup(self) -> None:
+        with isolated_portability_client() as fixture:
+            package = valid_package()
+
+            response = fixture["client"].post(
+                "/",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(
+                            portability.dumps_portable_package(package).encode(
+                                "utf-8"
+                            )
+                        ),
+                        "valid-pricing.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+
+            with fixture["client"].session_transaction() as sess:
+                imported_path = str(sess.get("selected_pricelist_file", ""))
+                imported_currency = str(sess.get("selected_currency", ""))
+            lookup, loaded_currency, loaded_source = app_module.load_price_lookup(
+                imported_path
+            )
+            materialized = json.loads(Path(imported_path).read_text(encoding="utf-8"))
+
+            self.assertEqual(200, response.status_code)
+            self.assertEqual("EUR", imported_currency)
+            self.assertEqual(
+                {"Compute - Standard - E5 - OCPU": 0.031},
+                lookup,
+            )
+            self.assertEqual("EUR", loaded_currency)
+            self.assertEqual(imported_path, loaded_source)
+            self.assertEqual(package["pricing"]["document"], materialized)
+
+    def test_materialized_pricing_lookup_mismatch_rolls_back(self) -> None:
+        with isolated_portability_client() as fixture:
+            package = valid_package()
+            with fixture["client"].session_transaction() as sess:
+                before_session = copy.deepcopy(dict(sess))
+            before_files = self._file_tree_bytes(fixture["app_state"].parent)
+
+            with patch.object(
+                app_module,
+                "load_price_lookup",
+                return_value=({}, "", ""),
+            ):
+                response = fixture["client"].post(
+                    "/",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(package).encode(
+                                    "utf-8"
+                                )
+                            ),
+                            "lookup-mismatch.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            with fixture["client"].session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"could not be reconstructed exactly", response.data)
+            self.assertEqual(before_session, after_session)
+            self.assertEqual(
+                before_files,
+                self._file_tree_bytes(fixture["app_state"].parent),
+            )
+
     def test_imported_inventory_reload_preserves_every_normalized_field(self) -> None:
         with isolated_portability_client() as fixture:
             assessment, inventory, pricing = valid_sections()

@@ -104,6 +104,13 @@ def _clean_text(value: Any, field: str, *, default: str = "") -> str:
     return value
 
 
+def _clean_required_text(value: Any, field: str) -> str:
+    clean = _clean_text(value, field).strip()
+    if not clean:
+        raise PortableAssessmentError(f"{field} is required.")
+    return clean
+
+
 def _clean_display_filename(value: Any, field: str) -> str:
     clean = _clean_text(value, field).replace("\\", "/").rsplit("/", 1)[-1]
     clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", clean).strip(" ._")
@@ -147,6 +154,19 @@ def _clean_vm_number(value: Any, field: str) -> int | float:
         return 0
     else:
         raise PortableAssessmentError(f"{field} must be a number.")
+    if not math.isfinite(number):
+        raise PortableAssessmentError(f"{field} must be a finite number.")
+    if number < 0:
+        raise PortableAssessmentError(f"{field} cannot be negative.")
+    if number > _MAX_NUMBER:
+        raise PortableAssessmentError(f"{field} is too large.")
+    return int(number) if number.is_integer() else number
+
+
+def _clean_price_number(value: Any, field: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PortableAssessmentError(f"{field} must be a JSON number.")
+    number = float(value)
     if not math.isfinite(number):
         raise PortableAssessmentError(f"{field} must be a finite number.")
     if number < 0:
@@ -323,7 +343,10 @@ def _clean_inventory_summary(value: Any) -> dict[str, Any]:
     return cleaned
 
 
-def _clean_pricing_document(value: Any) -> dict[str, Any]:
+def _clean_pricing_document(
+    value: Any,
+    expected_currency: str,
+) -> dict[str, Any]:
     document = _require_mapping(value, "pricing.document")
     cleaned: dict[str, Any] = {}
     if "lastUpdated" in document:
@@ -336,60 +359,76 @@ def _clean_pricing_document(value: Any) -> dict[str, Any]:
     items = document["items"]
     if not isinstance(items, list):
         raise PortableAssessmentError("pricing.document.items must be a JSON array.")
+    if items and not expected_currency:
+        raise PortableAssessmentError(
+            "pricing.currency is required when pricing items are present."
+        )
     cleaned_items: list[dict[str, Any]] = []
     for item_index, raw_item in enumerate(items):
         item = _require_mapping(raw_item, f"pricing.document.items[{item_index}]")
-        clean_item: dict[str, Any] = {}
-        if "displayName" in item:
-            clean_item["displayName"] = _clean_text(
-                item["displayName"],
-                f"pricing.document.items[{item_index}].displayName",
+        display_name_field = f"pricing.document.items[{item_index}].displayName"
+        clean_item: dict[str, Any] = {
+            "displayName": _clean_required_text(
+                item.get("displayName"),
+                display_name_field,
             )
-        if "currencyCodeLocalizations" in item:
-            localizations = item["currencyCodeLocalizations"]
-            if not isinstance(localizations, list):
+        }
+        localizations_field = (
+            f"pricing.document.items[{item_index}].currencyCodeLocalizations"
+        )
+        localizations = item.get("currencyCodeLocalizations")
+        if not isinstance(localizations, list) or not localizations:
+            raise PortableAssessmentError(
+                f"{localizations_field} must be a non-empty JSON array."
+            )
+        clean_localizations: list[dict[str, Any]] = []
+        for localization_index, raw_localization in enumerate(localizations):
+            localization_field = f"{localizations_field}[{localization_index}]"
+            localization = _require_mapping(raw_localization, localization_field)
+            currency_field = f"{localization_field}.currencyCode"
+            currency = _clean_currency(
+                localization.get("currencyCode"),
+                currency_field,
+            )
+            if not currency:
+                raise PortableAssessmentError(f"{currency_field} is required.")
+            if currency != expected_currency:
                 raise PortableAssessmentError(
-                    f"pricing.document.items[{item_index}].currencyCodeLocalizations must be a JSON array."
+                    f"{currency_field} must match pricing.currency."
                 )
-            clean_localizations: list[dict[str, Any]] = []
-            for localization_index, raw_localization in enumerate(localizations):
-                localization = _require_mapping(
-                    raw_localization,
-                    f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}]",
+            prices_field = f"{localization_field}.prices"
+            prices = localization.get("prices")
+            if not isinstance(prices, list) or not prices:
+                raise PortableAssessmentError(
+                    f"{prices_field} must be a non-empty JSON array."
                 )
-                clean_localization: dict[str, Any] = {}
-                if "currencyCode" in localization:
-                    clean_localization["currencyCode"] = _clean_currency(
-                        localization["currencyCode"],
-                        f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].currencyCode",
-                    )
-                if "prices" in localization:
-                    prices = localization["prices"]
-                    if not isinstance(prices, list):
-                        raise PortableAssessmentError(
-                            f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices must be a JSON array."
-                        )
-                    clean_prices: list[dict[str, Any]] = []
-                    for price_index, raw_price in enumerate(prices):
-                        price = _require_mapping(
-                            raw_price,
-                            f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}]",
-                        )
-                        clean_price: dict[str, Any] = {}
-                        if "model" in price:
-                            clean_price["model"] = _clean_text(
-                                price["model"],
-                                f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}].model",
-                            )
-                        if "value" in price:
-                            clean_price["value"] = _clean_vm_number(
-                                price["value"],
-                                f"pricing.document.items[{item_index}].currencyCodeLocalizations[{localization_index}].prices[{price_index}].value",
-                            )
-                        clean_prices.append(clean_price)
-                    clean_localization["prices"] = clean_prices
-                clean_localizations.append(clean_localization)
-            clean_item["currencyCodeLocalizations"] = clean_localizations
+            clean_prices: list[dict[str, Any]] = []
+            for price_index, raw_price in enumerate(prices):
+                price_field = f"{prices_field}[{price_index}]"
+                price = _require_mapping(raw_price, price_field)
+                model_field = f"{price_field}.model"
+                value_field = f"{price_field}.value"
+                if "value" not in price:
+                    raise PortableAssessmentError(f"{value_field} is required.")
+                clean_prices.append(
+                    {
+                        "model": _clean_required_text(
+                            price.get("model"),
+                            model_field,
+                        ),
+                        "value": _clean_price_number(
+                            price["value"],
+                            value_field,
+                        ),
+                    }
+                )
+            clean_localizations.append(
+                {
+                    "currencyCode": currency,
+                    "prices": clean_prices,
+                }
+            )
+        clean_item["currencyCodeLocalizations"] = clean_localizations
         cleaned_items.append(clean_item)
     cleaned["items"] = cleaned_items
     return cleaned
@@ -520,12 +559,13 @@ def _clean_pricing(value: Any) -> dict[str, Any]:
     else:
         document = {}
     _require_mapping(document, "pricing.document")
-    clean_document = _clean_pricing_document(document)
+    currency = _clean_currency(
+        pricing.get("currency", ""),
+        "pricing.currency",
+    )
+    clean_document = _clean_pricing_document(document, currency)
     return {
-        "currency": _clean_currency(
-            pricing.get("currency", ""),
-            "pricing.currency",
-        ),
+        "currency": currency,
         "source_file_name": _clean_display_filename(
             pricing.get("source_file_name", ""),
             "pricing.source_file_name",
