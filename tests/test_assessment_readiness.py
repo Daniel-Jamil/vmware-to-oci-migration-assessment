@@ -1,4 +1,6 @@
 import copy
+import html as html_lib
+import re
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -7,6 +9,19 @@ from unittest.mock import patch
 
 import app as app_module
 from assessment_readiness import build_assessment_readiness
+from werkzeug.datastructures import MultiDict
+
+
+def visible_page_text(markup: str) -> str:
+    without_assets = re.sub(
+        r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>",
+        " ",
+        markup,
+        flags=re.I | re.S,
+    )
+    return " ".join(
+        html_lib.unescape(re.sub(r"<[^>]+>", " ", without_assets)).split()
+    )
 
 
 def complete_context() -> dict:
@@ -259,7 +274,7 @@ def configure_all_native_hybrid(inputs: dict) -> None:
 
 
 @contextmanager
-def current_step4_client():
+def current_step4_client(vcf_price_per_core_yearly: float = 400.0):
     inventory_rows = copy.deepcopy(current_adapter_inputs()["inventory_rows"][:2])
     state = app_module._default_app_state()
     state["selected_vm_names"] = ["app-01", "legacy-01"]
@@ -268,7 +283,7 @@ def current_step4_client():
         "legacy-01": "ocvs",
     }
     state["acknowledged_warning_ids"] = ["unsupported-native"]
-    state["step4_vmware_license_price_per_core_yearly"] = 400.0
+    state["step4_vmware_license_price_per_core_yearly"] = vcf_price_per_core_yearly
 
     price_lookup: dict[str, float] = {
         "Storage - Block Volume - Storage": 0.02,
@@ -542,6 +557,201 @@ class ReadinessTests(unittest.TestCase):
             with client.session_transaction() as sess:
                 self.assertNotIn("_step4_unsaved_scenario_changes", sess)
             response.close()
+
+    def test_results_page_keeps_incomplete_scenarios_visible_and_unranked(self) -> None:
+        with current_step4_client(vcf_price_per_core_yearly=0.0) as (client, _state):
+            response = client.get("/step4?tab=price")
+
+        self.assertEqual(200, response.status_code)
+        html = response.data.decode("utf-8", errors="replace")
+        self.assertIn('data-results-comparison', html)
+        self.assertIn('data-overall-readiness="draft_review_required"', html)
+        self.assertEqual(3, html.count('data-result-scenario="'))
+        self.assertEqual(3, html.count("Technical eligibility"))
+        self.assertEqual(3, html.count("Pricing completeness"))
+        self.assertEqual(3, html.count("Modeled cost"))
+        for label in (
+            "Monthly",
+            "Annual",
+            "3-year",
+            "Cost per VM",
+            "Placement split",
+            "Assumptions and sizing",
+            "Benefits",
+            "Trade-offs",
+            "Remediation requirements",
+        ):
+            self.assertIn(label, html)
+        self.assertGreaterEqual(html.count("Incomplete pricing"), 2)
+        self.assertGreaterEqual(html.count("Partial modeled amount"), 2)
+        self.assertEqual(1, html.count("Lowest complete modeled price"))
+        self.assertNotRegex(
+            visible_page_text(html).lower(),
+            r"\b(medal|winner|best|recommended)\b",
+        )
+        self.assertIn('name="recommendation"', html)
+        for value in ("native", "ocvs", "hybrid", ""):
+            self.assertIn(f'value="{value}"', html)
+        self.assertIn("No recommendation yet", html)
+        self.assertIn('name="recommendation_rationale"', html)
+        self.assertIn('maxlength="4000"', html)
+        self.assertIn("Save assessment", html)
+        self.assertIn("Excel Export Draft", html)
+        self.assertNotIn("export_json", html)
+        self.assertNotIn("Portable JSON", html)
+
+    def test_recommendation_save_persists_incomplete_selection_and_rationale(self) -> None:
+        rationale = "Retain the legacy workload on OCVS during the first migration wave."
+        with current_step4_client(vcf_price_per_core_yearly=0.0) as (client, state):
+            response = client.post(
+                "/step4",
+                data={
+                    "action": "save_recommendation",
+                    "recommendation": "ocvs",
+                    "recommendation_rationale": rationale,
+                },
+                follow_redirects=False,
+            )
+
+            self.assertEqual(303, response.status_code)
+            self.assertTrue(response.headers.get("Location", "").endswith("/step4?tab=price"))
+            self.assertEqual("ocvs", state["assessor_recommendation"])
+            self.assertEqual(rationale, state["assessor_recommendation_rationale"])
+
+            reloaded = client.get("/step4?tab=price")
+
+        html = reloaded.data.decode("utf-8", errors="replace")
+        self.assertRegex(html, r'value="ocvs"\s+checked')
+        self.assertIn(rationale, html)
+        self.assertIn("Incomplete pricing", html)
+        self.assertIn("Excel Export Draft", html)
+
+    def test_recommendation_submission_rejects_invalid_payloads_transactionally(self) -> None:
+        invalid_forms = {
+            "duplicate action": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("action", "save_recommendation"),
+                    ("recommendation", "native"),
+                    ("recommendation_rationale", "Documented."),
+                ]
+            ),
+            "duplicate recommendation": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation", "native"),
+                    ("recommendation", "ocvs"),
+                    ("recommendation_rationale", "Documented."),
+                ]
+            ),
+            "duplicate rationale": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation", "native"),
+                    ("recommendation_rationale", "First"),
+                    ("recommendation_rationale", "Second"),
+                ]
+            ),
+            "missing recommendation": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation_rationale", "Documented."),
+                ]
+            ),
+            "invalid recommendation": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation", "automatic"),
+                    ("recommendation_rationale", "Documented."),
+                ]
+            ),
+            "oversized rationale": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation", "native"),
+                    ("recommendation_rationale", "x" * 4001),
+                ]
+            ),
+            "unknown field": MultiDict(
+                [
+                    ("action", "save_recommendation"),
+                    ("recommendation", "native"),
+                    ("recommendation_rationale", "Documented."),
+                    ("automatic_choice", "ocvs"),
+                ]
+            ),
+            "unknown action": MultiDict(
+                [
+                    ("action", "choose_winner"),
+                    ("recommendation", "native"),
+                    ("recommendation_rationale", "Documented."),
+                ]
+            ),
+        }
+
+        with current_step4_client() as (client, state):
+            prior_state = copy.deepcopy(state)
+            for label, form in invalid_forms.items():
+                with self.subTest(label=label):
+                    response = client.post(
+                        "/step4",
+                        data=form,
+                        follow_redirects=False,
+                    )
+                    self.assertIn(response.status_code, {302, 303})
+                    self.assertEqual(prior_state, state)
+
+    def test_recommendation_persistence_failure_keeps_prior_state(self) -> None:
+        with current_step4_client() as (client, state), patch.object(
+            app_module,
+            "save_app_state",
+            side_effect=OSError("injected recommendation persistence failure"),
+        ):
+            prior_state = copy.deepcopy(state)
+            response = client.post(
+                "/step4",
+                data={
+                    "action": "save_recommendation",
+                    "recommendation": "hybrid",
+                    "recommendation_rationale": "Keep both landing zones in draft review.",
+                },
+                follow_redirects=False,
+            )
+
+            self.assertEqual(303, response.status_code)
+            self.assertEqual(prior_state, state)
+            redirected = client.get(response.headers["Location"])
+
+        self.assertIn(b"prior recommendation was kept", redirected.data)
+
+    def test_native_treatment_rationale_enables_customer_ready_excel_label(self) -> None:
+        rationale = "Remediate the legacy guest before placing it on OCI Native."
+        with current_step4_client() as (client, _state):
+            draft_response = client.post(
+                "/step4",
+                data={
+                    "action": "save_recommendation",
+                    "recommendation": "native",
+                    "recommendation_rationale": "",
+                },
+                follow_redirects=True,
+            )
+            self.assertIn(b"Excel Export Draft", draft_response.data)
+
+            ready_response = client.post(
+                "/step4",
+                data={
+                    "action": "save_recommendation",
+                    "recommendation": "native",
+                    "recommendation_rationale": rationale,
+                },
+                follow_redirects=True,
+            )
+
+        self.assertEqual(200, ready_response.status_code)
+        self.assertIn(b"Excel Export Customer-ready", ready_response.data)
+        self.assertIn(rationale.encode(), ready_response.data)
+        self.assertIn(b'role="status"', ready_response.data)
 
     def test_critical_fit_warning_centrally_blocks_customer_ready_export(self) -> None:
         inputs = current_adapter_inputs()

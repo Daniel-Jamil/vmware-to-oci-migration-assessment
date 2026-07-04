@@ -800,6 +800,9 @@
     }
   </style>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/scenarios.css') }}" />
+  {% if active_scenario == 'price' %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/results.css') }}" />
+  {% endif %}
 {% endblock %}
 {% block stage_content %}
   <div class="container">
@@ -826,6 +829,10 @@
     } %}
     <h1 id="step4-main-title">{{ initial_titles.get(active_scenario, 'Migration to OCI Native') }}</h1>
 
+    {% if active_scenario == 'price' %}
+      {% include "_results_comparison.html" %}
+      {% include "_export_center.html" %}
+    {% else %}
     <div class="top-actions">
       {% if active_scenario != 'price' %}
         <div class="workspace-nav" aria-label="Scenario workspace">
@@ -1399,6 +1406,7 @@
       </div>
 
     </div>
+    {% endif %}
   </div>
 {% endblock %}
 {% block scripts %}
@@ -2252,5 +2260,7 @@
       }
     })();
   </script>
-  <script src="{{ url_for('static', filename='js/scenario-editor.js') }}" defer></script>
+  {% if active_scenario != 'price' %}
+    <script src="{{ url_for('static', filename='js/scenario-editor.js') }}" defer></script>
+  {% endif %}
 {% endblock %}

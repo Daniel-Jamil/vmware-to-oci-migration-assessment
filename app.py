@@ -151,6 +151,12 @@ NATIVE_SEARCH_MAX_LENGTH = 200
 STEP4_UNSAVED_READINESS_SESSION_KEY = "_step4_unsaved_scenario_changes"
 STEP4_ALLOWED_ACTIONS = {"save", "export_excel"}
 STEP4_ACTIVE_SCENARIOS = {"native", "ocvs", "hybrid", "price"}
+RESULT_RECOMMENDATION_VALUES = {"", "native", "ocvs", "hybrid"}
+RESULT_RECOMMENDATION_FIELDS = {
+    "action",
+    "recommendation",
+    "recommendation_rationale",
+}
 STEP4_SINGLE_VALUE_FIELDS = {
     "action",
     "active_scenario",
@@ -3055,6 +3061,47 @@ def parse_step4_scalar_submission(form: Any) -> tuple[dict[str, Any], list[str]]
     return parsed, errors
 
 
+def parse_recommendation_submission(form: Any) -> tuple[dict[str, str], list[str]]:
+    """Validate the Results decision form without accepting scenario fields."""
+    parsed = {"recommendation": "", "recommendation_rationale": ""}
+    errors: list[str] = []
+
+    unknown_fields = sorted(set(form.keys()) - RESULT_RECOMMENDATION_FIELDS)
+    if unknown_fields:
+        errors.append("The recommendation form contains unsupported fields.")
+
+    action_values = form.getlist("action")
+    if len(action_values) != 1 or action_values[0] != "save_recommendation":
+        errors.append("Submit exactly one valid recommendation action.")
+
+    recommendation_values = form.getlist("recommendation")
+    if len(recommendation_values) != 1:
+        errors.append("Submit exactly one assessor recommendation.")
+    else:
+        recommendation = str(recommendation_values[0]).strip()
+        if recommendation not in RESULT_RECOMMENDATION_VALUES:
+            errors.append("Choose a valid assessor recommendation.")
+        else:
+            parsed["recommendation"] = recommendation
+
+    rationale_values = form.getlist("recommendation_rationale")
+    if len(rationale_values) != 1:
+        errors.append("Submit exactly one recommendation rationale.")
+    else:
+        rationale = (
+            str(rationale_values[0])
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .strip()
+        )
+        if len(rationale) > 4000:
+            errors.append("Recommendation rationale must be 4,000 characters or fewer.")
+        else:
+            parsed["recommendation_rationale"] = rationale
+
+    return parsed, errors
+
+
 WORKSPACE_STAGE_MAP = {
     "setup": {
         "number": 1,
@@ -5676,6 +5723,207 @@ def build_scenario_view(scenario_id: str, context: dict[str, Any]) -> dict[str, 
     }
 
 
+def build_results_page_context(
+    readiness: dict[str, Any],
+    scenario_views: list[dict[str, Any]],
+    app_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Compose Results display data from readiness and established scenario views."""
+    readiness_scenarios = readiness.get("scenarios", {})
+    if not isinstance(readiness_scenarios, dict):
+        readiness_scenarios = {}
+    views_by_id = {
+        str(view.get("id") or ""): view
+        for view in scenario_views
+        if isinstance(view, dict)
+    }
+    decision_copy = {
+        "native": {
+            "benefits": [
+                "Direct access to OCI-native services and automation.",
+                "Reduces dependency on the VMware operating model.",
+            ],
+            "tradeoffs": [
+                "Guest compatibility and target sizing need workload-level validation.",
+                "Some applications may require remediation before migration.",
+            ],
+            "assumptions": [
+                "Uses the saved OCI shape, OCPU, burst, VPU, licensing, and discount inputs.",
+            ],
+        },
+        "ocvs": {
+            "benefits": [
+                "Preserves VMware tools, skills, and operating patterns.",
+                "Supports migration with fewer guest-level changes.",
+            ],
+            "tradeoffs": [
+                "Retains VMware platform and licensing dependencies.",
+                "Minimum cluster capacity can dominate the modeled run rate.",
+            ],
+            "assumptions": [
+                "Uses the saved node profile, capacity headroom, commitment term, and spare-node inputs.",
+            ],
+        },
+        "hybrid": {
+            "benefits": [
+                "Balances modernization with continuity for higher-risk workloads.",
+                "Supports phased placement decisions across both landing zones.",
+            ],
+            "tradeoffs": [
+                "Requires governance and operations across two target platforms.",
+                "Placement dependencies need validation before migration waves are finalized.",
+            ],
+            "assumptions": [
+                "Uses the saved per-VM placement plan and the same Native and OCVS pricing inputs.",
+            ],
+        },
+    }
+
+    def amount(value: Any, fallback: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return fallback
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        return parsed if math.isfinite(parsed) else fallback
+
+    scenarios: list[dict[str, Any]] = []
+    lowest_complete = str(readiness.get("lowest_complete_scenario") or "")
+    for scenario_id in ("native", "ocvs", "hybrid"):
+        view = views_by_id.get(scenario_id, {})
+        scenario = view.get("scenario", {}) if isinstance(view, dict) else {}
+        if not isinstance(scenario, dict):
+            scenario = {}
+        status = readiness_scenarios.get(scenario_id, {})
+        if not isinstance(status, dict):
+            status = {}
+        copy_values = decision_copy[scenario_id]
+
+        monthly_cost = amount(scenario.get("monthly_cost"))
+        annual_cost = amount(scenario.get("yearly_cost"), monthly_cost * 12)
+        if annual_cost == 0.0 and monthly_cost:
+            annual_cost = monthly_cost * 12
+        pricing_complete = status.get("pricing_state") == "complete"
+        technically_eligible = status.get("technical_eligibility") == "eligible"
+        native_vm_count = int(amount(scenario.get("native_vm_count")))
+        ocvs_vm_count = int(amount(scenario.get("ocvs_vm_count")))
+        affected_names = [
+            str(name)
+            for name in status.get("affected_vm_names", [])
+            if str(name).strip()
+        ] if isinstance(status.get("affected_vm_names", []), list) else []
+
+        remediation_requirements: list[str] = []
+        if affected_names:
+            remediation_requirements.append(
+                f"Review treatment for {len(affected_names):,} unsupported Native VM(s): "
+                + ", ".join(affected_names)
+            )
+        if not pricing_complete:
+            remediation_requirements.append(
+                "Complete the missing pricing inputs before customer-ready use."
+            )
+        if not remediation_requirements:
+            remediation_requirements.append(
+                "No unresolved remediation requirement is recorded for this path."
+            )
+
+        detail_rows = [
+            row
+            for row in view.get("detail_rows", [])
+            if isinstance(row, dict) and str(row.get("label") or "").strip()
+        ] if isinstance(view, dict) else []
+        scenarios.append(
+            {
+                "id": scenario_id,
+                "title": str(view.get("title") or scenario_id.upper()),
+                "intro": (
+                    "Blend OCI Native and OCVS by placing each VM according to readiness, dependencies, and risk."
+                    if scenario_id == "hybrid"
+                    else str(view.get("intro") or "")
+                ),
+                "technical_label": "Eligible" if technically_eligible else "Ineligible",
+                "technical_tone": "ready" if technically_eligible else "blocked",
+                "pricing_label": "Complete pricing" if pricing_complete else "Incomplete pricing",
+                "pricing_tone": "ready" if pricing_complete else "attention",
+                "modeled_cost_label": (
+                    "Complete modeled amount"
+                    if pricing_complete
+                    else "Partial modeled amount"
+                ),
+                "monthly_cost": monthly_cost,
+                "annual_cost": annual_cost,
+                "three_year_cost": monthly_cost * 36,
+                "cost_per_vm": amount(scenario.get("cost_per_vm")),
+                "native_vm_count": native_vm_count,
+                "ocvs_vm_count": ocvs_vm_count,
+                "workload_count": native_vm_count + ocvs_vm_count,
+                "rankable": status.get("rankable") is True,
+                "is_lowest_complete": scenario_id == lowest_complete,
+                "detail_rows": detail_rows,
+                "assumptions": list(copy_values["assumptions"]),
+                "benefits": list(copy_values["benefits"]),
+                "tradeoffs": list(copy_values["tradeoffs"]),
+                "remediation_requirements": remediation_requirements,
+            }
+        )
+
+    overall_state = str(readiness.get("overall_state") or "incomplete")
+    overall_copy = {
+        "customer_ready": (
+            "Customer-ready export",
+            "The selected path and required treatment notes satisfy the current readiness checks.",
+        ),
+        "draft_review_required": (
+            "Draft review required",
+            "Scenario modeling is available for assessor review; record a decision before customer-ready use.",
+        ),
+        "incomplete": (
+            "Assessment incomplete",
+            "Review outstanding setup, inventory, scenario, or pricing requirements.",
+        ),
+    }
+    overall_label, overall_detail = overall_copy.get(
+        overall_state,
+        overall_copy["incomplete"],
+    )
+    recommendation = app_state.get("assessor_recommendation", "")
+    if recommendation not in RESULT_RECOMMENDATION_VALUES:
+        recommendation = ""
+    rationale = app_state.get("assessor_recommendation_rationale", "")
+    if not isinstance(rationale, str):
+        rationale = ""
+
+    return {
+        "overall_state": overall_state,
+        "overall_label": overall_label,
+        "overall_detail": overall_detail,
+        "scenarios": scenarios,
+        "recommendation": recommendation,
+        "rationale": rationale,
+        "recommendation_options": [
+            {"value": "native", "label": "Native"},
+            {"value": "ocvs", "label": "OCVS"},
+            {"value": "hybrid", "label": "Hybrid"},
+            {"value": "", "label": "No recommendation yet"},
+        ],
+        "customer_ready_export": readiness.get("customer_ready_export") is True,
+        "excel_export_label": (
+            "Excel Export Customer-ready"
+            if readiness.get("customer_ready_export") is True
+            else "Excel Export Draft"
+        ),
+        "assessment_name": normalize_assessment_name(
+            session.get("active_assessment_name", "")
+        )
+        or "Untitled assessment",
+        "assessment_notes": normalize_assessment_notes(
+            session.get("active_assessment_notes", "")
+        ),
+    }
+
+
 def _xlsx_currency_format_code(currency_code: str) -> str:
     currency_format_map = {
         "EUR": "€#,##0.00",
@@ -8133,6 +8381,44 @@ def step4() -> str:
         )
         return redirect(url_for("step3"))
 
+    if (
+        request.method == "POST"
+        and "save_recommendation" in request.form.getlist("action")
+    ):
+        recommendation_input, recommendation_errors = parse_recommendation_submission(
+            request.form
+        )
+        if recommendation_errors:
+            flash(
+                f"{recommendation_errors[0]} The prior recommendation was kept.",
+                "error",
+            )
+            return redirect(step4_tab_redirect("price")), 303
+
+        staged_state = copy.deepcopy(app_state)
+        staged_state["assessor_recommendation"] = recommendation_input[
+            "recommendation"
+        ]
+        staged_state["assessor_recommendation_rationale"] = recommendation_input[
+            "recommendation_rationale"
+        ]
+        try:
+            save_app_state(staged_state)
+        except Exception:
+            app.logger.exception("Assessor recommendation persistence failed")
+            try:
+                _write_json_atomically(_state_file_path(), persisted_app_state)
+            except Exception:
+                app.logger.exception("Assessor recommendation rollback failed")
+            flash(
+                "The assessor recommendation could not be saved. The prior recommendation was kept.",
+                "error",
+            )
+            return redirect(step4_tab_redirect("price")), 303
+
+        flash("Assessor recommendation saved.", "success")
+        return redirect(step4_tab_redirect("price")), 303
+
     submitted_hybrid_placements: dict[str, str] | None = None
     submitted_step4_scalars: dict[str, Any] = {}
     if request.method == "POST":
@@ -8854,6 +9140,7 @@ def step4() -> str:
         readiness,
         ocvs_commitment_term,
     )
+    results = build_results_page_context(readiness, scenario_views, app_state)
 
     return render_template(
         "step4.html",
@@ -8909,6 +9196,7 @@ def step4() -> str:
             last_export_file=session.get("last_export_file", ""),
             customer_name=customer_name,
             active_scenario=active_scenario,
+            results=results,
         ),
     )
 

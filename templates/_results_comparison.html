@@ -1,0 +1,191 @@
+<section
+  id="scenario-panel-price"
+  class="results-comparison"
+  aria-label="Results and price comparison"
+  data-results-comparison
+  data-overall-readiness="{{ results.overall_state }}"
+>
+  <header class="results-heading">
+    <div>
+      <p class="results-eyebrow">Assessment results</p>
+      <h2>Migration path comparison</h2>
+      <p>Review technical fit, pricing completeness, and modeled amounts independently before recording the assessor decision.</p>
+    </div>
+    <div class="results-readiness results-readiness--{{ results.overall_state }}" role="status">
+      <span class="results-readiness__indicator" aria-hidden="true"></span>
+      <span>
+        <strong>{{ results.overall_label }}</strong>
+        <small>{{ results.overall_detail }}</small>
+      </span>
+    </div>
+  </header>
+
+  <div class="results-scenario-grid">
+    {% for scenario in results.scenarios %}
+      <article
+        class="result-scenario result-scenario--{{ scenario.id }}"
+        data-result-scenario="{{ scenario.id }}"
+        data-rankable="{{ 'true' if scenario.rankable else 'false' }}"
+      >
+        <header class="result-scenario__heading">
+          <div>
+            <p class="result-scenario__path">Migration path</p>
+            <h2>{{ scenario.title }}</h2>
+          </div>
+          {% if scenario.is_lowest_complete %}
+            <span class="result-scenario__price-label">Lowest complete modeled price</span>
+          {% endif %}
+        </header>
+        <p class="result-scenario__intro">{{ scenario.intro }}</p>
+
+        <dl class="result-status-grid">
+          <div>
+            <dt>Technical eligibility</dt>
+            <dd class="result-status result-status--{{ scenario.technical_tone }}">
+              <span aria-hidden="true"></span>{{ scenario.technical_label }}
+            </dd>
+          </div>
+          <div>
+            <dt>Pricing completeness</dt>
+            <dd class="result-status result-status--{{ scenario.pricing_tone }}">
+              <span aria-hidden="true"></span>{{ scenario.pricing_label }}
+            </dd>
+          </div>
+          <div>
+            <dt>Modeled cost</dt>
+            <dd>{{ scenario.modeled_cost_label }}</dd>
+          </div>
+        </dl>
+
+        <dl class="result-cost-grid">
+          <div>
+            <dt>Monthly</dt>
+            <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(scenario.monthly_cost) }}</dd>
+          </div>
+          <div>
+            <dt>Annual</dt>
+            <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(scenario.annual_cost) }}</dd>
+          </div>
+          <div>
+            <dt>3-year</dt>
+            <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(scenario.three_year_cost) }}</dd>
+          </div>
+          <div>
+            <dt>Cost per VM</dt>
+            <dd>{{ pricing_symbol }}{{ "{:,.0f}".format(scenario.cost_per_vm) }}</dd>
+          </div>
+        </dl>
+
+        <section class="result-detail-section" aria-labelledby="result-{{ scenario.id }}-placement">
+          <h3 id="result-{{ scenario.id }}-placement">Placement split</h3>
+          <div class="result-placement">
+            <span><strong>{{ "{:,}".format(scenario.native_vm_count) }}</strong> Native</span>
+            <span><strong>{{ "{:,}".format(scenario.ocvs_vm_count) }}</strong> OCVS</span>
+            <span><strong>{{ "{:,}".format(scenario.workload_count) }}</strong> Total VMs</span>
+          </div>
+        </section>
+
+        <section class="result-detail-section" aria-labelledby="result-{{ scenario.id }}-assumptions">
+          <h3 id="result-{{ scenario.id }}-assumptions">Assumptions and sizing</h3>
+          <ul class="result-detail-list">
+            {% for assumption in scenario.assumptions %}
+              <li>{{ assumption }}</li>
+            {% endfor %}
+          </ul>
+          <dl class="result-sizing-list">
+            {% for row in scenario.detail_rows %}
+              <div>
+                <dt>{{ row.label }}</dt>
+                <dd>
+                  {% if row.kind == 'money' %}
+                    {{ pricing_symbol }}{{ "{:,.0f}".format(row.value) }}
+                  {% else %}
+                    {{ row.value }}
+                  {% endif %}
+                </dd>
+              </div>
+            {% endfor %}
+          </dl>
+        </section>
+
+        <div class="result-decision-grid">
+          <section class="result-detail-section" aria-labelledby="result-{{ scenario.id }}-benefits">
+            <h3 id="result-{{ scenario.id }}-benefits">Benefits</h3>
+            <ul class="result-detail-list">
+              {% for benefit in scenario.benefits %}<li>{{ benefit }}</li>{% endfor %}
+            </ul>
+          </section>
+          <section class="result-detail-section" aria-labelledby="result-{{ scenario.id }}-tradeoffs">
+            <h3 id="result-{{ scenario.id }}-tradeoffs">Trade-offs</h3>
+            <ul class="result-detail-list">
+              {% for tradeoff in scenario.tradeoffs %}<li>{{ tradeoff }}</li>{% endfor %}
+            </ul>
+          </section>
+        </div>
+
+        <section class="result-detail-section result-detail-section--remediation" aria-labelledby="result-{{ scenario.id }}-remediation">
+          <h3 id="result-{{ scenario.id }}-remediation">Remediation requirements</h3>
+          <ul class="result-detail-list">
+            {% for requirement in scenario.remediation_requirements %}<li>{{ requirement }}</li>{% endfor %}
+          </ul>
+        </section>
+      </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="results-recommendation" aria-labelledby="assessor-recommendation-title">
+  <div class="results-recommendation__heading">
+    <div>
+      <p class="results-eyebrow">Assessor decision</p>
+      <h2 id="assessor-recommendation-title">Assessor recommendation</h2>
+    </div>
+    <p>Incomplete paths remain available for internal draft review.</p>
+  </div>
+
+  <form method="post" action="{{ url_for('step4') }}" class="recommendation-form" novalidate>
+    <input type="hidden" name="action" value="save_recommendation" />
+    <fieldset>
+      <legend>Migration path</legend>
+      <div class="recommendation-options">
+        {% for option in results.recommendation_options %}
+          {% set option_id = 'recommendation-none' if option.value == '' else 'recommendation-' ~ option.value %}
+          <label class="recommendation-option" for="{{ option_id }}">
+            <input
+              id="{{ option_id }}"
+              type="radio"
+              name="recommendation"
+              value="{{ option.value }}"
+              {% if results.recommendation == option.value %}checked{% endif %}
+            />
+            <span>{{ option.label }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    <label class="recommendation-rationale" for="recommendation-rationale">
+      <span>Rationale</span>
+      <textarea
+        id="recommendation-rationale"
+        name="recommendation_rationale"
+        rows="5"
+        maxlength="4000"
+        aria-describedby="recommendation-rationale-help recommendation-errors"
+      >{{ results.rationale }}</textarea>
+      <small id="recommendation-rationale-help">Required for customer-ready Native treatment when unsupported VMs remain in scope. Maximum 4,000 characters.</small>
+    </label>
+    <div id="recommendation-errors" class="recommendation-errors" role="status" aria-live="polite"></div>
+
+    {% if results.rationale %}
+      <div class="recommendation-recorded">
+        <strong>Recorded rationale</strong>
+        <p>{{ results.rationale }}</p>
+      </div>
+    {% endif %}
+
+    <div class="recommendation-actions">
+      <button type="submit">Save recommendation</button>
+    </div>
+  </form>
+</section>

@@ -1,0 +1,31 @@
+<section
+  class="results-export"
+  aria-labelledby="results-export-title"
+  data-customer-ready-export="{{ 'true' if results.customer_ready_export else 'false' }}"
+>
+  <header class="results-export__heading">
+    <div>
+      <p class="results-eyebrow">Export center</p>
+      <h2 id="results-export-title">Save and export</h2>
+    </div>
+    <span class="results-export__state">
+      {{ "Customer-ready" if results.customer_ready_export else "Draft" }}
+    </span>
+  </header>
+  <p class="results-export__note">
+    The Excel workbook remains available while pricing is incomplete. Its label reflects the current readiness state.
+  </p>
+  <div class="results-export__actions">
+    <form method="post" action="{{ url_for('index') }}">
+      <input type="hidden" name="action" value="save_assessment" />
+      <input type="hidden" name="assessment_name" value="{{ results.assessment_name }}" />
+      <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
+      <button type="submit" class="results-button results-button--secondary">Save assessment</button>
+    </form>
+    <form method="post" action="{{ url_for('step4') }}">
+      <input type="hidden" name="action" value="export_excel" />
+      <input type="hidden" name="active_scenario" value="price" />
+      <button type="submit" class="results-button">{{ results.excel_export_label }}</button>
+    </form>
+  </div>
+</section>

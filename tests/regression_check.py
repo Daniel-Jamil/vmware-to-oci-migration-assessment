@@ -3433,6 +3433,217 @@ def validate_task7_native_scenario_workspace() -> None:
         and 'aria-labelledby="scenario-tab-price"' not in price_html
         and 'aria-label="Results and price comparison"' in price_html,
     )
+    check(
+        "Task 9 Results exposes explicit status cost and decision fields",
+        'data-results-comparison' in price_html
+        and 'data-overall-readiness="draft_review_required"' in price_html
+        and price_html.count('data-result-scenario="') == 3
+        and price_html.count("Technical eligibility") == 3
+        and price_html.count("Pricing completeness") == 3
+        and price_html.count("Modeled cost") == 3
+        and all(
+            label in price_html
+            for label in (
+                "Monthly",
+                "Annual",
+                "3-year",
+                "Cost per VM",
+                "Placement split",
+                "Assumptions and sizing",
+                "Benefits",
+                "Trade-offs",
+                "Remediation requirements",
+            )
+        ),
+    )
+    check(
+        "Task 9 incomplete scenarios remain visible but cannot receive the low-price label",
+        price_html.count("Incomplete pricing") >= 2
+        and price_html.count("Partial modeled amount") >= 2
+        and price_html.count("Lowest complete modeled price") == 1
+        and re.search(r"data-result-scenario=\"native\".*?Lowest complete modeled price", price_html, re.S)
+        is not None
+        and re.search(r"data-result-scenario=\"ocvs\".*?Incomplete pricing", price_html, re.S)
+        is not None
+        and re.search(r"data-result-scenario=\"hybrid\".*?Incomplete pricing", price_html, re.S)
+        is not None,
+    )
+    check(
+        "Task 9 Results has no automatic choice or medal language",
+        re.search(
+            r"\b(medal|winner|best|recommended)\b",
+            visible_text_outside_details(price_response.data),
+            re.I,
+        )
+        is None
+        and "Rank 1" not in price_html
+        and "automatic recommendation" not in price_html.lower(),
+    )
+    check(
+        "Task 9 recommendation and draft export controls are explicit and accessible",
+        'name="recommendation"' in price_html
+        and all(f'value="{value}"' in price_html for value in ("native", "ocvs", "hybrid", ""))
+        and "No recommendation yet" in price_html
+        and 'name="recommendation_rationale"' in price_html
+        and 'maxlength="4000"' in price_html
+        and 'aria-live="polite"' in price_html
+        and 'value="save_assessment"' in price_html
+        and 'value="export_excel"' in price_html
+        and "Excel Export Draft" in price_html
+        and "export_json" not in price_html
+        and "Portable JSON" not in price_html,
+    )
+
+    task9_rationale = "Keep the OCVS path available while VCF pricing is confirmed."
+    recommendation_response = client.post(
+        "/step4",
+        data={
+            "action": "save_recommendation",
+            "recommendation": "ocvs",
+            "recommendation_rationale": task9_rationale,
+        },
+        follow_redirects=False,
+    )
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        recommendation_state = app_module.load_app_state()
+    recommendation_reload = client.get("/step4?tab=price")
+    recommendation_html = recommendation_reload.data.decode("utf-8", errors="replace")
+    check(
+        "Task 9 persists an incomplete-scenario draft recommendation through reload",
+        recommendation_response.status_code == 303
+        and recommendation_response.headers.get("Location", "").endswith("/step4?tab=price")
+        and recommendation_state.get("assessor_recommendation") == "ocvs"
+        and recommendation_state.get("assessor_recommendation_rationale") == task9_rationale
+        and re.search(r'value="ocvs"\s+checked', recommendation_html) is not None
+        and task9_rationale in recommendation_html
+        and "Incomplete pricing" in recommendation_html,
+        f"status={recommendation_response.status_code}, state={recommendation_state}",
+    )
+
+    invalid_recommendation_forms = {
+        "duplicate recommendation": MultiDict(
+            [
+                ("action", "save_recommendation"),
+                ("recommendation", "native"),
+                ("recommendation", "hybrid"),
+                ("recommendation_rationale", "Documented."),
+            ]
+        ),
+        "oversized rationale": MultiDict(
+            [
+                ("action", "save_recommendation"),
+                ("recommendation", "native"),
+                ("recommendation_rationale", "x" * 4001),
+            ]
+        ),
+        "unknown field": MultiDict(
+            [
+                ("action", "save_recommendation"),
+                ("recommendation", "native"),
+                ("recommendation_rationale", "Documented."),
+                ("winner", "native"),
+            ]
+        ),
+    }
+    invalid_results: list[tuple[str, bool]] = []
+    for label, form in invalid_recommendation_forms.items():
+        before_state_bytes, before_snapshot_bytes = persistence_bytes()
+        invalid_response = client.post("/step4", data=form, follow_redirects=False)
+        after_state_bytes, after_snapshot_bytes = persistence_bytes()
+        invalid_results.append(
+            (
+                label,
+                invalid_response.status_code == 303
+                and invalid_response.headers.get("Location", "").endswith("/step4?tab=price")
+                and after_state_bytes == before_state_bytes
+                and after_snapshot_bytes == before_snapshot_bytes,
+            )
+        )
+    check(
+        "Task 9 rejects duplicate oversized and unknown recommendation fields transactionally",
+        all(passed for _label, passed in invalid_results),
+        str(invalid_results),
+    )
+
+    saved_response = client.post(
+        "/",
+        data={
+            "action": "save_assessment",
+            "assessment_name": "Task 9 Results Snapshot",
+            "assessment_notes": "Recommendation persistence regression.",
+        },
+        follow_redirects=True,
+    )
+    saved_results = next(
+        item
+        for item in app_module.list_saved_assessments()
+        if item.get("name") == "Task 9 Results Snapshot"
+    )
+    saved_results_id = str(saved_results["id"])
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        mutated_recommendation_state = app_module.load_app_state()
+        mutated_recommendation_state["assessor_recommendation"] = "hybrid"
+        mutated_recommendation_state["assessor_recommendation_rationale"] = "Mutated after save."
+        app_module.save_app_state(mutated_recommendation_state)
+    loaded_response = client.post(
+        "/",
+        data={"action": "load_assessment", "assessment_id": saved_results_id},
+        follow_redirects=True,
+    )
+    with client.session_transaction() as sess:
+        restored_state_id = str(sess.get("state_id", ""))
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = restored_state_id
+        restored_recommendation_state = app_module.load_app_state()
+    check(
+        "Task 9 recommendation survives local assessment save and load",
+        saved_response.status_code == 200
+        and loaded_response.status_code == 200
+        and restored_recommendation_state.get("assessor_recommendation") == "ocvs"
+        and restored_recommendation_state.get("assessor_recommendation_rationale") == task9_rationale,
+        str(restored_recommendation_state),
+    )
+    client.post(
+        "/",
+        data={"action": "delete_assessment", "assessment_id": saved_results_id},
+        follow_redirects=True,
+    )
+    app_module.save_preferences({})
+
+    positive_vcf_response = client.post(
+        "/step4",
+        data={
+            "action": "save",
+            "active_scenario": "ocvs",
+            "vmware_license_price_per_core_yearly": "400",
+        },
+        follow_redirects=False,
+    )
+    native_rationale = "Remediate unsupported guests before Native placement."
+    ready_recommendation = client.post(
+        "/step4",
+        data={
+            "action": "save_recommendation",
+            "recommendation": "native",
+            "recommendation_rationale": native_rationale,
+        },
+        follow_redirects=True,
+    )
+    ready_html = ready_recommendation.data.decode("utf-8", errors="replace")
+    ready_ids = re.findall(r'\bid="([^"]+)"', ready_html)
+    check(
+        "Task 9 Native treatment unlocks only the customer-ready export label",
+        positive_vcf_response.status_code in {302, 303}
+        and ready_recommendation.status_code == 200
+        and "Excel Export Customer-ready" in ready_html
+        and native_rationale in ready_html
+        and 'data-result-scenario="native"' in ready_html
+        and "Technical eligibility" in ready_html
+        and len(ready_ids) == len(set(ready_ids)),
+        f"positive={positive_vcf_response.status_code}, duplicates={len(ready_ids) - len(set(ready_ids))}",
+    )
 
     step4_source = (ROOT / "templates" / "step4.html").read_text(encoding="utf-8")
     header_partial_path = ROOT / "templates" / "_scenario_header.html"
@@ -3441,6 +3652,22 @@ def validate_task7_native_scenario_workspace() -> None:
     scenario_js_path = ROOT / "static" / "js" / "scenario-editor.js"
     scenarios_css = scenarios_css_path.read_text(encoding="utf-8") if scenarios_css_path.exists() else ""
     scenario_js = scenario_js_path.read_text(encoding="utf-8") if scenario_js_path.exists() else ""
+    results_partial_path = ROOT / "templates" / "_results_comparison.html"
+    export_partial_path = ROOT / "templates" / "_export_center.html"
+    results_css_path = ROOT / "static" / "css" / "results.css"
+    results_css = results_css_path.read_text(encoding="utf-8") if results_css_path.exists() else ""
+    check(
+        "Task 9 Results uses dedicated partials and responsive non-gradient styling",
+        results_partial_path.exists()
+        and export_partial_path.exists()
+        and results_css_path.exists()
+        and '{% include "_results_comparison.html" %}' in step4_source
+        and '{% include "_export_center.html" %}' in step4_source
+        and "css/results.css" in step4_source
+        and "gradient" not in results_css.lower()
+        and "@media (max-width: 640px)" in results_css
+        and "minmax(0, 1fr)" in results_css,
+    )
     check(
         "Stage 3 uses scenario header and Native content partials with conventional assets",
         header_partial_path.exists()
@@ -4511,21 +4738,40 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
         ]:
             response = client.get(route, follow_redirects=True)
             check(f"{route} panel renders", response.status_code == 200 and panel_id in response.data)
-            check(f"{route} controls render", b"Save Settings" in response.data and b"Export to Excel" in response.data)
-            check(
-                f"{route} export status UI renders",
-                b'id="export-status"' in response.data
-                and b"Excel export created:" in response.data
-                and b"Open file" in response.data,
-            )
+            is_results_route = route == "/step5"
+            if is_results_route:
+                check(
+                    f"{route} controls render",
+                    b"Save recommendation" in response.data
+                    and b"Save assessment" in response.data
+                    and b"Excel Export Draft" in response.data,
+                )
+                check(
+                    f"{route} export status UI renders",
+                    b'data-customer-ready-export="false"' in response.data,
+                )
+            else:
+                check(
+                    f"{route} controls render",
+                    b"Save Settings" in response.data
+                    and b"Export to Excel" in response.data,
+                )
+                check(
+                    f"{route} export status UI renders",
+                    b'id="export-status"' in response.data
+                    and b"Excel export created:" in response.data
+                    and b"Open file" in response.data,
+                )
             check(f"{route} has no JSON export", b"Export to JSON" not in response.data and b"Export to Json" not in response.data)
             response_text = response.data.decode("utf-8", errors="ignore")
+            cost_pattern = (
+                r"<dt>Cost per VM</dt>\s*<dd>\s*([^<]+?)\s*</dd>"
+                if is_results_route
+                else r"<span>Cost / VM / month</span>\s*<strong[^>]*>\s*([^<]+?)\s*</strong>"
+            )
             scenario_cost_per_vm_values = [
                 float(re.sub(r"[^0-9.]", "", value) or 0)
-                for value in re.findall(
-                    r"<span>Cost / VM / month</span>\s*<strong[^>]*>\s*([^<]+?)\s*</strong>",
-                    response_text,
-                )
+                for value in re.findall(cost_pattern, response_text)
             ]
             check(
                 f"{route} scenario cost per VM populated",
