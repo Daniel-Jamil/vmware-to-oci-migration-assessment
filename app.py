@@ -8,12 +8,13 @@ import hashlib
 import math
 import io
 import re
+import shutil
 import subprocess
 import sys
 import zipfile
 import ssl
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -28,6 +29,13 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from assessment_readiness import build_assessment_readiness
+from assessment_portability import (
+    MAX_PACKAGE_BYTES,
+    PortableAssessmentError,
+    build_portable_package,
+    dumps_portable_package,
+    validate_portable_package,
+)
 
 
 def _first_env(*names: str) -> str | None:
@@ -533,6 +541,29 @@ def _write_json_atomically(file_path: Path, payload: Any) -> None:
             app.logger.exception("Temporary JSON cleanup failed")
 
 
+def _read_optional_file_bytes(file_path: Path) -> tuple[bool, bytes]:
+    if not file_path.exists():
+        return False, b""
+    return True, file_path.read_bytes()
+
+
+def _restore_optional_file_bytes(
+    file_path: Path,
+    prior_value: tuple[bool, bytes],
+) -> None:
+    existed, payload = prior_value
+    if not existed:
+        file_path.unlink(missing_ok=True)
+        return
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file = file_path.with_name(f".{file_path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary_file.write_bytes(payload)
+        os.replace(temporary_file, file_path)
+    finally:
+        temporary_file.unlink(missing_ok=True)
+
+
 def load_preferences() -> dict[str, Any]:
     preferences_file = _preferences_file_path()
     if not preferences_file.exists():
@@ -976,6 +1007,284 @@ def delete_saved_assessment(assessment_id: Any) -> dict[str, Any]:
     return {"ok": True, "message": "Assessment deleted.", "name": assessment_name}
 
 
+def build_current_portable_assessment(
+    assessment_name: Any,
+    assessment_notes: Any,
+) -> tuple[dict[str, Any], str]:
+    """Build a path-free package from the current server-side workspace."""
+    active_id = _clean_assessment_id(session.get("active_assessment_id", ""))
+    if active_id:
+        snapshot = save_current_assessment(assessment_name, assessment_notes)
+    else:
+        snapshot = build_saved_assessment_snapshot(
+            assessment_name,
+            assessment_notes,
+        )
+
+    selected_inventory = str(snapshot.get("selected_rvtools_file") or "").strip()
+    inventory_rows: list[dict[str, Any]] = []
+    inventory_source = ""
+    if selected_inventory:
+        try:
+            inventory_rows, inventory_source = load_vms_from_vinfo(selected_inventory)
+        except Exception as exc:
+            raise PortableAssessmentError(
+                "The selected inventory could not be read for portable export."
+            ) from exc
+
+    selected_pricing = str(snapshot.get("selected_pricelist_file") or "").strip()
+    pricing_document: dict[str, Any] = {}
+    if selected_pricing:
+        try:
+            loaded_pricing = json.loads(Path(selected_pricing).read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise PortableAssessmentError(
+                "The selected OCI price list could not be read for portable export."
+            ) from exc
+        if not isinstance(loaded_pricing, dict):
+            raise PortableAssessmentError(
+                "The selected OCI price list is not a valid JSON object."
+            )
+        pricing_document = loaded_pricing
+
+    exported_at = datetime.now(timezone.utc)
+    package = build_portable_package(
+        snapshot,
+        {
+            "source_file_name": secure_filename(Path(selected_inventory).name)
+            if selected_inventory
+            else "",
+            "source_label": (
+                inventory_source.rsplit("::", 1)[-1]
+                if "::" in inventory_source
+                else ("Normalized VM inventory" if inventory_rows else "")
+            ),
+            "import_summary": (
+                build_inventory_import_summary(inventory_rows, "Portable inventory")
+                if inventory_rows
+                else {}
+            ),
+            "rows": inventory_rows,
+        },
+        {
+            "currency": str(snapshot.get("selected_currency") or "").upper().strip(),
+            "source_file_name": secure_filename(Path(selected_pricing).name)
+            if selected_pricing
+            else "",
+            "document": pricing_document,
+        },
+        exported_at=exported_at.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        source={
+            "assessment_id": active_id,
+            "application_schema_version": SAVED_ASSESSMENT_SCHEMA_VERSION,
+        },
+    )
+    filename = build_export_filename(
+        str(package["assessment"].get("name") or "assessment"),
+        "portable_assessment",
+        "json",
+        exported_at.strftime("%Y%m%d_%H%M%S"),
+    )
+    return package, filename
+
+
+def _next_imported_assessment_name(value: Any) -> str:
+    base_name = normalize_assessment_name(value) or "Imported assessment"
+    existing_names = {
+        str(item.get("name") or "").strip().casefold()
+        for item in list_saved_assessments()
+    }
+    if base_name.casefold() not in existing_names:
+        return base_name
+    suffix_index = 2
+    while True:
+        suffix = f" (Imported {suffix_index})"
+        candidate = f"{base_name[: max(1, 120 - len(suffix))].rstrip()}{suffix}"
+        if candidate.casefold() not in existing_names:
+            return candidate
+        suffix_index += 1
+
+
+def _write_imported_inventory(
+    file_path: Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    headers = [
+        "VM",
+        "Powerstate",
+        "Template",
+        "OS according to the configuration file",
+        "CPUs",
+        "Memory",
+        "Provisioned MiB",
+    ]
+    temporary_file = file_path.with_name(f".{file_path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary_file.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for row in rows:
+                power_state = str(row.get("power_state") or "").strip().lower()
+                serialized_power = (
+                    "poweredOn"
+                    if power_state == "on"
+                    else ("" if power_state == "unknown" else "poweredOff")
+                )
+                writer.writerow(
+                    [
+                        str(row.get("name") or ""),
+                        serialized_power,
+                        "False",
+                        str(row.get("raw_os") or row.get("mapped_os") or ""),
+                        row.get("cpus", 0),
+                        row.get("memory_mb", 0),
+                        row.get("provisioned_mib", 0),
+                    ]
+                )
+        os.replace(temporary_file, file_path)
+    finally:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("Imported inventory temporary file cleanup failed")
+
+
+def import_portable_assessment(package: Any) -> dict[str, Any]:
+    """Materialize and load a validated package as a new local assessment."""
+    validated = validate_portable_package(package)
+    assessment = validated["assessment"]
+    inventory = validated["inventory"]
+    pricing = validated["pricing"]
+    imported_name = _next_imported_assessment_name(assessment.get("name"))
+    assessment_id = _new_assessment_id(imported_name)
+    import_dir = DOWNLOADS_DIR / "imported_assessments" / assessment_id
+    inventory_file = import_dir / "normalized_inventory.csv"
+    currency = str(
+        assessment.get("selected_currency") or pricing.get("currency") or ""
+    ).upper().strip()
+    pricing_file = import_dir / (
+        f"oci_pricing_{currency or 'imported'}_portable.json"
+    )
+    snapshot_file = _saved_assessment_file_path(assessment_id)
+    if snapshot_file is None:
+        raise PortableAssessmentError("A new local assessment id could not be created.")
+
+    prior_session = copy.deepcopy(dict(session))
+    prior_state_id = str(prior_session.get("state_id") or "").strip()
+    prior_state_file = (
+        APP_STATE_DIR / f"{prior_state_id}.json" if prior_state_id else None
+    )
+    prior_step4_file = (
+        APP_STATE_DIR / f"{prior_state_id}_step4_snapshot.json"
+        if prior_state_id
+        else None
+    )
+    prior_preferences_file = APP_STATE_DIR / "preferences.json"
+    prior_persistence = {
+        path: _read_optional_file_bytes(path)
+        for path in (prior_state_file, prior_step4_file, prior_preferences_file)
+        if path is not None
+    }
+
+    rows = list(inventory.get("rows") or [])
+    pricing_document = dict(pricing.get("document") or {})
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        import_dir.mkdir(parents=True, exist_ok=False)
+        _write_imported_inventory(inventory_file, rows)
+        _write_json_atomically(pricing_file, pricing_document)
+
+        generated_rows: list[dict[str, Any]] = []
+        generated_source = ""
+        if rows:
+            generated_rows, generated_source = load_vms_from_vinfo(
+                str(inventory_file).replace("\\", "/")
+            )
+            expected_names = [str(row.get("name") or "") for row in rows]
+            generated_names = [str(row.get("name") or "") for row in generated_rows]
+            if generated_names != expected_names:
+                raise PortableAssessmentError(
+                    "The imported inventory could not be reconstructed exactly."
+                )
+
+        step4_snapshot = copy.deepcopy(assessment.get("step4_snapshot") or {})
+        if rows:
+            step4_snapshot["source_vinfo_csv"] = str(inventory_file).replace(
+                "\\", "/"
+            )
+        else:
+            step4_snapshot.pop("source_vinfo_csv", None)
+
+        has_pricing = bool(pricing_document.get("items"))
+        inventory_path = str(inventory_file).replace("\\", "/") if rows else ""
+        pricing_path = str(pricing_file).replace("\\", "/") if has_pricing else ""
+        snapshot = {
+            "schema_version": SAVED_ASSESSMENT_SCHEMA_VERSION,
+            "id": assessment_id,
+            "name": imported_name,
+            "notes": normalize_assessment_notes(assessment.get("notes")),
+            "saved_at": now,
+            "updated_at": now,
+            "customer_name": normalize_customer_name(
+                assessment.get("customer_name", "")
+            ),
+            "selected_currency": currency,
+            "selected_pricelist_file": pricing_path,
+            "selected_rvtools_file": inventory_path,
+            "rvtools_file_info": (
+                build_source_file_info(inventory_path) if inventory_path else {}
+            ),
+            "rvtools_import_summary": (
+                build_inventory_import_summary(generated_rows, generated_source)
+                if generated_rows
+                else {}
+            ),
+            "app_state": normalize_app_state(assessment.get("app_state")),
+            "step4_snapshot": step4_snapshot,
+            "last_export_file": "",
+        }
+        _write_json_atomically(snapshot_file, snapshot)
+        load_result = load_saved_assessment(assessment_id)
+        if not load_result.get("ok"):
+            raise PortableAssessmentError(
+                "The imported assessment could not be loaded after reconstruction."
+            )
+    except Exception:
+        failed_state_id = str(session.get("state_id") or "").strip()
+        try:
+            for path, prior_value in prior_persistence.items():
+                _restore_optional_file_bytes(path, prior_value)
+            if failed_state_id and failed_state_id != prior_state_id:
+                (APP_STATE_DIR / f"{failed_state_id}.json").unlink(
+                    missing_ok=True
+                )
+                (APP_STATE_DIR / f"{failed_state_id}_step4_snapshot.json").unlink(
+                    missing_ok=True
+                )
+        except OSError:
+            app.logger.exception("Imported assessment persistence rollback failed")
+        session.clear()
+        session.update(copy.deepcopy(prior_session))
+        try:
+            snapshot_file.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("Imported assessment snapshot cleanup failed")
+        try:
+            shutil.rmtree(import_dir, ignore_errors=True)
+        except OSError:
+            app.logger.exception("Imported assessment artifact cleanup failed")
+        raise
+
+    return {
+        "ok": True,
+        "id": assessment_id,
+        "name": imported_name,
+        "vm_count": len(rows),
+        "currency": currency,
+        "warnings": list(load_result.get("warnings") or []),
+    }
+
+
 def load_supported_os_signatures() -> list[str]:
     """Load OCI supported OS names from text file as lowercase match signatures."""
     if not OCI_SUPPORTED_OS_PATH.exists():
@@ -1062,6 +1371,11 @@ def load_latest_price_lookup() -> tuple[dict[str, float], str, str]:
 def list_downloaded_price_lists() -> list[str]:
     """List saved OCI price list JSON files (newest first)."""
     files = list(DOWNLOADS_DIR.glob("oci_pricing_*.json"))
+    files.extend(
+        (DOWNLOADS_DIR / "imported_assessments").glob(
+            "*/oci_pricing_*.json"
+        )
+    )
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [str(p).replace("\\", "/") for p in files]
 
@@ -7488,7 +7802,7 @@ def build_migration_price_workbook_xlsx(
 
 
 @app.route("/", methods=["GET", "POST"])
-def index() -> str:
+def index() -> Any:
     _cleanup_legacy_session_keys()
 
     download_info: dict[str, Any] | None = None
@@ -7744,7 +8058,75 @@ def index() -> str:
             flash(success_message, "rvtools_success")
             return True
 
-        if action == "save_customer_name":
+        if action == "export_assessment":
+            try:
+                package, filename = build_current_portable_assessment(
+                    request.form.get("assessment_name", active_assessment_name),
+                    request.form.get("assessment_notes", active_assessment_notes),
+                )
+                payload = dumps_portable_package(package).encode("utf-8")
+            except PortableAssessmentError as exc:
+                flash(str(exc), "error")
+            except Exception:
+                app.logger.exception("Portable assessment export failed")
+                flash(
+                    "The current assessment could not be exported as portable JSON.",
+                    "error",
+                )
+            else:
+                response = send_file(
+                    io.BytesIO(payload),
+                    mimetype="application/json",
+                    as_attachment=True,
+                    download_name=filename,
+                )
+                response.headers["Content-Type"] = "application/json; charset=utf-8"
+                return response
+
+        elif action == "import_assessment":
+            upload = request.files.get("assessment_file")
+            original_name = secure_filename(upload.filename if upload else "")
+            if not upload or not original_name:
+                flash("Choose a portable assessment JSON file to import.", "error")
+            elif Path(original_name).suffix.lower() != ".json":
+                flash("Only .json portable assessment files can be imported.", "error")
+            else:
+                try:
+                    raw_package = upload.stream.read(MAX_PACKAGE_BYTES + 1)
+                    if len(raw_package) > MAX_PACKAGE_BYTES:
+                        raise PortableAssessmentError(
+                            "Portable assessment exceeds the 25 MiB size limit."
+                        )
+                    decoded = raw_package.decode("utf-8-sig")
+                    parsed_package = json.loads(decoded)
+                    validated_package = validate_portable_package(parsed_package)
+                    import_result = import_portable_assessment(validated_package)
+                except UnicodeDecodeError:
+                    flash(
+                        "Portable assessment JSON must use UTF-8 encoding.",
+                        "error",
+                    )
+                except json.JSONDecodeError:
+                    flash("Portable assessment JSON is malformed.", "error")
+                except PortableAssessmentError as exc:
+                    flash(str(exc), "error")
+                except Exception:
+                    app.logger.exception("Portable assessment import failed")
+                    flash(
+                        "The portable assessment could not be imported. The current assessment was kept.",
+                        "error",
+                    )
+                else:
+                    currency_label = import_result.get("currency") or "no currency"
+                    flash(
+                        f"Assessment imported: {import_result['name']} - "
+                        f"{int(import_result['vm_count']):,} VM(s) - {currency_label}.",
+                        "success",
+                    )
+                    for warning in import_result.get("warnings", []):
+                        flash(str(warning), "info")
+
+        elif action == "save_customer_name":
             customer_name = normalize_customer_name(request.form.get("customer_name", ""))
             if customer_name:
                 session["customer_name"] = customer_name

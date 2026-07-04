@@ -20,19 +20,29 @@
   >
     <a href="{{ url_for('index') }}#saved-assessments">Save</a>
     <a href="{{ url_for('index') }}#saved-assessments">Open</a>
-    <span
-      data-assessment-import
-      aria-disabled="true"
-      title="Portable assessment import is not available yet"
-    >Import</span>
-    {% if workspace_can_export %}
-      <a data-assessment-export href="{{ url_for('step4', tab='price') }}#scenario-price">Export</a>
-    {% else %}
-      <span
+    <form method="post" action="{{ url_for('index') }}">
+      <input type="hidden" name="action" value="export_assessment" />
+      <button
+        type="submit"
+        class="workspace-action workspace-action--secondary"
         data-assessment-export
-        aria-disabled="true"
-        title="Select an inventory source and at least one VM before exporting"
-      >Export</span>
-    {% endif %}
+      >Export current assessment</button>
+    </form>
+    <form method="post" action="{{ url_for('index') }}" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="import_assessment" />
+      <input
+        type="file"
+        name="assessment_file"
+        accept=".json,application/json"
+        hidden
+        onchange="this.form.submit()"
+      />
+      <button
+        type="button"
+        class="workspace-action workspace-action--secondary"
+        data-assessment-import
+        onclick="this.form.elements.assessment_file.click()"
+      >Import assessment</button>
+    </form>
   </div>
 </div>

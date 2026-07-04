@@ -1585,8 +1585,8 @@ def validate_workspace_shell_behavior() -> None:
         and empty_primary_controls[0]["tag"] != "a"
         and empty_primary_controls[0]["attrs"].get("aria-disabled") == "true"
         and empty_shell.assessment_export is not None
-        and empty_shell.assessment_export["tag"] == "span"
-        and empty_shell.assessment_export["attrs"].get("aria-disabled") == "true",
+        and empty_shell.assessment_export["tag"] == "button"
+        and empty_shell.assessment_export["attrs"].get("aria-disabled") is None,
         f"stages={empty_stage_signature}, options={empty_shell.mobile_options}, footer={empty_shell.footer_controls}",
     )
     check(
@@ -1600,9 +1600,8 @@ def validate_workspace_shell_behavior() -> None:
         and "menu" not in empty_shell.roles
         and "menuitem" not in empty_shell.roles
         and empty_shell.assessment_import is not None
-        and empty_shell.assessment_import["tag"] == "span"
-        and empty_shell.assessment_import["attrs"].get("aria-disabled") == "true"
-        and bool(empty_shell.assessment_import["attrs"].get("title")),
+        and empty_shell.assessment_import["tag"] == "button"
+        and empty_shell.assessment_import["attrs"].get("aria-disabled") is None,
         f"trigger={empty_shell.assessment_trigger}, panel={empty_shell.assessment_panel}, roles={empty_shell.roles}",
     )
 
@@ -1660,7 +1659,7 @@ def validate_workspace_shell_behavior() -> None:
         len(setup_primary_links) == 1
         and setup_primary_links[0]["attrs"].get("href") == "/step3"
         and configured_shells[0].assessment_export is not None
-        and configured_shells[0].assessment_export["tag"] == "a",
+        and configured_shells[0].assessment_export["tag"] == "button",
         str(configured_shells[0].footer_controls),
     )
     for stage_name, shell in zip(["Inventory Review", "Scenario Configuration"], configured_shells[1:]):
@@ -4754,6 +4753,286 @@ def validate_saved_assessments() -> None:
         app_module.save_preferences({})
 
 
+def validate_portable_assessments() -> None:
+    fixture_id = uuid4().hex[:8]
+    portable_name = f"Portable Task 10 {fixture_id}"
+    portable_notes = "Portable customer review with retained sizing decisions."
+    portable_customer = f"Portable Customer {fixture_id}"
+    source_inventory = app_module.RVTOOLS_DIR / f"portable_source_{fixture_id}.csv"
+    source_pricing = app_module.DOWNLOADS_DIR / f"oci_pricing_EUR_portable_{fixture_id}.json"
+    source_inventory.write_bytes(CSV_INVENTORY.read_bytes())
+    source_pricing.write_bytes(Path(find_price_file()).read_bytes())
+    inventory_rows, inventory_source = app_module.load_vms_from_vinfo(
+        str(source_inventory)
+    )
+    selected_names = ["vm-app-01", "vm-db-01", "vm-legacy-01"]
+    placements = {
+        "vm-app-01": "native",
+        "vm-db-01": "native",
+        "vm-legacy-01": "ocvs",
+    }
+    rationale = "Keep the legacy workload on OCVS while modernizing the application tier."
+    state_id = f"portable_state_{fixture_id}"
+    state = app_module._default_app_state()
+    state.update(
+        selected_vm_names=selected_names,
+        step4_hybrid_placements=placements,
+        step4_iaas_discount_pct=17.5,
+        step4_ocvs_commitment_term="3_year",
+        acknowledged_warning_ids=["unsupported-native"],
+        assessor_recommendation="hybrid",
+        assessor_recommendation_rationale=rationale,
+    )
+    step4_snapshot = {
+        "saved_at": "2026-07-04T12:00:00",
+        "source_vinfo_csv": str(source_inventory).replace("\\", "/"),
+        "vm_settings": {
+            "vm-app-01": {
+                "shape": "VM.Standard.E5.Flex",
+                "ocpus": 2,
+                "burst": "100%",
+                "vpu": 20,
+                "os_license": "BYOL",
+            },
+            "vm-db-01": {
+                "shape": "VM.Standard.E5.Flex",
+                "ocpus": 4,
+                "burst": "50%",
+                "vpu": 30,
+                "os_license": "BYOL",
+            },
+        },
+        "iaas_discount_pct": 17.5,
+        "ocvs_commitment_term": "3_year",
+    }
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        app_module.save_app_state(state)
+        app_module.save_step4_snapshot(step4_snapshot)
+
+    saved_dir = app_module.APP_STATE_DIR / "saved_assessments"
+
+    def file_tree_bytes(root: Path) -> dict[str, bytes]:
+        if not root.exists():
+            return {}
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    with app_module.app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
+            sess["state_id"] = state_id
+            sess["selected_rvtools_file"] = str(source_inventory).replace("\\", "/")
+            sess["rvtools_file_info"] = app_module.build_source_file_info(
+                source_inventory
+            )
+            sess["rvtools_import_summary"] = app_module.build_inventory_import_summary(
+                inventory_rows,
+                inventory_source,
+            )
+            sess["selected_pricelist_file"] = str(source_pricing).replace("\\", "/")
+            sess["selected_currency"] = "EUR"
+            sess["customer_name"] = portable_customer
+            sess["active_assessment_name"] = portable_name
+            sess["active_assessment_notes"] = portable_notes
+
+        library_before_export = file_tree_bytes(saved_dir)
+        export_response = client.post(
+            "/",
+            data={
+                "action": "export_assessment",
+                "assessment_name": portable_name,
+                "assessment_notes": portable_notes,
+            },
+        )
+        package_bytes = bytes(export_response.data)
+        package = json.loads(package_bytes.decode("utf-8"))
+        check(
+            "Task 10 unsaved assessment exports deterministic portable JSON",
+            export_response.status_code == 200
+            and export_response.mimetype == "application/json"
+            and "attachment" in export_response.headers.get("Content-Disposition", "")
+            and package.get("package_type") == "vmware_to_oci_assessment"
+            and package.get("schema_version") == 1
+            and len(package.get("inventory", {}).get("rows", [])) == EXPECTED_VM_COUNT
+            and bool(package.get("pricing", {}).get("document", {}).get("items"))
+            and package.get("assessment", {}).get("app_state", {}).get(
+                "selected_vm_names"
+            )
+            == selected_names
+            and "source_vinfo_csv" not in json.dumps(package)
+            and file_tree_bytes(saved_dir) == library_before_export,
+            export_response.headers.get("Content-Disposition", ""),
+        )
+
+        source_inventory.unlink()
+        source_pricing.unlink()
+        with client.session_transaction() as sess:
+            sess["active_assessment_name"] = "Prior local assessment"
+            sess["active_assessment_notes"] = "Must be replaced only after success."
+            sess["customer_name"] = "Prior customer"
+        prior_state = app_module._default_app_state()
+        prior_state["selected_vm_names"] = ["prior-vm"]
+        with app_module.app.test_request_context("/"):
+            app_module.session["state_id"] = state_id
+            app_module.save_app_state(prior_state)
+            app_module.save_step4_snapshot({"marker": "prior-step4"})
+
+        import_response = client.post(
+            "/",
+            data={
+                "action": "import_assessment",
+                "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
+            },
+            content_type="multipart/form-data",
+        )
+        with client.session_transaction() as sess:
+            imported_session = dict(sess)
+        imported_id = str(imported_session.get("active_assessment_id", ""))
+        imported_inventory = str(imported_session.get("selected_rvtools_file", ""))
+        imported_pricing = str(imported_session.get("selected_pricelist_file", ""))
+        imported_state_path = app_module.APP_STATE_DIR / f"{state_id}.json"
+        imported_step4_path = app_module.APP_STATE_DIR / f"{state_id}_step4_snapshot.json"
+        imported_state = json.loads(imported_state_path.read_text(encoding="utf-8"))
+        imported_step4 = json.loads(imported_step4_path.read_text(encoding="utf-8"))
+        restored_rows, _ = app_module.load_vms_from_vinfo(imported_inventory)
+        restored_prices, restored_currency, _ = app_module.load_price_lookup(
+            imported_pricing
+        )
+        check(
+            "Task 10 import restores a self-contained assessment after source deletion",
+            import_response.status_code == 200
+            and b"Assessment imported" in import_response.data
+            and bool(imported_id)
+            and imported_session.get("active_assessment_name") == portable_name
+            and imported_session.get("active_assessment_notes") == portable_notes
+            and imported_session.get("customer_name") == portable_customer
+            and imported_session.get("selected_currency") == "EUR"
+            and Path(imported_inventory).is_file()
+            and Path(imported_pricing).is_file()
+            and f"imported_assessments/{imported_id}" in imported_inventory.replace(
+                "\\", "/"
+            )
+            and [row.get("name") for row in restored_rows]
+            == [row.get("name") for row in inventory_rows]
+            and bool(restored_prices)
+            and restored_currency == "EUR"
+            and imported_state.get("selected_vm_names") == selected_names
+            and imported_state.get("step4_hybrid_placements") == placements
+            and imported_state.get("step4_iaas_discount_pct") == 17.5
+            and imported_state.get("step4_ocvs_commitment_term") == "3_year"
+            and imported_state.get("acknowledged_warning_ids")
+            == ["unsupported-native"]
+            and imported_state.get("assessor_recommendation") == "hybrid"
+            and imported_state.get("assessor_recommendation_rationale") == rationale
+            and imported_step4.get("source_vinfo_csv") == imported_inventory
+            and imported_step4.get("vm_settings") == step4_snapshot["vm_settings"],
+            f"session={imported_session}, state={imported_state}, step4={imported_step4}",
+        )
+
+        shell_response = client.get("/")
+        shell = parse_workspace_markup(shell_response.data)
+        results_response = client.get("/step4?tab=price")
+        check(
+            "Task 10 global and Results portability controls are enabled",
+            shell_response.status_code == 200
+            and shell.assessment_export is not None
+            and shell.assessment_export["tag"] == "button"
+            and shell.assessment_export["attrs"].get("aria-disabled") is None
+            and shell.assessment_import is not None
+            and shell.assessment_import["tag"] == "button"
+            and shell.assessment_import["attrs"].get("aria-disabled") is None
+            and b'name="assessment_file"' in shell_response.data
+            and results_response.status_code == 200
+            and b'value="export_assessment"' in results_response.data
+            and b'name="assessment_file"' in results_response.data,
+            f"results_status={results_response.status_code}",
+        )
+
+        second_response = client.post(
+            "/",
+            data={
+                "action": "import_assessment",
+                "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
+            },
+            content_type="multipart/form-data",
+        )
+        with client.session_transaction() as sess:
+            second_name = str(sess.get("active_assessment_name", ""))
+            second_id = str(sess.get("active_assessment_id", ""))
+        check(
+            "Task 10 duplicate import gets deterministic suffix and fresh id",
+            second_response.status_code == 200
+            and second_name == f"{portable_name} (Imported 2)"
+            and second_id
+            and second_id != imported_id,
+            f"name={second_name}, first={imported_id}, second={second_id}",
+        )
+
+        with client.session_transaction() as sess:
+            preserved_session = json.loads(json.dumps(dict(sess)))
+        preserved_app_state = file_tree_bytes(app_module.APP_STATE_DIR)
+        preserved_library = file_tree_bytes(saved_dir)
+        imported_root = app_module.DOWNLOADS_DIR / "imported_assessments"
+        preserved_artifacts = file_tree_bytes(imported_root)
+        invalid_wrong_type = json.loads(package_bytes.decode("utf-8"))
+        invalid_wrong_type["package_type"] = "wrong"
+        invalid_version = json.loads(package_bytes.decode("utf-8"))
+        invalid_version["schema_version"] = 2
+        invalid_missing = json.loads(package_bytes.decode("utf-8"))
+        invalid_missing.pop("pricing")
+        invalid_duplicate = json.loads(package_bytes.decode("utf-8"))
+        invalid_duplicate["inventory"]["rows"].append(
+            dict(invalid_duplicate["inventory"]["rows"][0])
+        )
+        invalid_negative = json.loads(package_bytes.decode("utf-8"))
+        invalid_negative["inventory"]["rows"][0]["cpus"] = -1
+        invalid_cases = [
+            ("wrong extension", package_bytes, "portable.txt"),
+            ("malformed JSON", b"{not-json", "portable.json"),
+            ("wrong package type", json.dumps(invalid_wrong_type).encode("utf-8"), "portable.json"),
+            ("unsupported version", json.dumps(invalid_version).encode("utf-8"), "portable.json"),
+            ("missing section", json.dumps(invalid_missing).encode("utf-8"), "portable.json"),
+            ("duplicate VM name", json.dumps(invalid_duplicate).encode("utf-8"), "portable.json"),
+            ("negative number", json.dumps(invalid_negative).encode("utf-8"), "portable.json"),
+            (
+                "oversized package",
+                b"{" + (b" " * app_module.MAX_PACKAGE_BYTES),
+                "portable.json",
+            ),
+        ]
+        invalid_results: list[tuple[str, bool]] = []
+        for label, invalid_bytes, filename in invalid_cases:
+            response = client.post(
+                "/",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (BytesIO(invalid_bytes), filename),
+                },
+                content_type="multipart/form-data",
+            )
+            with client.session_transaction() as sess:
+                current_session = json.loads(json.dumps(dict(sess)))
+            invalid_results.append(
+                (
+                    label,
+                    response.status_code == 200
+                    and current_session == preserved_session
+                    and file_tree_bytes(app_module.APP_STATE_DIR) == preserved_app_state
+                    and file_tree_bytes(saved_dir) == preserved_library
+                    and file_tree_bytes(imported_root) == preserved_artifacts,
+                )
+            )
+        check(
+            "Task 10 invalid imports preserve session library and artifacts byte-for-byte",
+            all(passed for _label, passed in invalid_results),
+            str(invalid_results),
+        )
+
+
 def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
     inventory = CSV_INVENTORY
     price_file = find_price_file()
@@ -5335,6 +5614,7 @@ def main() -> None:
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
     validate_saved_assessments()
+    validate_portable_assessments()
     validate_step3_duplicate_removal()
     validate_guided_inventory_review()
     validate_inventory_review_transactions_and_step4_boundary()

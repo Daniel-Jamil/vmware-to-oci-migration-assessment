@@ -22,6 +22,27 @@
       <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
       <button type="submit" class="results-button results-button--secondary">Save assessment</button>
     </form>
+    <form method="post" action="{{ url_for('index') }}">
+      <input type="hidden" name="action" value="export_assessment" />
+      <input type="hidden" name="assessment_name" value="{{ results.assessment_name }}" />
+      <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
+      <button type="submit" class="results-button results-button--secondary">Export assessment JSON</button>
+    </form>
+    <form method="post" action="{{ url_for('index') }}" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="import_assessment" />
+      <input
+        type="file"
+        name="assessment_file"
+        accept=".json,application/json"
+        hidden
+        onchange="this.form.submit()"
+      />
+      <button
+        type="button"
+        class="results-button results-button--secondary"
+        onclick="this.form.elements.assessment_file.click()"
+      >Import assessment</button>
+    </form>
     <form method="post" action="{{ url_for('step4') }}">
       <input type="hidden" name="action" value="export_excel" />
       <input type="hidden" name="active_scenario" value="price" />
