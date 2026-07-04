@@ -67,7 +67,13 @@
   </div>
   {% else %}
   <div class="scenario-save-bar scenario-save-bar--compact" data-scenario-save-bar>
-    <span>Changes apply to the complete selected workload.</span>
+    <span
+      id="{{ view.id }}-dirty-status"
+      data-scenario-dirty-live
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >Changes apply to the complete selected workload.</span>
     <button class="scenario-primary-action" type="submit" form="step4-form" name="action" value="save">
       Recalculate &amp; Save
     </button>

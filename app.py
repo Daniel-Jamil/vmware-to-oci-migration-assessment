@@ -149,6 +149,32 @@ NATIVE_PAGE_SIZE_OPTIONS = (25, 50, 100)
 NATIVE_SUPPORT_FILTERS = {"all", "supported", "remediation", "review"}
 NATIVE_SEARCH_MAX_LENGTH = 200
 STEP4_UNSAVED_READINESS_SESSION_KEY = "_step4_unsaved_scenario_changes"
+STEP4_ALLOWED_ACTIONS = {"save", "export_excel"}
+STEP4_ACTIVE_SCENARIOS = {"native", "ocvs", "hybrid", "price"}
+STEP4_SINGLE_VALUE_FIELDS = {
+    "action",
+    "active_scenario",
+    "native_page",
+    "native_page_size",
+    "native_search",
+    "native_support",
+    "bulk_apply_oci_shape",
+    "bulk_apply_burst",
+    "bulk_apply_vpu",
+    "bulk_apply_os_license",
+    "native_shape_strategy_enabled",
+    "iaas_discount_pct",
+    "ocvs_profile",
+    "ocvs_commitment_term",
+    "ocvs_vcpu_per_ocpu",
+    "ocvs_cpu_headroom_pct",
+    "ocvs_memory_headroom_pct",
+    "ocvs_storage_headroom_pct",
+    "ocvs_dense_vsan_usable_pct",
+    "ocvs_standard_storage_vpu",
+    "ocvs_dr_nodes",
+    "vmware_license_price_per_core_yearly",
+}
 
 HOURS_PER_MONTH = 730.0
 MIN_BLOCK_VOLUME_GB = 50
@@ -373,25 +399,42 @@ def normalize_ocvs_commitment_term(value: Any) -> str:
 
 def normalize_ocvs_dr_nodes(value: Any) -> int:
     try:
-        parsed = int(float(str(value).strip()))
-    except (TypeError, ValueError):
-        parsed = 0
+        numeric = float(str(value).strip())
+        parsed = int(numeric) if math.isfinite(numeric) and numeric.is_integer() else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
     return parsed if parsed in VALID_OCVS_DR_NODE_COUNTS else 0
 
 
 def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
     try:
+        fallback = float(default)
+    except (TypeError, ValueError):
+        fallback = minimum
+    if not math.isfinite(fallback):
+        fallback = minimum
+    fallback = max(minimum, min(maximum, fallback))
+    try:
         parsed = float(str(value).strip())
     except (TypeError, ValueError):
-        parsed = default
+        parsed = fallback
+    if not math.isfinite(parsed):
+        parsed = fallback
     return max(minimum, min(maximum, parsed))
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     try:
-        parsed = int(float(str(value).strip()))
-    except (TypeError, ValueError):
-        parsed = default
+        fallback_numeric = float(default)
+        fallback = int(fallback_numeric) if math.isfinite(fallback_numeric) else minimum
+    except (TypeError, ValueError, OverflowError):
+        fallback = minimum
+    fallback = max(minimum, min(maximum, fallback))
+    try:
+        numeric = float(str(value).strip())
+        parsed = int(numeric) if math.isfinite(numeric) and numeric.is_integer() else fallback
+    except (TypeError, ValueError, OverflowError):
+        parsed = fallback
     return max(minimum, min(maximum, parsed))
 
 
@@ -585,11 +628,12 @@ def normalize_app_state(value: Any) -> dict[str, Any]:
             str(vm_name): normalize_hybrid_placement(value, "ocvs")
             for vm_name, value in default["step4_hybrid_placements"].items()
         }
-    try:
-        discount_value = float(default.get("step4_iaas_discount_pct", 0.0))
-    except (TypeError, ValueError):
-        discount_value = 0.0
-    default["step4_iaas_discount_pct"] = max(0.0, min(100.0, discount_value))
+    default["step4_iaas_discount_pct"] = _bounded_float(
+        default.get("step4_iaas_discount_pct"),
+        0.0,
+        0.0,
+        100.0,
+    )
     default["step4_ocvs_profile"] = normalize_ocvs_profile(default.get("step4_ocvs_profile", "best_fit"))
     default["step4_ocvs_policy"] = normalize_ocvs_policy(default.get("step4_ocvs_policy", {}))
     default["step4_ocvs_commitment_term"] = normalize_ocvs_commitment_term(
@@ -2921,6 +2965,96 @@ def parse_native_editor_page_fields(
     return (parsed if not errors else None), errors
 
 
+def parse_step4_scalar_submission(form: Any) -> tuple[dict[str, Any], list[str]]:
+    """Strictly parse the single-value Step 4 controls before persistence."""
+    parsed: dict[str, Any] = {}
+    errors: list[str] = []
+
+    for field_name in STEP4_SINGLE_VALUE_FIELDS:
+        if field_name in form and len(form.getlist(field_name)) != 1:
+            errors.append(f"Submit exactly one value for {field_name}.")
+
+    action = str(form.get("action", "save")).strip()
+    if action not in STEP4_ALLOWED_ACTIONS:
+        errors.append("Choose a valid Step 4 action.")
+    parsed["action"] = action
+
+    active_scenario = str(form.get("active_scenario", "native")).strip()
+    if active_scenario not in STEP4_ACTIVE_SCENARIOS:
+        errors.append("Choose a valid active scenario.")
+        active_scenario = "native"
+    parsed["active_scenario"] = active_scenario
+
+    if "ocvs_profile" in form:
+        profile = str(form.get("ocvs_profile", "")).strip()
+        valid_profiles = {"best_fit"} | {
+            str(item.get("shape") or "").strip()
+            for item in OCVS_HOST_PROFILES
+            if str(item.get("shape") or "").strip()
+        }
+        if profile not in valid_profiles:
+            errors.append("Choose a valid OCVS node profile.")
+        else:
+            parsed["ocvs_profile"] = profile
+
+    if "ocvs_commitment_term" in form:
+        commitment_term = str(form.get("ocvs_commitment_term", "")).strip()
+        if commitment_term not in OCVS_COMMITMENT_TERMS:
+            errors.append("Choose a valid OCVS commitment term.")
+        else:
+            parsed["ocvs_commitment_term"] = commitment_term
+
+    numeric_rules = {
+        "iaas_discount_pct": ("IaaS discount", 0.0, 100.0, False, None),
+        "vmware_license_price_per_core_yearly": (
+            "VCF list price per physical core/year",
+            0.0,
+            1_000_000.0,
+            False,
+            None,
+        ),
+        "ocvs_vcpu_per_ocpu": ("vCPU per OCPU", 1.0, 16.0, False, None),
+        "ocvs_cpu_headroom_pct": ("CPU headroom", 0.0, 90.0, True, None),
+        "ocvs_memory_headroom_pct": ("RAM headroom", 0.0, 90.0, True, None),
+        "ocvs_storage_headroom_pct": ("storage headroom", 0.0, 90.0, True, None),
+        "ocvs_dense_vsan_usable_pct": ("dense vSAN usable", 10.0, 95.0, True, None),
+        "ocvs_standard_storage_vpu": (
+            "standard storage VPU/GB",
+            10.0,
+            120.0,
+            True,
+            set(VPU_OPTIONS),
+        ),
+        "ocvs_dr_nodes": (
+            "additional spare nodes",
+            float(min(VALID_OCVS_DR_NODE_COUNTS)),
+            float(max(VALID_OCVS_DR_NODE_COUNTS)),
+            True,
+            set(VALID_OCVS_DR_NODE_COUNTS),
+        ),
+    }
+    for field_name, (label, minimum, maximum, whole_number, allowed_values) in numeric_rules.items():
+        if field_name not in form:
+            continue
+        raw_value = str(form.get(field_name, "")).strip()
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_value = math.nan
+        valid = (
+            math.isfinite(numeric_value)
+            and minimum <= numeric_value <= maximum
+            and (not whole_number or numeric_value.is_integer())
+            and (allowed_values is None or int(numeric_value) in allowed_values)
+        )
+        if not valid:
+            errors.append(f"Enter a valid {label} value.")
+            continue
+        parsed[field_name] = int(numeric_value) if whole_number else numeric_value
+
+    return parsed, errors
+
+
 WORKSPACE_STAGE_MAP = {
     "setup": {
         "number": 1,
@@ -3931,7 +4065,13 @@ def build_hybrid_placement_plan(
             if is_supported
             else "unsupported"
         )
-        recommended = "native" if is_supported else "ocvs"
+        recommended = (
+            "review"
+            if support_state == "review"
+            else "native"
+            if is_supported
+            else "ocvs"
+        )
         placement = normalize_hybrid_placement(selection.get(vm_name), recommended)
         effective_target = "native" if placement == "native" else "ocvs"
 
@@ -7994,11 +8134,21 @@ def step4() -> str:
         return redirect(url_for("step3"))
 
     submitted_hybrid_placements: dict[str, str] | None = None
+    submitted_step4_scalars: dict[str, Any] = {}
     if request.method == "POST":
-        posted_scenario = normalize_step4_scenario_tab(
-            request.form.get("active_scenario", "native"),
-            "native",
+        submitted_step4_scalars, scalar_errors = parse_step4_scalar_submission(
+            request.form
         )
+        posted_scenario = str(
+            submitted_step4_scalars.get("active_scenario", "native")
+        )
+        if scalar_errors:
+            session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+            flash(
+                f"{scalar_errors[0]} No scenario settings were saved.",
+                "error",
+            )
+            return redirect(step4_tab_redirect(posted_scenario, **request.form))
         has_hybrid_fields = any(
             str(key).startswith("hybrid_placement:") for key in request.form.keys()
         )
@@ -8172,7 +8322,6 @@ def step4() -> str:
         return redirect(url_for("step3"))
 
     export_format: str | None = None
-    return_to = "step4"
     active_scenario = requested_scenario
     native_editor_query = normalize_native_editor_query(
         request.form if request.method == "POST" else request.args
@@ -8195,12 +8344,8 @@ def step4() -> str:
     )
 
     if request.method == "POST":
-        action = str(request.form.get("action", "save")).strip().lower()
-        return_to = str(request.form.get("return_to", "step4")).strip().lower()
-        active_scenario = normalize_step4_scenario_tab(
-            request.form.get("active_scenario", "native"),
-            "native",
-        )
+        action = str(submitted_step4_scalars["action"])
+        active_scenario = str(submitted_step4_scalars["active_scenario"])
         submitted_native_settings, native_field_errors = parse_native_editor_page_fields(
             request.form,
             native_editor_scope["rows"],
@@ -8239,24 +8384,6 @@ def step4() -> str:
                 native_post_errors.append("Choose a valid shape for every default shape strategy row.")
             elif any(normalize_burst_value(value) not in valid_burst_values for value in native_strategy_bursts):
                 native_post_errors.append("Choose a valid burst for every default shape strategy row.")
-
-        submitted_vmware_license_price = vmware_license_price_per_core_yearly
-        if "vmware_license_price_per_core_yearly" in request.form:
-            vmware_license_raw = str(
-                request.form.get("vmware_license_price_per_core_yearly", "")
-            ).strip()
-            try:
-                submitted_vmware_license_price = float(vmware_license_raw)
-            except (TypeError, ValueError):
-                submitted_vmware_license_price = math.nan
-            if (
-                not math.isfinite(submitted_vmware_license_price)
-                or submitted_vmware_license_price < 0.0
-                or submitted_vmware_license_price > 1_000_000.0
-            ):
-                native_post_errors.append(
-                    "Enter a valid VCF list price per physical core/year."
-                )
 
         scenario_setting_fields = (
             "iaas_discount_pct",
@@ -8303,28 +8430,65 @@ def step4() -> str:
             )
             return redirect(step4_tab_redirect(active_scenario, **request.form))
 
-        iaas_discount_raw = str(request.form.get("iaas_discount_pct", iaas_discount_pct)).strip()
-        ocvs_profile_choice = normalize_ocvs_profile(request.form.get("ocvs_profile", ocvs_profile_choice))
-        ocvs_commitment_term = normalize_ocvs_commitment_term(
-            request.form.get("ocvs_commitment_term", ocvs_commitment_term)
+        iaas_discount_pct = float(
+            submitted_step4_scalars.get("iaas_discount_pct", iaas_discount_pct)
         )
-        ocvs_dr_nodes = normalize_ocvs_dr_nodes(request.form.get("ocvs_dr_nodes", ocvs_dr_nodes))
-        ocvs_policy = normalize_ocvs_policy(
-            {
-                "vcpu_per_ocpu": request.form.get("ocvs_vcpu_per_ocpu", ocvs_policy["vcpu_per_ocpu"]),
-                "cpu_headroom_pct": request.form.get("ocvs_cpu_headroom_pct", ocvs_policy["cpu_headroom_pct"]),
-                "memory_headroom_pct": request.form.get("ocvs_memory_headroom_pct", ocvs_policy["memory_headroom_pct"]),
-                "storage_headroom_pct": request.form.get("ocvs_storage_headroom_pct", ocvs_policy["storage_headroom_pct"]),
-                "dense_vsan_usable_pct": request.form.get("ocvs_dense_vsan_usable_pct", ocvs_policy["dense_vsan_usable_pct"]),
-                "standard_storage_vpu": request.form.get("ocvs_standard_storage_vpu", ocvs_policy["standard_storage_vpu"]),
-            }
+        ocvs_profile_choice = str(
+            submitted_step4_scalars.get("ocvs_profile", ocvs_profile_choice)
         )
-        try:
-            iaas_discount_pct = float(iaas_discount_raw)
-        except (TypeError, ValueError):
-            iaas_discount_pct = 0.0
-        iaas_discount_pct = max(0.0, min(100.0, iaas_discount_pct))
-        vmware_license_price_per_core_yearly = submitted_vmware_license_price
+        ocvs_commitment_term = str(
+            submitted_step4_scalars.get(
+                "ocvs_commitment_term",
+                ocvs_commitment_term,
+            )
+        )
+        ocvs_dr_nodes = int(
+            submitted_step4_scalars.get("ocvs_dr_nodes", ocvs_dr_nodes)
+        )
+        ocvs_policy = {
+            "vcpu_per_ocpu": float(
+                submitted_step4_scalars.get(
+                    "ocvs_vcpu_per_ocpu",
+                    ocvs_policy["vcpu_per_ocpu"],
+                )
+            ),
+            "cpu_headroom_pct": float(
+                submitted_step4_scalars.get(
+                    "ocvs_cpu_headroom_pct",
+                    ocvs_policy["cpu_headroom_pct"],
+                )
+            ),
+            "memory_headroom_pct": float(
+                submitted_step4_scalars.get(
+                    "ocvs_memory_headroom_pct",
+                    ocvs_policy["memory_headroom_pct"],
+                )
+            ),
+            "storage_headroom_pct": float(
+                submitted_step4_scalars.get(
+                    "ocvs_storage_headroom_pct",
+                    ocvs_policy["storage_headroom_pct"],
+                )
+            ),
+            "dense_vsan_usable_pct": float(
+                submitted_step4_scalars.get(
+                    "ocvs_dense_vsan_usable_pct",
+                    ocvs_policy["dense_vsan_usable_pct"],
+                )
+            ),
+            "standard_storage_vpu": int(
+                submitted_step4_scalars.get(
+                    "ocvs_standard_storage_vpu",
+                    ocvs_policy["standard_storage_vpu"],
+                )
+            ),
+        }
+        vmware_license_price_per_core_yearly = float(
+            submitted_step4_scalars.get(
+                "vmware_license_price_per_core_yearly",
+                vmware_license_price_per_core_yearly,
+            )
+        )
 
         updated_shapes = dict(vm_shape_selection)
         updated_ocpus = dict(vm_ocpu_selection)

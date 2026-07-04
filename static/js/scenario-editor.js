@@ -5,9 +5,7 @@
   const panels = Array.from(document.querySelectorAll("[data-scenario-panel]"));
   const scenarioForm = document.querySelector("[data-scenario-form]");
   const activeScenarioInput = document.getElementById("active_scenario");
-  const dirtyLiveRegions = Array.from(document.querySelectorAll(
-    "[data-scenario-dirty-live], .scenario-save-bar--compact > span",
-  ));
+  const dirtyLiveRegions = Array.from(document.querySelectorAll("[data-scenario-dirty-live]"));
   const mainTitle = document.getElementById("step4-main-title");
   const stageSelect = document.getElementById("workspace-stage-select");
   const nativeRows = Array.from(document.querySelectorAll("[data-native-editor-row]"));

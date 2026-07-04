@@ -3737,31 +3737,207 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         and 'data-hybrid-rankable="true"' in positive_hybrid_html,
     )
 
-    with app_module.app.test_request_context("/"):
-        app_module.session["state_id"] = state_id
-        before_invalid_vcf = app_module.load_app_state()
-        before_invalid_snapshot = app_module.load_step4_snapshot()
-    invalid_vcf_response = client.post(
-        "/step4",
-        data=ocvs_save_form("not-a-price", native_ocpu="4", dr_nodes="2"),
-        follow_redirects=False,
-    )
-    with app_module.app.test_request_context("/"):
-        app_module.session["state_id"] = state_id
-        after_invalid_vcf = app_module.load_app_state()
-        after_invalid_snapshot = app_module.load_step4_snapshot()
-    invalid_vcf_redirect = client.get(invalid_vcf_response.headers.get("Location", ""))
-    check(
-        "Invalid VCF form value rejects the whole OCVS save transaction",
-        invalid_vcf_response.status_code in {302, 303}
-        and after_invalid_vcf == before_invalid_vcf
-        and after_invalid_snapshot == before_invalid_snapshot
-        and b"valid VCF list price" in invalid_vcf_redirect.data,
-        f"status={invalid_vcf_response.status_code}, location={invalid_vcf_response.headers.get('Location')}",
-    )
-
     scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
     scenario_css = (ROOT / "static" / "css" / "scenarios.css").read_text(encoding="utf-8")
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        state_path = app_module._state_file_path()
+        snapshot_path = app_module._step4_snapshot_file_path()
+    baseline_state_bytes = state_path.read_bytes()
+    baseline_snapshot_bytes = snapshot_path.read_bytes()
+
+    rendered_scalar_fields = (
+        "action",
+        "active_scenario",
+        "native_page",
+        "native_page_size",
+        "native_search",
+        "native_support",
+        "bulk_apply_oci_shape",
+        "bulk_apply_burst",
+        "bulk_apply_vpu",
+        "bulk_apply_os_license",
+        "native_shape_strategy_enabled",
+        "iaas_discount_pct",
+        "ocvs_profile",
+        "ocvs_commitment_term",
+        "ocvs_vcpu_per_ocpu",
+        "ocvs_cpu_headroom_pct",
+        "ocvs_memory_headroom_pct",
+        "ocvs_storage_headroom_pct",
+        "ocvs_dense_vsan_usable_pct",
+        "ocvs_standard_storage_vpu",
+        "ocvs_dr_nodes",
+        "vmware_license_price_per_core_yearly",
+    )
+    malformed_scalar_cases = (
+        ("unknown action", "action", "publish"),
+        ("unknown active scenario", "active_scenario", "elsewhere"),
+        ("unknown OCVS profile", "ocvs_profile", "BM.Unknown.1"),
+        ("aliased commitment term", "ocvs_commitment_term", "one_year"),
+        ("malformed DR nodes", "ocvs_dr_nodes", "not-a-number"),
+        ("NaN DR nodes", "ocvs_dr_nodes", "nan"),
+        ("fractional DR nodes", "ocvs_dr_nodes", "1.5"),
+        ("out-of-range DR nodes", "ocvs_dr_nodes", "3"),
+        ("NaN IaaS discount", "iaas_discount_pct", "nan"),
+        ("negative IaaS discount", "iaas_discount_pct", "-0.01"),
+        ("out-of-range IaaS discount", "iaas_discount_pct", "100.01"),
+        ("malformed VCF price", "vmware_license_price_per_core_yearly", "not-a-price"),
+        ("infinite VCF price", "vmware_license_price_per_core_yearly", "inf"),
+        ("negative VCF price", "vmware_license_price_per_core_yearly", "-1"),
+        ("out-of-range VCF price", "vmware_license_price_per_core_yearly", "1000000.01"),
+        ("NaN vCPU/OCPU policy", "ocvs_vcpu_per_ocpu", "nan"),
+        ("infinite vCPU/OCPU policy", "ocvs_vcpu_per_ocpu", "inf"),
+        ("low vCPU/OCPU policy", "ocvs_vcpu_per_ocpu", "0.9"),
+        ("high vCPU/OCPU policy", "ocvs_vcpu_per_ocpu", "16.1"),
+        ("negative CPU headroom", "ocvs_cpu_headroom_pct", "-1"),
+        ("fractional CPU headroom", "ocvs_cpu_headroom_pct", "20.5"),
+        ("high RAM headroom", "ocvs_memory_headroom_pct", "91"),
+        ("infinite RAM headroom", "ocvs_memory_headroom_pct", "-inf"),
+        ("NaN storage headroom", "ocvs_storage_headroom_pct", "nan"),
+        ("fractional storage headroom", "ocvs_storage_headroom_pct", "25.5"),
+        ("low dense vSAN usable", "ocvs_dense_vsan_usable_pct", "9"),
+        ("high dense vSAN usable", "ocvs_dense_vsan_usable_pct", "96"),
+        ("fractional dense vSAN usable", "ocvs_dense_vsan_usable_pct", "50.5"),
+        ("malformed storage VPU", "ocvs_standard_storage_vpu", "none"),
+        ("fractional storage VPU", "ocvs_standard_storage_vpu", "10.5"),
+        ("off-step storage VPU", "ocvs_standard_storage_vpu", "15"),
+        ("high storage VPU", "ocvs_standard_storage_vpu", "121"),
+    )
+    invalid_post_failures: list[str] = []
+    invalid_post_cases: list[tuple[str, str, list[str]]] = [
+        (label, field_name, [value])
+        for label, field_name, value in malformed_scalar_cases
+    ]
+    for field_name in rendered_scalar_fields:
+        base_values = ocvs_save_form("360.00").getlist(field_name) or [""]
+        invalid_post_cases.append(
+            (f"duplicate {field_name}", field_name, [base_values[0], base_values[0]])
+        )
+
+    for label, field_name, submitted_values in invalid_post_cases:
+        form = ocvs_save_form("360.00", native_ocpu="4", dr_nodes="2")
+        form.setlist(field_name, submitted_values)
+        before_state_bytes = state_path.read_bytes()
+        before_snapshot_bytes = snapshot_path.read_bytes()
+        response = client.post("/step4", data=form, follow_redirects=False)
+        after_state_bytes = state_path.read_bytes()
+        after_snapshot_bytes = snapshot_path.read_bytes()
+        with client.session_transaction() as sess:
+            marked_unsaved = (
+                sess.get(app_module.STEP4_UNSAVED_READINESS_SESSION_KEY) is True
+            )
+        location = response.headers.get("Location", "")
+        redirected = client.get(location) if location else response
+        rejected = (
+            response.status_code in {302, 303}
+            and before_state_bytes == after_state_bytes
+            and before_snapshot_bytes == after_snapshot_bytes
+            and marked_unsaved
+            and b"No scenario settings were saved" in redirected.data
+        )
+        if not rejected:
+            invalid_post_failures.append(
+                f"{label}(status={response.status_code}, state={before_state_bytes == after_state_bytes}, "
+                f"snapshot={before_snapshot_bytes == after_snapshot_bytes}, unsaved={marked_unsaved})"
+            )
+        state_path.write_bytes(baseline_state_bytes)
+        snapshot_path.write_bytes(baseline_snapshot_bytes)
+
+    unknown_review_plan = app_module.build_hybrid_placement_plan(
+        [{"vm_name": "review-baseline", "os_name": "Unknown"}],
+        {"review-baseline": "review"},
+        app_module.load_supported_os_signatures(),
+    )
+    unknown_native_plan = app_module.build_hybrid_placement_plan(
+        [{"vm_name": "review-baseline", "os_name": "Unknown"}],
+        {"review-baseline": "native"},
+        app_module.load_supported_os_signatures(),
+    )
+    unknown_ocvs_plan = app_module.build_hybrid_placement_plan(
+        [{"vm_name": "review-baseline", "os_name": "Unknown"}],
+        {"review-baseline": "ocvs"},
+        app_module.load_supported_os_signatures(),
+    )
+    review_row = unknown_review_plan.get("rows", [{}])[0]
+    hybrid_review_baseline_valid = (
+        review_row.get("hybrid_recommended_placement") == "review"
+        and review_row.get("hybrid_effective_target") == "ocvs"
+        and review_row.get("hybrid_manual_override") is False
+        and unknown_review_plan.get("manual_override_count") == 0
+        and unknown_review_plan.get("ocvs_priced_count") == 1
+        and unknown_native_plan.get("manual_override_count") == 1
+        and unknown_ocvs_plan.get("manual_override_count") == 1
+    )
+
+    rendered_ids = re.findall(r'\bid="([^"]+)"', positive_vcf_html)
+    compact_live_ids = ("ocvs-dirty-status", "hybrid-dirty-status")
+    compact_live_semantics_valid = (
+        len(rendered_ids) == len(set(rendered_ids))
+        and positive_vcf_html.count("data-scenario-dirty-live") == 3
+        and all(
+            re.search(
+                rf'<span(?=[^>]*\bid="{status_id}")(?=[^>]*\bdata-scenario-dirty-live)(?=[^>]*\brole="status")(?=[^>]*\baria-live="polite")[^>]*>',
+                positive_vcf_html,
+            )
+            is not None
+            for status_id in compact_live_ids
+        )
+        and ".scenario-save-bar--compact > span" not in scenario_js
+    )
+
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        corrupt_state = app_module.load_app_state()
+        corrupt_snapshot = app_module.load_step4_snapshot()
+        corrupt_state["step4_iaas_discount_pct"] = float("inf")
+        corrupt_state["step4_vmware_license_price_per_core_yearly"] = float("nan")
+        corrupt_state["step4_ocvs_policy"] = {
+            "vcpu_per_ocpu": float("inf"),
+            "cpu_headroom_pct": float("nan"),
+            "memory_headroom_pct": float("-inf"),
+            "storage_headroom_pct": float("nan"),
+            "dense_vsan_usable_pct": float("inf"),
+            "standard_storage_vpu": float("nan"),
+        }
+        corrupt_snapshot["vmware_license_price_per_core_yearly"] = float("inf")
+        app_module.save_app_state(corrupt_state)
+        app_module.save_step4_snapshot(corrupt_snapshot)
+    corrupt_response = client.get("/step4?tab=ocvs")
+    corrupt_html = corrupt_response.data.decode("utf-8", errors="replace")
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        normalized_corrupt_state = app_module.load_app_state()
+    normalized_policy = normalized_corrupt_state.get("step4_ocvs_policy", {})
+    finite_stored_state_valid = (
+        app_module._bounded_float(float("nan"), 0.0, 0.0, 100.0) == 0.0
+        and app_module._bounded_float(float("inf"), 0.0, 0.0, 100.0) == 0.0
+        and app_module._bounded_float(float("-inf"), 0.0, 0.0, 100.0) == 0.0
+        and normalized_corrupt_state.get("step4_iaas_discount_pct") == 0.0
+        and normalized_corrupt_state.get("step4_vmware_license_price_per_core_yearly") == 0.0
+        and normalized_policy == app_module.OCVS_DEFAULT_SIZING_POLICY
+        and 'value="0.00"' in corrupt_html
+        and "Unit price required" in corrupt_html
+        and 'data-ocvs-readiness-state="incomplete"' in corrupt_html
+        and 'data-ocvs-rankable="false"' in corrupt_html
+        and 'data-hybrid-rankable="false"' in corrupt_html
+    )
+    state_path.write_bytes(baseline_state_bytes)
+    snapshot_path.write_bytes(baseline_snapshot_bytes)
+
+    quality_failures = [
+        *invalid_post_failures,
+        *([] if finite_stored_state_valid else ["stored non-finite normalization"]),
+        *([] if hybrid_review_baseline_valid else ["Hybrid Review recommendation baseline"]),
+        *([] if compact_live_semantics_valid else ["compact dirty live-region semantics"]),
+    ]
+    check(
+        "Task 8 strict scalar transactions finite stored state Review baseline and live semantics",
+        not quality_failures,
+        "; ".join(quality_failures),
+    )
+
     # Task 8 browser probes at 390/1280 verified page/filtered/all bulk scope,
     # Undo, and preservation of later row edits. Task 12 owns automated events.
     check(
