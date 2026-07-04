@@ -79,7 +79,7 @@ Scenario costs remain in the existing scenario view objects. The readiness build
 - Create: `tests/__init__.py`
 - Create: `tests/test_assessment_readiness.py`
 
-- [ ] **Step 1: Write failing readiness contract tests**
+- [x] **Step 1: Write failing readiness contract tests**
 
 Create `tests/test_assessment_readiness.py` with a reusable complete context and focused tests:
 
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the tests and confirm the expected import failure**
+- [x] **Step 2: Run the tests and confirm the expected import failure**
 
 Run:
 
@@ -193,7 +193,7 @@ Run:
 
 Expected: `ModuleNotFoundError: No module named 'assessment_readiness'`.
 
-- [ ] **Step 3: Implement the readiness builder**
+- [x] **Step 3: Implement the readiness builder**
 
 Create `assessment_readiness.py` with:
 
@@ -307,7 +307,7 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
 
 During implementation, keep the returned keys exactly as shown but enrich `blockers` and `advisories` with stable `id`, `title`, `detail`, `stage`, and `affected_vm_names` fields from the adapter in `app.py`.
 
-- [ ] **Step 4: Run the readiness tests**
+- [x] **Step 4: Run the readiness tests**
 
 Run:
 
@@ -317,7 +317,7 @@ Run:
 
 Expected: 4 tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add assessment_readiness.py tests/__init__.py tests/test_assessment_readiness.py
@@ -331,7 +331,7 @@ git commit -m "feat: add assessment readiness model"
 - Modify: `app.py:683-817`
 - Modify: `tests/regression_check.py:442-584`
 
-- [ ] **Step 1: Add failing backward-compatibility and round-trip checks**
+- [x] **Step 1: Add failing backward-compatibility and round-trip checks**
 
 Extend `validate_saved_assessments()` to verify:
 
@@ -344,7 +344,7 @@ app_module.save_app_state(state)
 
 After load, assert all three fields are restored. Also write an old-format state JSON without those keys and assert `load_app_state()` returns `[]`, `""`, and `""` respectively.
 
-- [ ] **Step 2: Run the regression and confirm the new assertion fails**
+- [x] **Step 2: Run the regression and confirm the new assertion fails**
 
 Run:
 
@@ -354,7 +354,7 @@ Run:
 
 Expected: the new persisted-state check reports `FAIL`.
 
-- [ ] **Step 3: Add defaults and normalization**
+- [x] **Step 3: Add defaults and normalization**
 
 Add to `_default_app_state()`:
 
@@ -371,11 +371,11 @@ In `load_app_state()`:
 - Limit rationale to 4,000 characters.
 - Preserve the current default-update behavior so older snapshots gain the fields automatically.
 
-- [ ] **Step 4: Verify local saved-assessment snapshots round-trip the new state**
+- [x] **Step 4: Verify local saved-assessment snapshots round-trip the new state**
 
 The current `save_current_assessment()` already writes `app_state`; do not duplicate the fields at the snapshot top level. Confirm `load_saved_assessment()` routes the snapshot through the same normalization before saving it into the active state file.
 
-- [ ] **Step 5: Run the full regression**
+- [x] **Step 5: Run the full regression**
 
 Run:
 
@@ -385,7 +385,7 @@ Run:
 
 Expected: `All regression checks passed.`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app.py tests/regression_check.py
@@ -407,7 +407,7 @@ git commit -m "feat: persist assessment review decisions"
 - Modify: `app.py:5449-6614`
 - Modify: `tests/regression_check.py:591-816`
 
-- [ ] **Step 1: Add failing shell checks**
+- [x] **Step 1: Add failing shell checks**
 
 For `GET /`, `GET /step3`, and `GET /step4?tab=native`, assert the rendered response contains:
 
@@ -420,7 +420,7 @@ For `GET /`, `GET /step3`, and `GET /step4?tab=native`, assert the rendered resp
 
 Assert each page contains `Step 1 of 4`, `Step 2 of 4`, or `Step 3 of 4` as appropriate and never contains the old color-system explanation.
 
-- [ ] **Step 2: Run the regression and confirm shell checks fail**
+- [x] **Step 2: Run the regression and confirm shell checks fail**
 
 Run:
 
@@ -430,7 +430,7 @@ Run:
 
 Expected: the first shared-shell assertion reports `FAIL`.
 
-- [ ] **Step 3: Build `base.html`**
+- [x] **Step 3: Build `base.html`**
 
 Use one document shell with blocks `title`, `head`, `stage_content`, and `scripts`. Include the assets with `url_for("static", filename="css/workspace.css")` and `url_for("static", filename="js/workspace.js")`. Render:
 
@@ -444,7 +444,7 @@ Use one document shell with blocks `title`, `head`, `stage_content`, and `script
 - A skip link targeting `#main-workspace`.
 - Previous/Continue footer actions supplied by each route.
 
-- [ ] **Step 4: Add the common template context adapter**
+- [x] **Step 4: Add the common template context adapter**
 
 Create `build_workspace_context(stage_id, readiness, **values)` in `app.py`. It must supply:
 
@@ -464,7 +464,7 @@ Create `build_workspace_context(stage_id, readiness, **values)` in `app.py`. It 
 
 Map stage IDs to visible names and compatibility URLs in one constant. Stage 4 maps to `/step4?tab=price`; Stage 3 maps only to `native`, `ocvs`, and `hybrid` tabs.
 
-- [ ] **Step 5: Move shared visual rules into `workspace.css`**
+- [x] **Step 5: Move shared visual rules into `workspace.css`**
 
 Define Redwood-aligned tokens for neutral surfaces, Oracle red brand accent, green/teal primary actions, amber review states, and red errors. Include:
 
@@ -476,15 +476,15 @@ Define Redwood-aligned tokens for neutral surfaces, Oracle red brand accent, gre
 - Cards at 8px radius or less.
 - No gradients, decorative orbs, nested cards, or viewport-scaled type.
 
-- [ ] **Step 6: Implement common interactions in `workspace.js`**
+- [x] **Step 6: Implement common interactions in `workspace.js`**
 
 Implement stage-select navigation, assessment-menu open/close, Escape handling, outside-click close, and focus return. Do not implement readiness rules in JavaScript.
 
-- [ ] **Step 7: Convert the three templates to extend `base.html`**
+- [x] **Step 7: Convert the three templates to extend `base.html`**
 
 Initially wrap their existing inner content in `stage_content`; later tasks replace that content. Remove duplicate `<html>`, `<head>`, header, progress, shared button CSS, and shared scripts from each template.
 
-- [ ] **Step 8: Run template and regression checks**
+- [x] **Step 8: Run template and regression checks**
 
 Run:
 
@@ -495,7 +495,7 @@ Run:
 
 Expected: compilation succeeds and all regression checks pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add app.py templates static tests/regression_check.py
@@ -511,7 +511,7 @@ git commit -m "feat: add shared Redwood assessment shell"
 - Modify: `app.py:5449-5851`
 - Modify: `tests/regression_check.py:315-441`
 
-- [ ] **Step 1: Add failing Stage 1 checks**
+- [x] **Step 1: Add failing Stage 1 checks**
 
 Add regression checks for:
 
@@ -524,7 +524,7 @@ Add regression checks for:
 
 For replacement preservation, create a valid manual inventory, capture its path, upload invalid CSV bytes, and assert the path and prior selected VM names remain unchanged.
 
-- [ ] **Step 2: Run the regression and confirm the preservation check fails**
+- [x] **Step 2: Run the regression and confirm the preservation check fails**
 
 Run:
 
@@ -534,7 +534,7 @@ Run:
 
 Expected: the invalid-replacement preservation check reports `FAIL` until route handling is transactional.
 
-- [ ] **Step 3: Separate validation from inventory activation**
+- [x] **Step 3: Separate validation from inventory activation**
 
 Refactor Stage 1 helpers so upload/manual actions:
 
@@ -546,7 +546,7 @@ Refactor Stage 1 helpers so upload/manual actions:
 
 Do not call the current source-clearing helper before candidate validation succeeds.
 
-- [ ] **Step 4: Rebuild Stage 1 content**
+- [x] **Step 4: Rebuild Stage 1 content**
 
 Render three unframed sections:
 
@@ -556,11 +556,11 @@ Render three unframed sections:
 
 Keep the local saved-assessment library in the global menu rather than a fixed right rail. Use `fieldset` and `legend` for the inventory mode. `setup.js` toggles panels with `hidden`, keeps focus on the selected mode, and does not erase values in the inactive panel.
 
-- [ ] **Step 5: Add field-level errors**
+- [x] **Step 5: Add field-level errors**
 
 Return a `field_errors` mapping from failed POST actions and render each error next to its control with `aria-describedby`. Place a linked error summary at the top and focus it after response load.
 
-- [ ] **Step 6: Run Stage 1 and full regression checks**
+- [x] **Step 6: Run Stage 1 and full regression checks**
 
 Run:
 
@@ -570,7 +570,7 @@ Run:
 
 Expected: all checks pass, including manual create/update and replacement preservation.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add app.py templates/index.html templates/_source_details.html static/js/setup.js tests/regression_check.py
@@ -589,7 +589,7 @@ git commit -m "feat: redesign setup and inventory source flow"
 - Modify: `app.py:5855-6021`
 - Modify: `tests/regression_check.py:230-314`
 
-- [ ] **Step 1: Add failing Stage 2 state and markup checks**
+- [x] **Step 1: Add failing Stage 2 state and markup checks**
 
 Exercise `POST /step3` with a single `save_inventory_review` action containing repeated `included_vm_names` and `placement:<encoded-vm-name>` controls. Assert:
 
@@ -599,7 +599,7 @@ Exercise `POST /step3` with a single `save_inventory_review` action containing r
 - Critical warnings cannot be acknowledged.
 - The response has native checkboxes, `aria-sort`, warning filter buttons, bulk placement controls, and an Undo live region.
 
-- [ ] **Step 2: Run the focused regression and confirm failure**
+- [x] **Step 2: Run the focused regression and confirm failure**
 
 Run:
 
@@ -609,7 +609,7 @@ Run:
 
 Expected: the new `save_inventory_review` assertion reports `FAIL`.
 
-- [ ] **Step 3: Normalize warning severity and VM identifiers**
+- [x] **Step 3: Normalize warning severity and VM identifiers**
 
 Extend `build_inventory_review_issues()` so every issue includes:
 
@@ -626,7 +626,7 @@ Extend `build_inventory_review_issues()` so every issue includes:
 
 Use `critical` for `missing-storage`, `missing-cpu`, and `missing-memory`. Use `advisory` for `unsupported-native`, `unknown-os`, and `duplicate-vm-name`.
 
-- [ ] **Step 4: Implement one authoritative save action**
+- [x] **Step 4: Implement one authoritative save action**
 
 In `/step3`, implement `save_inventory_review` to:
 
@@ -640,11 +640,11 @@ In `/step3`, implement `save_inventory_review` to:
 
 Keep old `add`, `remove`, and `remove_duplicates` handlers temporarily for bookmarked forms and existing regression compatibility, but do not render them in the redesigned UI.
 
-- [ ] **Step 5: Render warning inbox and single inventory list**
+- [x] **Step 5: Render warning inbox and single inventory list**
 
 The inventory table columns are inclusion, name, power, OS, Native support, vCPU, RAM, storage, suggested placement, warning, and details. Use checkbox IDs derived from row index, never raw VM names. Add programmatic labels and sortable header buttons with `aria-sort`.
 
-- [ ] **Step 6: Implement filtering, bulk placement, and Undo**
+- [x] **Step 6: Implement filtering, bulk placement, and Undo**
 
 `inventory-review.js` must:
 
@@ -655,11 +655,11 @@ The inventory table columns are inclusion, name, power, OS, Native support, vCPU
 - Restore the snapshot on Undo.
 - Leave final persistence to the form submit.
 
-- [ ] **Step 7: Add mobile list behavior**
+- [x] **Step 7: Add mobile list behavior**
 
 At widths below 768px, hide nonessential table columns, retain inclusion/name/status, and expose remaining fields through a `<details>` row panel. Do not duplicate form controls into a second DOM tree.
 
-- [ ] **Step 8: Run regression checks**
+- [x] **Step 8: Run regression checks**
 
 Run:
 
@@ -669,7 +669,7 @@ Run:
 
 Expected: all checks pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add app.py templates/step3.html templates/_warning_inbox.html templates/_inventory_table.html static/css/inventory-review.css static/js/inventory-review.js tests/regression_check.py
@@ -685,7 +685,7 @@ git commit -m "feat: add guided inventory review workspace"
 - Modify: `tests/test_assessment_readiness.py`
 - Modify: `tests/regression_check.py:911-1030`
 
-- [ ] **Step 1: Add failing adapter integration tests**
+- [x] **Step 1: Add failing adapter integration tests**
 
 Build a selected workload with one unsupported VM and complete Native pricing. Assert the route context reports:
 
@@ -696,7 +696,7 @@ Build a selected workload with one unsupported VM and complete Native pricing. A
 
 Set OCVS physical cores above zero and VCF unit price to zero. Assert OCVS and Hybrid pricing state is `incomplete`, `rankable is False`, and `fit_warnings` appear in the readiness payload.
 
-- [ ] **Step 2: Run tests and confirm adapter assertions fail**
+- [x] **Step 2: Run tests and confirm adapter assertions fail**
 
 Run:
 
@@ -707,7 +707,7 @@ Run:
 
 Expected: pure tests pass; route adapter checks fail.
 
-- [ ] **Step 3: Implement `build_current_readiness_context()` in `app.py`**
+- [x] **Step 3: Implement `build_current_readiness_context()` in `app.py`**
 
 The adapter must receive already-loaded inventory rows, selected names, scenario views, and app state. It must:
 
@@ -720,11 +720,11 @@ The adapter must receive already-loaded inventory rows, selected names, scenario
 - Pass unsaved-change state from the submitted form error path; default false after successful save.
 - Call `build_assessment_readiness()` exactly once per request.
 
-- [ ] **Step 4: Supply readiness to every stage**
+- [x] **Step 4: Supply readiness to every stage**
 
 Use the adapter in `/`, `/step3`, and `/step4`. For early stages where scenarios cannot yet be calculated, supply explicitly incomplete scenario inputs rather than inventing zero-cost complete scenarios.
 
-- [ ] **Step 5: Run all readiness and regression checks**
+- [x] **Step 5: Run all readiness and regression checks**
 
 Run:
 
@@ -735,7 +735,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app.py assessment_readiness.py tests/test_assessment_readiness.py tests/regression_check.py
@@ -753,7 +753,7 @@ git commit -m "feat: connect readiness to assessment calculations"
 - Modify: `app.py:6023-6460`
 - Modify: `tests/regression_check.py:591-816`
 
-- [ ] **Step 1: Add failing Stage 3 checks**
+- [x] **Step 1: Add failing Stage 3 checks**
 
 Assert `/step4?tab=native` renders:
 
@@ -765,7 +765,7 @@ Assert `/step4?tab=native` renders:
 
 Use 75 generated VMs and assert page 1 renders 50 editor rows while totals and workbook inputs still include all 75.
 
-- [ ] **Step 2: Run regression and confirm pagination checks fail**
+- [x] **Step 2: Run regression and confirm pagination checks fail**
 
 Run:
 
@@ -775,11 +775,11 @@ Run:
 
 Expected: the bounded Native editor assertion reports `FAIL`.
 
-- [ ] **Step 3: Restrict visible Stage 3 tabs without changing aliases**
+- [x] **Step 3: Restrict visible Stage 3 tabs without changing aliases**
 
 Keep `normalize_step4_scenario_tab()` and `/scenario/<scenario_id>` compatibility. Redirect `paths` to `/step3` and `price` to `/step4?tab=price`. Render only Native, OCVS, and Hybrid in Stage 3.
 
-- [ ] **Step 4: Add server-side Native pagination**
+- [x] **Step 4: Add server-side Native pagination**
 
 Accept validated query parameters:
 
@@ -792,11 +792,11 @@ native_support=all
 
 Allow page sizes 25, 50, and 100. Filter and paginate only the editor rows. Calculate scenario totals from the complete selected VM list. On POST, update only controls present in the form and preserve stored choices for omitted pages.
 
-- [ ] **Step 5: Split and render the Native partial**
+- [x] **Step 5: Split and render the Native partial**
 
 Use stable IDs based on row index and explicit `<label for>` text containing the VM name and setting. Keep VM and OS columns sticky inside an intentional horizontal scroll container. On mobile, edit one VM in a focused details panel without duplicating controls.
 
-- [ ] **Step 6: Implement accessible tab and dirty-state behavior**
+- [x] **Step 6: Implement accessible tab and dirty-state behavior**
 
 `scenario-editor.js` implements roving tab focus with Left/Right/Home/End keys. On any form change:
 
@@ -806,11 +806,11 @@ Use stable IDs based on row index and explicit `<label for>` text containing the
 - Warn on tab or stage navigation while dirty.
 - Clear dirty state after a successful redirected save.
 
-- [ ] **Step 7: Verify Native unsupported behavior**
+- [x] **Step 7: Verify Native unsupported behavior**
 
 Render `Requires remediation` beside affected Native rows and in the Native scenario header. Never disable Native, remove its cost, or label it ineligible solely because these VMs exist.
 
-- [ ] **Step 8: Run regression checks**
+- [x] **Step 8: Run regression checks**
 
 Run:
 
@@ -820,7 +820,7 @@ Run:
 
 Expected: all checks pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add app.py templates/step4.html templates/_scenario_header.html templates/_scenario_native.html static/css/scenarios.css static/js/scenario-editor.js tests/regression_check.py
@@ -838,7 +838,7 @@ git commit -m "feat: rebuild Native scenario workspace"
 - Modify: `app.py:6023-6460`
 - Modify: `tests/regression_check.py:718-812`
 
-- [ ] **Step 1: Add failing OCVS and Hybrid checks**
+- [x] **Step 1: Add failing OCVS and Hybrid checks**
 
 Assert:
 
@@ -849,7 +849,7 @@ Assert:
 - Hybrid workload counts, OCVS subset sizing, and manual override count are present.
 - OCVS and Hybrid become rankable after a positive VCF price is saved.
 
-- [ ] **Step 2: Run regression and confirm grouped/shared-control checks fail**
+- [x] **Step 2: Run regression and confirm grouped/shared-control checks fail**
 
 Run:
 
@@ -859,11 +859,11 @@ Run:
 
 Expected: the first new OCVS grouping assertion reports `FAIL`.
 
-- [ ] **Step 3: Split OCVS and Hybrid partials**
+- [x] **Step 3: Split OCVS and Hybrid partials**
 
 Move existing controls without changing their POST field names. Render `step4_ocvs_*` inputs only in the OCVS partial. Hybrid links to the OCVS tab for shared assumptions and renders only placement override controls.
 
-- [ ] **Step 4: Make blocker and discount status explicit**
+- [x] **Step 4: Make blocker and discount status explicit**
 
 Show:
 
@@ -876,11 +876,11 @@ Show:
 
 Do not derive any of these status labels in JavaScript.
 
-- [ ] **Step 5: Add Hybrid filtering and bulk placement**
+- [x] **Step 5: Add Hybrid filtering and bulk placement**
 
 Reuse the Stage 2 placement vocabulary. Bulk actions snapshot changes for Undo and clearly state their scope. Count manual overrides by comparing saved placement to the initial supported/unsupported recommendation.
 
-- [ ] **Step 6: Run regression checks**
+- [x] **Step 6: Run regression checks**
 
 Run:
 
@@ -890,7 +890,7 @@ Run:
 
 Expected: all checks pass, including all existing OCVS discount invariants.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add app.py templates/step4.html templates/_scenario_ocvs.html templates/_scenario_hybrid.html static/css/scenarios.css static/js/scenario-editor.js tests/regression_check.py
@@ -909,7 +909,7 @@ git commit -m "feat: rebuild OCVS and Hybrid scenarios"
 - Modify: `tests/test_assessment_readiness.py`
 - Modify: `tests/regression_check.py:591-816`
 
-- [ ] **Step 1: Add failing Results checks**
+- [x] **Step 1: Add failing Results checks**
 
 Assert `/step4?tab=price` renders Stage 4 with:
 
@@ -924,7 +924,7 @@ Assert `/step4?tab=price` renders Stage 4 with:
 
 POST recommendation and rationale, reload the page, then save/load the assessment and assert both persist.
 
-- [ ] **Step 2: Run tests and confirm recommendation action fails**
+- [x] **Step 2: Run tests and confirm recommendation action fails**
 
 Run:
 
@@ -935,15 +935,15 @@ Run:
 
 Expected: the Results recommendation persistence assertion reports `FAIL`.
 
-- [ ] **Step 3: Add `save_recommendation` handling**
+- [x] **Step 3: Add `save_recommendation` handling**
 
 Validate recommendation against the four allowed values, normalize rationale to at most 4,000 characters, save app state, and redirect back to `tab=price`. Allow incomplete scenarios to be selected for internal draft review.
 
-- [ ] **Step 4: Render comparison from readiness plus scenario views**
+- [x] **Step 4: Render comparison from readiness plus scenario views**
 
 Use readiness only for eligibility/status/ranking. Use existing scenario views for cost and sizing details. Exclude non-rankable scenarios from `lowest_complete_scenario` but keep their partial cost visible with an `Incomplete pricing` label.
 
-- [ ] **Step 5: Enforce Native customer-ready treatment**
+- [x] **Step 5: Enforce Native customer-ready treatment**
 
 When Native is recommended and unsupported VMs exist, require both:
 
@@ -952,11 +952,11 @@ When Native is recommended and unsupported VMs exist, require both:
 
 Native remains eligible and rankable before these actions; only `customer_ready_export` stays false.
 
-- [ ] **Step 6: Render the initial export center**
+- [x] **Step 6: Render the initial export center**
 
 Show Save assessment and Excel actions. Label Excel `Export Draft` unless `customer_ready_export` is true. Do not render portable JSON actions until Task 10 implements their complete server-side behavior.
 
-- [ ] **Step 7: Run all tests**
+- [x] **Step 7: Run all tests**
 
 Run:
 
@@ -967,7 +967,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add app.py assessment_readiness.py templates/step4.html templates/_results_comparison.html templates/_export_center.html static/css/results.css tests/test_assessment_readiness.py tests/regression_check.py
@@ -985,7 +985,7 @@ git commit -m "feat: add readiness results and recommendation"
 - Modify: `templates/_export_center.html`
 - Modify: `tests/regression_check.py:442-584`
 
-- [ ] **Step 1: Write failing pure package tests**
+- [x] **Step 1: Write failing pure package tests**
 
 Create tests for:
 
@@ -1006,7 +1006,7 @@ from assessment_portability import (
 )
 ```
 
-- [ ] **Step 2: Run tests and confirm import failure**
+- [x] **Step 2: Run tests and confirm import failure**
 
 Run:
 
@@ -1016,7 +1016,7 @@ Run:
 
 Expected: `ModuleNotFoundError: No module named 'assessment_portability'`.
 
-- [ ] **Step 3: Implement package build and validation**
+- [x] **Step 3: Implement package build and validation**
 
 Use constants:
 
@@ -1030,11 +1030,11 @@ MAX_TEXT_LENGTH = 4_000
 
 The validator must return a new normalized object containing only supported keys. It must never return or dereference a supplied inventory path, price-list path, generated export path, or local assessment ID.
 
-- [ ] **Step 4: Add export helpers and action**
+- [x] **Step 4: Add export helpers and action**
 
 Build the package from the current session, normalized inventory rows, selected pricing JSON, app state, and Step 4 snapshot. If the active assessment already has a local ID, refresh its snapshot first. Return deterministic UTF-8 JSON with `send_file()` and a sanitized filename. An unsaved export must not create a local saved assessment.
 
-- [ ] **Step 5: Add transactional import helpers and action**
+- [x] **Step 5: Add transactional import helpers and action**
 
 For `import_assessment`:
 
@@ -1047,7 +1047,7 @@ For `import_assessment`:
 7. Load the snapshot through `load_saved_assessment()`.
 8. On failure, remove generated temporary artifacts and preserve current state exactly.
 
-- [ ] **Step 6: Add end-to-end regression coverage**
+- [x] **Step 6: Add end-to-end regression coverage**
 
 Extend `tests/regression_check.py` to export an unsaved current assessment, delete or rename original inventory/pricing dependencies, import the JSON, and confirm:
 
@@ -1055,11 +1055,11 @@ Extend `tests/regression_check.py` to export an unsaved current assessment, dele
 - Customer, notes, currency, normalized inventory, selected VMs, placements, discounts, commitment term, acknowledgments, recommendation, and rationale are restored.
 - Invalid packages leave session state and saved library byte-for-byte unchanged.
 
-- [ ] **Step 7: Enable JSON controls**
+- [x] **Step 7: Enable JSON controls**
 
 Replace disabled placeholders in the global assessment menu and Stage 4 export center with labeled Export current assessment and Import assessment controls. Keep Load previous assessment visible and disabled when the library is empty.
 
-- [ ] **Step 8: Run portability and full regression tests**
+- [x] **Step 8: Run portability and full regression tests**
 
 Run:
 
@@ -1070,7 +1070,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add assessment_portability.py app.py templates/_assessment_menu.html templates/_export_center.html tests/test_assessment_portability.py tests/regression_check.py
@@ -1083,7 +1083,7 @@ git commit -m "feat: add portable assessment JSON"
 - Modify: `app.py:4206-5335`
 - Modify: `tests/regression_check.py:818-910`
 
-- [ ] **Step 1: Add failing workbook assertions**
+- [x] **Step 1: Add failing workbook assertions**
 
 Open the generated workbook and assert its executive summary includes:
 
@@ -1097,7 +1097,7 @@ Open the generated workbook and assert its executive summary includes:
 
 Also assert existing price, discount, sizing, and scenario formula checks remain unchanged.
 
-- [ ] **Step 2: Run regression and confirm workbook metadata checks fail**
+- [x] **Step 2: Run regression and confirm workbook metadata checks fail**
 
 Run:
 
@@ -1107,15 +1107,15 @@ Run:
 
 Expected: the first readiness workbook assertion reports `FAIL`.
 
-- [ ] **Step 3: Pass readiness into workbook generation**
+- [x] **Step 3: Pass readiness into workbook generation**
 
 Add a required `readiness` argument and optional recommendation fields to `build_migration_price_workbook_xlsx()`. Render readiness metadata in the executive summary and warning section. Do not change calculation cells or shape-price formulas.
 
-- [ ] **Step 4: Distinguish draft and customer-ready exports**
+- [x] **Step 4: Distinguish draft and customer-ready exports**
 
 The HTTP action and workbook use `Export Draft`/`Draft` unless `readiness["customer_ready_export"]` is true. Draft export remains available even when scenarios are incomplete.
 
-- [ ] **Step 5: Run workbook and full regression checks**
+- [x] **Step 5: Run workbook and full regression checks**
 
 Run:
 
@@ -1125,7 +1125,7 @@ Run:
 
 Expected: all checks pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add app.py tests/regression_check.py
@@ -1148,7 +1148,7 @@ git commit -m "feat: include assessment readiness in Excel"
 - Modify: `templates/_results_comparison.html`
 - Modify: `tests/regression_check.py`
 
-- [ ] **Step 1: Add automated markup checks**
+- [x] **Step 1: Add automated markup checks**
 
 Assert:
 
@@ -1159,7 +1159,7 @@ Assert:
 - No duplicate IDs exist on each rendered stage.
 - Every sticky mobile action bar reserves matching bottom padding in the main content.
 
-- [ ] **Step 2: Run regression and fix markup failures**
+- [x] **Step 2: Run regression and fix markup failures**
 
 Run:
 
@@ -1169,7 +1169,7 @@ Run:
 
 Expected: all automated checks pass before browser verification.
 
-- [ ] **Step 3: Verify all stages in the in-app browser**
+- [x] **Step 3: Verify all stages in the in-app browser**
 
 Use the `browser:control-in-app-browser` skill. Start the app on a free localhost port and inspect these widths for all four stages:
 
@@ -1189,19 +1189,19 @@ For each viewport verify:
 - The primary action remains visible and reachable.
 - Mobile details editors do not duplicate submitted controls.
 
-- [ ] **Step 4: Complete keyboard-only workflow verification**
+- [x] **Step 4: Complete keyboard-only workflow verification**
 
 Using the browser, complete Setup, Inventory Review, Scenario tabs, recommendation, and export without pointer clicks. Verify focus order, visible focus, Escape behavior, tab arrow keys, native checkbox behavior, sortable headers, Undo, dialogs/drawers, and error-summary focus.
 
-- [ ] **Step 5: Inspect contrast and status semantics**
+- [x] **Step 5: Inspect contrast and status semantics**
 
 Check normal, hover, active, disabled, warning, error, success, and focus states. Verify scenario tabs are not overridden by global button CSS. Use text/icon labels in addition to green, amber, and red.
 
-- [ ] **Step 6: Capture final screenshots**
+- [x] **Step 6: Capture final screenshots**
 
 Save representative Stage 1, Stage 2, Stage 3 Native, and Stage 4 screenshots at desktop and 390px under `artifacts/gui-review/`. Inspect each image before accepting it. Do not commit screenshots unless the repository already tracks review artifacts.
 
-- [ ] **Step 7: Run final frontend regression after fixes**
+- [x] **Step 7: Run final frontend regression after fixes**
 
 Run:
 
@@ -1211,7 +1211,7 @@ Run:
 
 Expected: all checks pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add static templates tests/regression_check.py
@@ -1224,7 +1224,7 @@ git commit -m "fix: harden workspace accessibility and responsive layout"
 - Modify: `readme.MD`
 - Modify: `docs/superpowers/plans/2026-07-03-guided-assessment-workspace.md`
 
-- [ ] **Step 1: Update user documentation**
+- [x] **Step 1: Update user documentation**
 
 Replace the five-step legacy workflow with:
 
@@ -1235,7 +1235,7 @@ Replace the five-step legacy workflow with:
 
 Document manual summary editing, warning acknowledgment, Native remediation behavior, VCF pricing completeness, local saved assessments, portable JSON import/export, assessor recommendation, draft/customer-ready Excel, and the continued exclusion of Word proposal generation.
 
-- [ ] **Step 2: Run the complete automated verification suite**
+- [x] **Step 2: Run the complete automated verification suite**
 
 Run:
 
@@ -1251,7 +1251,7 @@ Expected:
 - All unit tests report `OK`.
 - Regression output ends with `All regression checks passed.`
 
-- [ ] **Step 3: Run a clean-server smoke test**
+- [x] **Step 3: Run a clean-server smoke test**
 
 Stop the old local process, start `app.py` on a free port, and request:
 
@@ -1269,11 +1269,11 @@ Stop the old local process, start `app.py` on a free port, and request:
 
 Expected: configured routes return 200; prerequisite routes redirect to Setup with a readable message when no assessment is loaded; aliases reach the correct stage.
 
-- [ ] **Step 4: Re-run browser acceptance on the clean server**
+- [x] **Step 4: Re-run browser acceptance on the clean server**
 
 Verify the saved assessment library, JSON export/import, Stage 2 warning filtering, Native eligibility with unsupported VMs, VCF blocker, recommendation persistence, and draft/customer-ready Excel labels.
 
-- [ ] **Step 5: Review spec coverage and remove temporary markers**
+- [x] **Step 5: Review spec coverage and remove temporary markers**
 
 Run:
 
@@ -1285,14 +1285,14 @@ git status --short
 
 Expected: no temporary implementation markers, no whitespace errors, and only the intended documentation changes remain unstaged.
 
-- [ ] **Step 6: Commit documentation**
+- [x] **Step 6: Commit documentation**
 
 ```bash
 git add readme.MD docs/superpowers/plans/2026-07-03-guided-assessment-workspace.md
 git commit -m "docs: describe guided assessment workflow"
 ```
 
-- [ ] **Step 7: Confirm the repository is clean**
+- [x] **Step 7: Confirm the repository is clean**
 
 Run:
 
@@ -1304,21 +1304,21 @@ Expected: no modified or untracked files. The local branch may be ahead of `orig
 
 ## Final Acceptance Checklist
 
-- [ ] Four stages use one persistent Redwood shell and consistent `Step N of 4` progress.
-- [ ] Setup keeps assessment name and customer/project name distinct.
-- [ ] Upload and manual inventory modes are clear, editable, and transactional.
-- [ ] Stage 2 uses one accessible inventory list with warning filtering, placement, bulk actions, and Undo.
-- [ ] Native remains eligible and rankable with unsupported VMs, while remediation stays visible.
-- [ ] Native customer-ready recommendation requires warning review and a treatment rationale.
-- [ ] OCVS and Hybrid are excluded from normal ranking when required VCF pricing is missing.
-- [ ] Scenario configuration has only Native, OCVS, and Hybrid tabs with saved/dirty state.
-- [ ] Results separate technical eligibility, pricing completeness, and modeled cost.
-- [ ] Lowest complete modeled price is not presented as an automatic recommendation.
-- [ ] Recommendation and rationale persist through local saves and portable JSON.
-- [ ] Excel clearly distinguishes draft and customer-ready output.
-- [ ] JSON export is self-contained; import is validated, transactional, and creates a new local copy.
-- [ ] Existing routes, saved assessments, manual sizing, discounts, calculations, and workbook invariants remain compatible.
-- [ ] No page-level overflow or incoherent overlap at 390px, 768px, 1280px, or 1440px.
-- [ ] Core workflow is keyboard operable and all controls have accessible names.
-- [ ] Automated and browser verification pass from a clean server.
-- [ ] Worktree is clean, with no PR or push performed.
+- [x] Four stages use one persistent Redwood shell and consistent `Step N of 4` progress.
+- [x] Setup keeps assessment name and customer/project name distinct.
+- [x] Upload and manual inventory modes are clear, editable, and transactional.
+- [x] Stage 2 uses one accessible inventory list with warning filtering, placement, bulk actions, and Undo.
+- [x] Native remains eligible and rankable with unsupported VMs, while remediation stays visible.
+- [x] Native customer-ready recommendation requires warning review and a treatment rationale.
+- [x] OCVS and Hybrid are excluded from normal ranking when required VCF pricing is missing.
+- [x] Scenario configuration has only Native, OCVS, and Hybrid tabs with saved/dirty state.
+- [x] Results separate technical eligibility, pricing completeness, and modeled cost.
+- [x] Lowest complete modeled price is not presented as an automatic recommendation.
+- [x] Recommendation and rationale persist through local saves and portable JSON.
+- [x] Excel clearly distinguishes draft and customer-ready output.
+- [x] JSON export is self-contained; import is validated, transactional, and creates a new local copy.
+- [x] Existing routes, saved assessments, manual sizing, discounts, calculations, and workbook invariants remain compatible.
+- [x] No page-level overflow or incoherent overlap at 390px, 768px, 1280px, or 1440px.
+- [x] Core workflow is keyboard operable and all controls have accessible names.
+- [x] Automated and browser verification pass from a clean server.
+- [x] Worktree is clean, with no PR or push performed.

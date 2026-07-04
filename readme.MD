@@ -169,25 +169,45 @@ http://127.0.0.1:5000/
 ## Basic Workflow
 
 1. **Setup & Inventory**
-   - Enter customer name.
-   - Select or download an OCI price list.
-   - Select or upload inventory.
+   - Name the assessment and enter the customer or project name.
+   - Select, upload, or download an OCI price list.
+   - Import RVTools inventory or create a manual sizing summary.
+   - Save locally, load an earlier assessment, or import a portable assessment JSON file.
 
-2. **VM Selection**
-   - Choose VMs in scope.
-   - Optionally remove duplicate VM-name rows.
+2. **Inventory Review**
+   - Review warnings and filter directly to affected VMs.
+   - Include or exclude VMs and assign Native, OCVS, or Review placement.
+   - Apply bulk placement with Undo, then save the reviewed inventory.
+   - Edit manual VM count, vCPU, memory, storage, and operating-system mix without starting over.
 
-3. **Migration Paths**
-   - Review workload summary and migration path options.
+3. **Scenario Configuration**
+   - Tune OCI Native sizing and storage assumptions.
+   - Configure OCVS shape, term, datastore, discount, and VCF licensing inputs.
+   - Review or adjust Hybrid placement between Native and OCVS.
+   - Unsupported Native VMs remain technically eligible and visible; record their remediation or migration treatment before a Native recommendation can be customer-ready.
 
-4. **Scenario Tabs**
-   - Tune OCI Native assumptions.
-   - Tune OCVS assumptions.
-   - Tune Hybrid placement.
+4. **Results & Export**
+   - Compare technical eligibility, pricing completeness, and modeled cost separately.
+   - Select the assessor recommendation and record a customer-facing rationale.
+   - Acknowledge outstanding warnings before producing customer-ready output.
+   - Export a draft or customer-ready Excel workbook, or export the current assessment as portable JSON.
 
-5. **Price Comparison**
-   - Review ranked monthly, annual, and 3-year price comparison.
-   - Export the Excel report.
+The lowest complete modeled price is shown as a comparison signal; the app does not automatically turn it into the assessor recommendation.
+
+## Assessment Readiness
+
+- **OCI Native:** Unsupported guest operating systems do not make the scenario ineligible. They create a remediation-required warning. The scenario remains rankable, but a customer-ready Native recommendation requires warning acknowledgment and a written treatment rationale.
+- **OCVS and Hybrid:** When the OCVS workload requires VCF licensing, a valid non-zero VCF price is required for complete pricing. Scenarios with missing required VCF pricing are excluded from normal price ranking until the input is completed.
+- **Review placement:** VMs left in Review remain visible as unresolved decisions and are conservatively modeled on OCVS until placement is confirmed.
+- **Exports:** Draft Excel remains available while review items are open. Customer-ready status is granted only when the selected recommendation meets its readiness requirements.
+
+## Saving and Sharing Assessments
+
+- **Local saves:** Save the current assessment to the local assessment library and load it later from Setup.
+- **Portable JSON:** Export the open assessment as a self-contained JSON package for backup or team sharing. Import validates the package before changing the active assessment and creates a new local copy rather than overwriting an existing save.
+- **Sensitive data:** Portable packages and local saves can contain customer names, VM inventory, pricing inputs, review decisions, and recommendation rationale. Handle them as customer-sensitive files.
+
+Word proposal generation is not included in this release. Customer-facing output is provided through the Excel assessment workbook.
 
 ## Input Files
 
@@ -237,6 +257,8 @@ The workbook includes:
 - Non-Selected VMs
 - Price List
 - Technical Details
+
+The workbook also carries assessment-readiness and assessor-recommendation metadata. Its title and status identify whether the export is a working draft or customer-ready output.
 
 ## Local Data
 
