@@ -6492,7 +6492,8 @@ def _xlsx_col_ref(col_idx: int) -> str:
 
 
 def _xlsx_clean_text(value: Any) -> str:
-    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(value))
+    cleaned = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(value))
+    return cleaned[:32767]
 
 
 class _TrustedXlsxFormula:
@@ -6770,6 +6771,9 @@ def _workbook_readiness_metadata(
     assessor_recommendation: Any = "",
     recommendation_rationale: Any = "",
 ) -> dict[str, Any]:
+    max_issue_count = 1000
+    max_affected_names = 1000
+    max_text_length = 4000
     readiness_labels = {
         "draft_review_required": "Draft review required",
         "incomplete": "Incomplete",
@@ -6783,6 +6787,47 @@ def _workbook_readiness_metadata(
     malformed = not isinstance(readiness, dict)
     source = readiness if isinstance(readiness, dict) else {}
 
+    def bounded_text(value: Any, *, required: bool = False) -> str:
+        nonlocal malformed
+        if not isinstance(value, str):
+            malformed = True
+            return ""
+        text = value.strip()
+        if len(value) > max_text_length or len(text) > max_text_length:
+            text = text[:max_text_length]
+            malformed = True
+        if required and not text:
+            malformed = True
+        return text
+
+    def normalized_names(value: Any) -> list[str]:
+        nonlocal malformed
+        if not isinstance(value, list):
+            malformed = True
+            return []
+        if len(value) > max_affected_names:
+            malformed = True
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for name in value[:max_affected_names]:
+            clean_name = bounded_text(name, required=True)
+            if not clean_name:
+                continue
+            if clean_name in seen:
+                malformed = True
+                continue
+            seen.add(clean_name)
+            normalized.append(clean_name)
+        return normalized
+
+    def bounded_names_display(names: list[str]) -> str:
+        nonlocal malformed
+        display = ", ".join(names)
+        if len(display) > max_text_length:
+            display = display[:max_text_length]
+            malformed = True
+        return display or "None"
+
     overall_state = source.get("overall_state")
     if not isinstance(overall_state, str) or overall_state not in readiness_labels:
         overall_state = "incomplete"
@@ -6792,21 +6837,14 @@ def _workbook_readiness_metadata(
     if not isinstance(customer_ready_export, bool):
         customer_ready_export = False
         malformed = True
+    if (overall_state == "customer_ready") != (customer_ready_export is True):
+        malformed = True
 
-    if not isinstance(assessor_recommendation, str):
+    recommendation = bounded_text(assessor_recommendation)
+    if recommendation not in {"", *recommendation_labels}:
         recommendation = ""
         malformed = True
-    else:
-        recommendation = assessor_recommendation.strip()
-        if recommendation not in {"", *recommendation_labels}:
-            recommendation = ""
-            malformed = True
-
-    if not isinstance(recommendation_rationale, str):
-        rationale = ""
-        malformed = True
-    else:
-        rationale = recommendation_rationale.strip()
+    rationale = bounded_text(recommendation_rationale)
 
     scenario_values = source.get("scenarios")
     if not isinstance(scenario_values, dict):
@@ -6819,8 +6857,18 @@ def _workbook_readiness_metadata(
             scenario = {}
             malformed = True
 
+        technical_eligibility = scenario.get("technical_eligibility")
+        if (
+            not isinstance(technical_eligibility, str)
+            or technical_eligibility not in {"eligible", "ineligible"}
+        ):
+            technical_eligibility = "ineligible"
+            malformed = True
         pricing_state = scenario.get("pricing_state")
-        if pricing_state not in {"complete", "incomplete"}:
+        if (
+            not isinstance(pricing_state, str)
+            or pricing_state not in {"complete", "incomplete"}
+        ):
             pricing_state = "incomplete"
             malformed = True
         rankable = scenario.get("rankable")
@@ -6836,21 +6884,23 @@ def _workbook_readiness_metadata(
             remediation_required = False
             malformed = True
 
-        raw_names = scenario.get("affected_vm_names")
-        affected_vm_names: list[str] = []
-        if not isinstance(raw_names, list):
+        affected_vm_names = normalized_names(scenario.get("affected_vm_names"))
+        if rankable != (
+            technical_eligibility == "eligible" and pricing_state == "complete"
+        ):
             malformed = True
-        else:
-            for name in raw_names:
-                if not isinstance(name, str) or not name.strip():
-                    malformed = True
-                    continue
-                clean_name = name.strip()
-                if clean_name in affected_vm_names:
-                    malformed = True
-                    continue
-                affected_vm_names.append(clean_name)
+        if scenario_customer_ready and not rankable:
+            malformed = True
+        if scenario_id == "native":
+            if remediation_required != bool(affected_vm_names):
+                malformed = True
+            remediation_required = remediation_required or bool(affected_vm_names)
+        elif remediation_required or affected_vm_names:
+            malformed = True
+            remediation_required = False
+            affected_vm_names = []
         scenarios[scenario_id] = {
+            "technical_eligibility": technical_eligibility,
             "pricing_state": pricing_state,
             "rankable": rankable,
             "customer_ready": scenario_customer_ready,
@@ -6858,62 +6908,65 @@ def _workbook_readiness_metadata(
             "affected_vm_names": affected_vm_names,
         }
 
+    seen_issue_ids: set[str] = set()
+    issue_input_count = 0
+
     def normalize_issues(key: str) -> list[dict[str, str]]:
-        nonlocal malformed
+        nonlocal issue_input_count, malformed
         values = source.get(key)
         if not isinstance(values, list):
             malformed = True
             return []
+        remaining = max_issue_count - issue_input_count
+        if len(values) > remaining:
+            malformed = True
         normalized: list[dict[str, str]] = []
-        for value in values:
+        for value in values[:remaining]:
+            issue_input_count += 1
             if not isinstance(value, dict):
                 malformed = True
                 continue
-            issue_id = value.get("id")
-            title = value.get("title")
-            detail = value.get("detail")
-            if not isinstance(issue_id, str):
-                issue_id = ""
+            issue_id = bounded_text(value.get("id"), required=True)
+            if not issue_id:
+                continue
+            if issue_id in seen_issue_ids:
                 malformed = True
-            if not isinstance(title, str):
-                title = ""
-                malformed = True
-            if not isinstance(detail, str):
-                detail = ""
-                malformed = True
-            issue_id = issue_id.strip()
-            title = title.strip() or issue_id.replace("-", " ").title() or "Readiness item"
-            detail = detail.strip() or "No additional detail provided."
-
-            raw_names = value.get("affected_vm_names")
-            names: list[str] = []
-            if not isinstance(raw_names, list):
-                malformed = True
-            else:
-                for name in raw_names:
-                    if not isinstance(name, str) or not name.strip():
-                        malformed = True
-                        continue
-                    clean_name = name.strip()
-                    if clean_name not in names:
-                        names.append(clean_name)
+                continue
+            seen_issue_ids.add(issue_id)
+            title = bounded_text(value.get("title"))
+            detail = bounded_text(value.get("detail"))
+            title = title or bounded_text(issue_id.replace("-", " ").title())
+            title = title or "Readiness item"
+            detail = detail or "No additional detail provided."
+            names = normalized_names(value.get("affected_vm_names"))
             normalized.append(
                 {
+                    "id": issue_id,
                     "title": title,
                     "detail": detail,
-                    "affected_vms": ", ".join(names) or "None",
+                    "affected_vms": bounded_names_display(names),
                 }
             )
         return normalized
 
     blockers = normalize_issues("blocking_items")
     advisories = normalize_issues("advisory_items")
+    native = scenarios["native"]
+    native_affected_vm_names = bounded_names_display(native["affected_vm_names"])
+    if (
+        native["customer_ready"] is True
+        and native["remediation_required"] is True
+        and (recommendation != "native" or not rationale)
+    ):
+        malformed = True
     selected_scenario = scenarios.get(recommendation, {})
     is_customer_ready = bool(
         not malformed
         and overall_state == "customer_ready"
         and customer_ready_export is True
         and recommendation in recommendation_labels
+        and selected_scenario.get("technical_eligibility") == "eligible"
+        and selected_scenario.get("pricing_state") == "complete"
         and selected_scenario.get("rankable") is True
         and selected_scenario.get("customer_ready") is True
         and not blockers
@@ -6925,6 +6978,12 @@ def _workbook_readiness_metadata(
     )
     if overall_state == "customer_ready" and not is_customer_ready:
         malformed = True
+    if (
+        recommendation in recommendation_labels
+        and selected_scenario.get("customer_ready") is True
+        and overall_state != "customer_ready"
+    ):
+        malformed = True
 
     workbook_status = "Customer ready" if is_customer_ready else "Draft"
     readiness_label = (
@@ -6932,7 +6991,6 @@ def _workbook_readiness_metadata(
         if malformed
         else readiness_labels.get(overall_state, "Incomplete")
     )
-    native = scenarios["native"]
     return {
         "workbook_status": workbook_status,
         "readiness_label": readiness_label,
@@ -6942,7 +7000,7 @@ def _workbook_readiness_metadata(
             "Required" if native["remediation_required"] else "Not required"
         ),
         "native_affected_vm_count": len(native["affected_vm_names"]),
-        "native_affected_vm_names": ", ".join(native["affected_vm_names"]) or "None",
+        "native_affected_vm_names": native_affected_vm_names,
         "ocvs_pricing_completeness": (
             "Complete" if scenarios["ocvs"]["pricing_state"] == "complete" else "Incomplete"
         ),

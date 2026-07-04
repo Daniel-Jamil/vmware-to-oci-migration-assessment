@@ -467,6 +467,48 @@ def validate_current_readiness_routes() -> None:
         readiness_results.append(result)
         return result
 
+    pricing_sheet_names = {
+        "Price Comparison",
+        "OCI Native Analysis",
+        "OCVS Analysis",
+        "Hybrid Analysis",
+        "Hybrid Placement",
+        "Selected VMs",
+        "Non-Selected VMs",
+        "Price List",
+    }
+
+    def workbook_signatures(
+        zf: zipfile.ZipFile,
+    ) -> tuple[
+        dict[str, list[tuple[str, str]]],
+        dict[str, list[tuple[str, str]]],
+        tuple[tuple[str, ...], tuple[tuple[str, str], ...]],
+    ]:
+        sheet_map = workbook_sheet_map(zf)
+        numeric_cells: dict[str, list[tuple[str, str]]] = {}
+        formulas: dict[str, list[tuple[str, str]]] = {}
+        for sheet_name, sheet_path in sheet_map.items():
+            root = ET.fromstring(zf.read(sheet_path))
+            formulas[sheet_name] = [
+                (cell.attrib.get("r", ""), formula.text or "")
+                for cell in root.findall(".//m:c", XLSX_NS)
+                if (formula := cell.find("m:f", XLSX_NS)) is not None
+            ]
+            if sheet_name in pricing_sheet_names:
+                numeric_cells[sheet_name] = [
+                    (cell.attrib.get("r", ""), value.text or "")
+                    for cell in root.findall(".//m:c", XLSX_NS)
+                    if (value := cell.find("m:v", XLSX_NS)) is not None
+                ]
+        workbook_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        calc_properties = workbook_root.find("m:calcPr", XLSX_NS)
+        calc_signature = (
+            tuple(sorted(name for name in zf.namelist() if "calc" in name.lower())),
+            tuple(sorted(calc_properties.attrib.items())) if calc_properties is not None else (),
+        )
+        return numeric_cells, formulas, calc_signature
+
     app_module.build_assessment_readiness = tracked_builder
     try:
         with app_module.app.test_client() as client:
@@ -683,9 +725,17 @@ def validate_current_readiness_routes() -> None:
                 f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, readiness={readiness_results[-1]}",
             )
             response.close()
+            baseline_numeric_cells: dict[str, list[tuple[str, str]]] = {}
+            baseline_formulas: dict[str, list[tuple[str, str]]] = {}
+            baseline_calc_signature: tuple[tuple[str, ...], tuple[tuple[str, str], ...]] = ((), ())
             if customer_ready_workbook:
                 with zipfile.ZipFile(customer_ready_workbook) as zf:
                     sheet_map = workbook_sheet_map(zf)
+                    (
+                        baseline_numeric_cells,
+                        baseline_formulas,
+                        baseline_calc_signature,
+                    ) = workbook_signatures(zf)
                     customer_ready_rows = sheet_text_rows(
                         zf, sheet_map["Executive Summary"]
                     )
@@ -716,6 +766,108 @@ def validate_current_readiness_routes() -> None:
                         executive_text,
                     )
                 Path(customer_ready_workbook).unlink(missing_ok=True)
+
+            oversized_text = "x" * 40000
+
+            def malformed_export_builder(context: dict[str, object]) -> dict[str, object]:
+                result = json.loads(json.dumps(original_builder(context)))
+                result["overall_state"] = "customer_ready"
+                result["customer_ready_export"] = True
+                result["scenarios"]["native"]["remediation_required"] = False
+                result["blocking_items"] = [
+                    {
+                        "id": "duplicate-id",
+                        "title": "First issue",
+                        "detail": "First detail.",
+                        "affected_vm_names": ["vm-legacy-01"],
+                    }
+                ]
+                result["advisory_items"] = [
+                    {
+                        "id": "duplicate-id",
+                        "title": "Duplicate issue",
+                        "detail": "Duplicate detail.",
+                        "affected_vm_names": ["vm-legacy-01"],
+                    },
+                    {
+                        "id": oversized_text,
+                        "title": oversized_text,
+                        "detail": oversized_text,
+                        "affected_vm_names": [oversized_text],
+                    },
+                    *[
+                        {
+                            "id": f"bounded-issue-{index}",
+                            "title": f"Bounded issue {index}",
+                            "detail": "Review this item.",
+                            "affected_vm_names": [],
+                        }
+                        for index in range(1000)
+                    ],
+                ]
+                return result
+
+            app_module.build_assessment_readiness = malformed_export_builder
+            try:
+                malformed_response = client.post("/step4", data=export_data)
+                with client.session_transaction() as sess:
+                    malformed_workbook = str(sess.get("last_export_file", "")).strip()
+                malformed_export_status = malformed_response.status_code
+                malformed_response.close()
+            finally:
+                app_module.build_assessment_readiness = tracked_builder
+
+            malformed_artifact_ok = False
+            malformed_artifact_detail = "workbook not created"
+            if malformed_workbook and Path(malformed_workbook).is_file():
+                with zipfile.ZipFile(malformed_workbook) as zf:
+                    sheet_map = workbook_sheet_map(zf)
+                    executive_path = sheet_map["Executive Summary"]
+                    executive_root = ET.fromstring(zf.read(executive_path))
+                    executive_rows = sheet_text_rows(zf, executive_path)
+                    executive_values = [
+                        value for row in executive_rows for value in row
+                    ]
+                    executive_text_lengths = [
+                        len(node.text or "")
+                        for node in executive_root.findall(".//m:t", XLSX_NS)
+                    ]
+                    numeric_cells, formulas, calc_signature = workbook_signatures(zf)
+                    malformed_artifact_ok = all(
+                        (
+                            malformed_export_status == 200,
+                            "Executive Summary - Draft" in executive_values,
+                            "Customer ready" not in executive_values,
+                            any(
+                                row[:2] == ["Assessment Readiness", "Incomplete"]
+                                for row in executive_rows
+                            ),
+                            any(
+                                row[:2] == ["Native Remediation Status", "Required"]
+                                for row in executive_rows
+                            ),
+                            executive_values.count("First issue") == 1,
+                            "Duplicate issue" not in executive_values,
+                            bool(executive_text_lengths),
+                            max(executive_text_lengths, default=0) <= 4000,
+                            len(executive_root.findall(".//m:row", XLSX_NS)) <= 1200,
+                            numeric_cells == baseline_numeric_cells,
+                            formulas == baseline_formulas,
+                            calc_signature == baseline_calc_signature,
+                        )
+                    )
+                    malformed_artifact_detail = (
+                        f"status={malformed_export_status}, rows={len(executive_root.findall('.//m:row', XLSX_NS))}, "
+                        f"max_text={max(executive_text_lengths, default=0)}, first={executive_values.count('First issue')}, "
+                        f"duplicate={executive_values.count('Duplicate issue')}, pricing_match={numeric_cells == baseline_numeric_cells}, "
+                        f"formula_match={formulas == baseline_formulas}, calc_match={calc_signature == baseline_calc_signature}"
+                    )
+                Path(malformed_workbook).unlink(missing_ok=True)
+            check(
+                "malformed readiness renders bounded draft XML without pricing or calculation drift",
+                malformed_artifact_ok,
+                malformed_artifact_detail,
+            )
 
             malformed_metadata = app_module._workbook_readiness_metadata(
                 {
@@ -764,6 +916,239 @@ def validate_current_readiness_routes() -> None:
             )
     finally:
         app_module.build_assessment_readiness = original_builder
+
+
+def validate_workbook_readiness_metadata_safety() -> None:
+    def customer_ready_metadata(recommendation: str = "ocvs") -> dict[str, object]:
+        scenarios = {
+            scenario_id: {
+                "technical_eligibility": "eligible",
+                "pricing_state": "complete",
+                "rankable": True,
+                "customer_ready": True,
+                "remediation_required": False,
+                "affected_vm_names": [],
+            }
+            for scenario_id in ("native", "ocvs", "hybrid")
+        }
+        return {
+            "overall_state": "customer_ready",
+            "customer_ready_export": True,
+            "scenarios": scenarios,
+            "blocking_items": [],
+            "advisory_items": [],
+            "recommendation": recommendation,
+        }
+
+    contradiction_inputs: list[tuple[str, dict[str, object], object, object]] = []
+
+    incomplete_ocvs = customer_ready_metadata("ocvs")
+    incomplete_ocvs["scenarios"]["ocvs"]["pricing_state"] = "incomplete"
+    contradiction_inputs.append(("incomplete selected OCVS", incomplete_ocvs, "ocvs", "Reviewed."))
+
+    missing_ocvs = customer_ready_metadata("ocvs")
+    del missing_ocvs["scenarios"]["ocvs"]
+    contradiction_inputs.append(("missing selected OCVS", missing_ocvs, "ocvs", "Reviewed."))
+
+    ineligible_ocvs = customer_ready_metadata("ocvs")
+    ineligible_ocvs["scenarios"]["ocvs"]["technical_eligibility"] = "ineligible"
+    contradiction_inputs.append(("ineligible selected OCVS", ineligible_ocvs, "ocvs", "Reviewed."))
+
+    wrong_boolean = customer_ready_metadata("ocvs")
+    wrong_boolean["scenarios"]["ocvs"]["technical_eligibility"] = True
+    contradiction_inputs.append(("wrong readiness field type", wrong_boolean, "ocvs", "Reviewed."))
+
+    wrong_rankable_boolean = customer_ready_metadata("ocvs")
+    wrong_rankable_boolean["scenarios"]["ocvs"]["rankable"] = "true"
+    contradiction_inputs.append(("wrong scenario boolean type", wrong_rankable_boolean, "ocvs", "Reviewed."))
+
+    scenario_not_customer_ready = customer_ready_metadata("ocvs")
+    scenario_not_customer_ready["scenarios"]["ocvs"]["customer_ready"] = False
+    contradiction_inputs.append(("selected scenario not customer ready", scenario_not_customer_ready, "ocvs", "Reviewed."))
+
+    incoherent_overall = customer_ready_metadata("ocvs")
+    incoherent_overall["overall_state"] = "draft_review_required"
+    contradiction_inputs.append(("incoherent overall/export state", incoherent_overall, "ocvs", "Reviewed."))
+
+    incoherent_export = customer_ready_metadata("ocvs")
+    incoherent_export["customer_ready_export"] = False
+    contradiction_inputs.append(("incoherent customer-ready export", incoherent_export, "ocvs", "Reviewed."))
+
+    contradictory_native = customer_ready_metadata("native")
+    contradictory_native["scenarios"]["native"]["affected_vm_names"] = ["legacy-vm"]
+    contradiction_inputs.append(("Native affected names without remediation", contradictory_native, "native", "Treat legacy-vm."))
+
+    contradiction_results = []
+    for label, readiness, recommendation, rationale in contradiction_inputs:
+        normalized = app_module._workbook_readiness_metadata(
+            readiness,
+            assessor_recommendation=recommendation,
+            recommendation_rationale=rationale,
+        )
+        contradiction_results.append(
+            (
+                label,
+                normalized.get("workbook_status"),
+                normalized.get("readiness_label"),
+                normalized.get("customer_ready_export"),
+                normalized.get("native_remediation_status"),
+            )
+        )
+
+    duplicate_issues = customer_ready_metadata("ocvs")
+    duplicate_issues["overall_state"] = "draft_review_required"
+    duplicate_issues["customer_ready_export"] = False
+    duplicate_issues["blocking_items"] = [
+        {
+            "id": "duplicate-id",
+            "title": "First issue",
+            "detail": "First detail.",
+            "affected_vm_names": ["vm-a"],
+        }
+    ]
+    duplicate_issues["advisory_items"] = [
+        {
+            "id": "duplicate-id",
+            "title": "Duplicate issue",
+            "detail": "Duplicate detail.",
+            "affected_vm_names": ["vm-a", "vm-a"],
+        }
+    ]
+    duplicate_normalized = app_module._workbook_readiness_metadata(
+        duplicate_issues,
+        assessor_recommendation="ocvs",
+        recommendation_rationale="Reviewed.",
+    )
+    duplicate_rows = [
+        *duplicate_normalized.get("blockers", []),
+        *duplicate_normalized.get("advisories", []),
+    ]
+
+    excessive_issues = customer_ready_metadata("ocvs")
+    excessive_issues["overall_state"] = "draft_review_required"
+    excessive_issues["customer_ready_export"] = False
+    excessive_issues["advisory_items"] = [
+        {
+            "id": f"issue-{index}",
+            "title": f"Issue {index}",
+            "detail": "Review this item.",
+            "affected_vm_names": [],
+        }
+        for index in range(1001)
+    ]
+    excessive_normalized = app_module._workbook_readiness_metadata(
+        excessive_issues,
+        assessor_recommendation="ocvs",
+        recommendation_rationale="Reviewed.",
+    )
+    excessive_rows = [
+        *excessive_normalized.get("blockers", []),
+        *excessive_normalized.get("advisories", []),
+    ]
+
+    oversized_text = "x" * 40000
+    oversized_metadata = customer_ready_metadata("ocvs")
+    oversized_metadata["overall_state"] = "draft_review_required"
+    oversized_metadata["customer_ready_export"] = False
+    oversized_metadata["advisory_items"] = [
+        {
+            "id": oversized_text,
+            "title": oversized_text,
+            "detail": oversized_text,
+            "affected_vm_names": [oversized_text],
+        }
+    ]
+    oversized_normalized = app_module._workbook_readiness_metadata(
+        oversized_metadata,
+        assessor_recommendation="ocvs",
+        recommendation_rationale=oversized_text,
+    )
+    oversized_issue = oversized_normalized.get("advisories", [{}])[0]
+
+    expanding_title_metadata = customer_ready_metadata("ocvs")
+    expanding_title_metadata["overall_state"] = "draft_review_required"
+    expanding_title_metadata["customer_ready_export"] = False
+    expanding_title_metadata["advisory_items"] = [
+        {
+            "id": "\u00df" * 4000,
+            "title": "",
+            "detail": "Fallback title must remain bounded.",
+            "affected_vm_names": [],
+        }
+    ]
+    expanding_title_normalized = app_module._workbook_readiness_metadata(
+        expanding_title_metadata,
+        assessor_recommendation="ocvs",
+        recommendation_rationale="Reviewed.",
+    )
+    expanding_title_issue = expanding_title_normalized.get("advisories", [{}])[0]
+
+    literal_xml = app_module._xlsx_cell_xml("=" + oversized_text, 1, 0)
+    literal_cell = ET.fromstring(literal_xml)
+    literal_text_node = literal_cell.find(".//t")
+    trusted_formula_xml = app_module._xlsx_cell_xml(
+        app_module._xlsx_formula("SUM(A1:A2)"), 1, 0
+    )
+
+    quality_failures = [
+        label
+        for label, status, readiness_label, export_allowed, native_status in contradiction_results
+        if status != "Draft"
+        or readiness_label != "Incomplete"
+        or export_allowed is not False
+        or (label == "Native affected names without remediation" and native_status != "Required")
+    ]
+    if not (
+        duplicate_normalized.get("readiness_label") == "Incomplete"
+        and len(duplicate_rows) == 1
+        and duplicate_rows[0].get("id") == "duplicate-id"
+        and duplicate_rows[0].get("title") == "First issue"
+    ):
+        quality_failures.append(f"duplicate issue handling: {duplicate_normalized}")
+    if not (
+        excessive_normalized.get("readiness_label") == "Incomplete"
+        and excessive_normalized.get("customer_ready_export") is False
+        and len(excessive_rows) == 1000
+    ):
+        quality_failures.append(
+            f"issue count bound: status={excessive_normalized.get('readiness_label')}, rows={len(excessive_rows)}"
+        )
+    if not (
+        oversized_normalized.get("readiness_label") == "Incomplete"
+        and oversized_normalized.get("customer_ready_export") is False
+        and len(str(oversized_normalized.get("recommendation_rationale", ""))) <= 4000
+        and bool(oversized_issue.get("id"))
+        and all(
+            len(str(oversized_issue.get(field, ""))) <= 4000
+            for field in ("id", "title", "detail", "affected_vms")
+        )
+    ):
+        quality_failures.append(
+            f"metadata text bounds: rationale={len(str(oversized_normalized.get('recommendation_rationale', '')))}, issue={oversized_issue}"
+        )
+    if not (
+        expanding_title_normalized.get("readiness_label") == "Incomplete"
+        and len(str(expanding_title_issue.get("title", ""))) <= 4000
+    ):
+        quality_failures.append(
+            f"generated title bound: status={expanding_title_normalized.get('readiness_label')}, "
+            f"title={len(str(expanding_title_issue.get('title', '')))}"
+        )
+    if not (
+        literal_text_node is not None
+        and len(literal_text_node.text or "") == 32767
+        and "<f>" not in literal_xml
+        and "<f>SUM(A1:A2)</f>" in trusted_formula_xml
+    ):
+        quality_failures.append(
+            f"XLSX text/formula boundary: literal={len(literal_text_node.text or '') if literal_text_node is not None else 'missing'}, formula={trusted_formula_xml}"
+        )
+
+    check(
+        "Task 11 workbook readiness rejects contradictions and bounds rendered metadata",
+        not quality_failures,
+        "; ".join(str(item) for item in quality_failures),
+    )
 
 
 def validate_unsupported_currency_workspace_shell() -> None:
@@ -5789,6 +6174,7 @@ def main() -> None:
     validate_saved_assessment_load_step4_failure()
     validate_atomic_step4_snapshot_write()
     validate_shared_workspace_shell()
+    validate_workbook_readiness_metadata_safety()
     validate_current_readiness_routes()
     validate_stage1_setup_redesign()
     validate_stage1_identity_save_and_loaded_manual_mode()
