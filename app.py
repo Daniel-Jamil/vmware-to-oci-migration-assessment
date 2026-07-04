@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 import ssl
 import xml.etree.ElementTree as ET
@@ -97,6 +98,7 @@ app.config["MAX_FORM_PARTS"] = _env_int(
 PORTABLE_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 MAX_PORTABLE_REQUEST_BYTES = MAX_PACKAGE_BYTES + PORTABLE_MULTIPART_OVERHEAD_BYTES
 APP_INSTANCE_ID = uuid4().hex
+_PREFERENCES_LOCK = threading.RLock()
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -110,24 +112,6 @@ def request_entity_too_large(_: RequestEntityTooLarge) -> Any:
     if request.path.startswith(("/step4", "/scenario", "/step5")):
         return redirect(step4_tab_redirect("native")), 303
     return redirect(url_for("index")), 303
-
-
-@app.before_request
-def enforce_portable_assessment_request_limit() -> Any:
-    """Reject oversized portable multipart bodies before Werkzeug parses them."""
-    if (
-        request.method == "POST"
-        and request.path == "/"
-        and request.mimetype == "multipart/form-data"
-        and request.content_length is not None
-        and request.content_length > MAX_PORTABLE_REQUEST_BYTES
-    ):
-        flash(
-            "Portable assessment upload exceeds the 25 MiB package limit.",
-            "error",
-        )
-        return redirect(url_for("index")), 303
-    return None
 
 
 @app.before_request
@@ -599,30 +583,91 @@ def _restore_optional_file_bytes(
         temporary_file.unlink(missing_ok=True)
 
 
-def load_preferences() -> dict[str, Any]:
-    preferences_file = _preferences_file_path()
-    if not preferences_file.exists():
+def _read_preferences_snapshot() -> tuple[bool, bytes]:
+    with _PREFERENCES_LOCK:
+        return _read_optional_file_bytes(_preferences_file_path())
+
+
+def _preferences_from_snapshot(snapshot: tuple[bool, bytes]) -> dict[str, Any]:
+    existed, payload = snapshot
+    if not existed:
         return {}
     try:
-        loaded = json.loads(preferences_file.read_text(encoding="utf-8"))
+        loaded = json.loads(payload.decode("utf-8"))
     except Exception:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _preferences_snapshot(preferences: dict[str, Any]) -> tuple[bool, bytes]:
+    return True, json.dumps(preferences, indent=2).encode("utf-8")
+
+
+def _compare_and_swap_preferences(
+    expected: tuple[bool, bytes],
+    desired: tuple[bool, bytes],
+) -> bool:
+    preferences_file = _preferences_file_path()
+    with _PREFERENCES_LOCK:
+        if _read_optional_file_bytes(preferences_file) != expected:
+            return False
+        _restore_optional_file_bytes(preferences_file, desired)
+        return True
+
+
+def _restore_preferences_if_current(
+    prior: tuple[bool, bytes],
+    written: tuple[bool, bytes],
+) -> bool:
+    preferences_file = _preferences_file_path()
+    with _PREFERENCES_LOCK:
+        if _read_optional_file_bytes(preferences_file) != written:
+            return False
+        _restore_optional_file_bytes(preferences_file, prior)
+        return True
+
+
+def _update_preference_keys(
+    set_values: dict[str, Any],
+    remove_keys: set[str],
+) -> tuple[tuple[bool, bytes], tuple[bool, bytes]] | None:
+    for _ in range(10):
+        expected = _read_preferences_snapshot()
+        current = _preferences_from_snapshot(expected)
+        updated = copy.deepcopy(current)
+        updated.update(set_values)
+        for key in remove_keys:
+            updated.pop(key, None)
+        if updated == current:
+            return None
+        desired = _preferences_snapshot(updated)
+        try:
+            if not _compare_and_swap_preferences(expected, desired):
+                continue
+        except Exception:
+            _restore_preferences_if_current(expected, desired)
+            raise
+        return expected, desired
+    raise OSError("Preferences changed repeatedly while applying an update.")
+
+
+def load_preferences() -> dict[str, Any]:
+    return _preferences_from_snapshot(_read_preferences_snapshot())
+
+
 def save_preferences(preferences: dict[str, Any]) -> None:
-    _write_json_atomically(_preferences_file_path(), preferences)
+    with _PREFERENCES_LOCK:
+        _write_json_atomically(_preferences_file_path(), preferences)
 
 
 def remember_price_list_selection(file_path: str, currency: str = "") -> None:
     clean_file = str(file_path or "").strip().replace("\\", "/")
     if not clean_file:
         return
-    preferences = load_preferences()
-    preferences["last_selected_pricelist_file"] = clean_file
+    values = {"last_selected_pricelist_file": clean_file}
     if currency:
-        preferences["last_selected_currency"] = str(currency).upper().strip()
-    save_preferences(preferences)
+        values["last_selected_currency"] = str(currency).upper().strip()
+    _update_preference_keys(values, set())
 
 
 def load_step4_snapshot() -> dict[str, Any]:
@@ -1252,6 +1297,7 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
     created_import_dir = False
     created_snapshot = False
+    preference_write: tuple[tuple[bool, bytes], tuple[bool, bytes]] | None = None
     try:
         import_dir.mkdir(parents=True, exist_ok=False)
         created_import_dir = True
@@ -1329,20 +1375,31 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
             raise PortableAssessmentError(
                 "The imported assessment could not be loaded after reconstruction."
             )
-        preferences = load_preferences()
-        updated_preferences = copy.deepcopy(preferences)
         if has_pricing:
-            updated_preferences["last_selected_pricelist_file"] = pricing_path
-            updated_preferences["last_selected_currency"] = currency
+            preference_write = _update_preference_keys(
+                {
+                    "last_selected_pricelist_file": pricing_path,
+                    "last_selected_currency": currency,
+                },
+                set(),
+            )
         else:
             session.pop("selected_pricelist_file", None)
             session.pop("selected_currency", None)
-            updated_preferences.pop("last_selected_pricelist_file", None)
-            updated_preferences.pop("last_selected_currency", None)
-        if updated_preferences != preferences:
-            save_preferences(updated_preferences)
+            preference_write = _update_preference_keys(
+                {},
+                {
+                    "last_selected_pricelist_file",
+                    "last_selected_currency",
+                },
+            )
     except Exception:
         failed_state_id = str(session.get("state_id") or "").strip()
+        if preference_write is not None:
+            try:
+                _restore_preferences_if_current(*preference_write)
+            except OSError:
+                app.logger.exception("Imported assessment preference rollback failed")
         try:
             for path, prior_value in prior_persistence.items():
                 _restore_optional_file_bytes(path, prior_value)
@@ -6438,6 +6495,19 @@ def _xlsx_clean_text(value: Any) -> str:
     return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(value))
 
 
+class _TrustedXlsxFormula:
+    __slots__ = ("expression",)
+
+    def __init__(self, expression: str) -> None:
+        if not isinstance(expression, str) or not expression:
+            raise ValueError("Trusted XLSX formulas require a nonempty expression.")
+        self.expression = expression
+
+
+def _xlsx_formula(expression: str) -> _TrustedXlsxFormula:
+    return _TrustedXlsxFormula(expression)
+
+
 def _xlsx_cell_xml(value: Any, row_idx: int, col_idx: int, style_idx: int | None = None) -> str:
     ref = f"{_xlsx_col_ref(col_idx)}{row_idx}"
     style_attr = f' s="{style_idx}"' if style_idx is not None else ""
@@ -6449,10 +6519,11 @@ def _xlsx_cell_xml(value: Any, row_idx: int, col_idx: int, style_idx: int | None
         if not math.isfinite(float(value)):
             value = 0
         return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    if isinstance(value, _TrustedXlsxFormula):
+        formula = xml_escape(_xlsx_clean_text(value.expression))
+        return f'<c r="{ref}"{style_attr}><f>{formula}</f></c>'
 
     text = _xlsx_clean_text(value)
-    if text.startswith("="):
-        return f'<c r="{ref}"{style_attr}><f>{xml_escape(text[1:])}</f></c>'
     safe = xml_escape(text)
     return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
 
@@ -7936,6 +8007,95 @@ def build_migration_price_workbook_xlsx(
     )
 
 
+@app.post("/assessment/import")
+def import_assessment_route() -> Any:
+    content_length = request.content_length
+    if content_length is None or content_length <= 0:
+        flash(
+            "Portable assessment upload requires a Content-Length header.",
+            "error",
+        )
+        return redirect(url_for("index"), code=303)
+    if content_length > MAX_PORTABLE_REQUEST_BYTES:
+        flash(
+            "Portable assessment upload exceeds the 25 MiB package limit.",
+            "error",
+        )
+        return redirect(url_for("index"), code=303)
+
+    try:
+        request.max_content_length = MAX_PORTABLE_REQUEST_BYTES
+    except (AttributeError, TypeError):
+        pass
+    try:
+        valid_form = (
+            set(request.form) == {"action"}
+            and request.form.getlist("action") == ["import_assessment"]
+        )
+        valid_files = (
+            set(request.files) == {"assessment_file"}
+            and len(request.files.getlist("assessment_file")) == 1
+        )
+    except RequestEntityTooLarge:
+        flash(
+            "Portable assessment upload exceeds the 25 MiB package limit.",
+            "error",
+        )
+        return redirect(url_for("index"), code=303)
+
+    if not valid_form or not valid_files:
+        flash(
+            "Submit exactly one portable assessment JSON file and no other fields.",
+            "error",
+        )
+        return redirect(url_for("index"), code=303)
+
+    upload = request.files.get("assessment_file")
+    original_name = secure_filename(upload.filename if upload else "")
+    if not upload or not original_name:
+        flash("Choose a portable assessment JSON file to import.", "error")
+    elif Path(original_name).suffix.lower() != ".json":
+        flash("Only .json portable assessment files can be imported.", "error")
+    else:
+        try:
+            raw_package = upload.stream.read(MAX_PACKAGE_BYTES + 1)
+            if len(raw_package) > MAX_PACKAGE_BYTES:
+                raise PortableAssessmentError(
+                    "Portable assessment exceeds the 25 MiB size limit."
+                )
+            decoded = raw_package.decode("utf-8-sig")
+            parsed_package = json.loads(decoded)
+            validated_package = validate_portable_package(parsed_package)
+            import_result = import_portable_assessment(validated_package)
+        except UnicodeDecodeError:
+            flash(
+                "Portable assessment JSON must use UTF-8 encoding.",
+                "error",
+            )
+        except json.JSONDecodeError:
+            flash("Portable assessment JSON is malformed.", "error")
+        except PortableAssessmentError as exc:
+            flash(str(exc), "error")
+        except Exception:
+            app.logger.exception("Portable assessment import failed")
+            flash(
+                "The portable assessment could not be imported. "
+                "The current assessment was kept.",
+                "error",
+            )
+        else:
+            currency_label = import_result.get("currency") or "no currency"
+            flash(
+                f"Assessment imported: {import_result['name']} - "
+                f"{int(import_result['vm_count']):,} VM(s) - {currency_label}.",
+                "success",
+            )
+            for warning in import_result.get("warnings", []):
+                flash(str(warning), "info")
+
+    return redirect(url_for("index"), code=303)
+
+
 @app.route("/", methods=["GET", "POST"])
 def index() -> Any:
     _cleanup_legacy_session_keys()
@@ -8227,66 +8387,6 @@ def index() -> Any:
                 )
             else:
                 return response
-
-        elif action == "import_assessment":
-            valid_form = (
-                set(request.form) == {"action"}
-                and request.form.getlist("action") == ["import_assessment"]
-            )
-            valid_files = (
-                set(request.files) == {"assessment_file"}
-                and len(request.files.getlist("assessment_file")) == 1
-            )
-            if not valid_form or not valid_files:
-                flash(
-                    "Submit exactly one portable assessment JSON file and no other fields.",
-                    "error",
-                )
-                upload = None
-            else:
-                upload = request.files.get("assessment_file")
-            original_name = secure_filename(upload.filename if upload else "")
-            if not valid_form or not valid_files:
-                pass
-            elif not upload or not original_name:
-                flash("Choose a portable assessment JSON file to import.", "error")
-            elif Path(original_name).suffix.lower() != ".json":
-                flash("Only .json portable assessment files can be imported.", "error")
-            else:
-                try:
-                    raw_package = upload.stream.read(MAX_PACKAGE_BYTES + 1)
-                    if len(raw_package) > MAX_PACKAGE_BYTES:
-                        raise PortableAssessmentError(
-                            "Portable assessment exceeds the 25 MiB size limit."
-                        )
-                    decoded = raw_package.decode("utf-8-sig")
-                    parsed_package = json.loads(decoded)
-                    validated_package = validate_portable_package(parsed_package)
-                    import_result = import_portable_assessment(validated_package)
-                except UnicodeDecodeError:
-                    flash(
-                        "Portable assessment JSON must use UTF-8 encoding.",
-                        "error",
-                    )
-                except json.JSONDecodeError:
-                    flash("Portable assessment JSON is malformed.", "error")
-                except PortableAssessmentError as exc:
-                    flash(str(exc), "error")
-                except Exception:
-                    app.logger.exception("Portable assessment import failed")
-                    flash(
-                        "The portable assessment could not be imported. The current assessment was kept.",
-                        "error",
-                    )
-                else:
-                    currency_label = import_result.get("currency") or "no currency"
-                    flash(
-                        f"Assessment imported: {import_result['name']} - "
-                        f"{int(import_result['vm_count']):,} VM(s) - {currency_label}.",
-                        "success",
-                    )
-                    for warning in import_result.get("warnings", []):
-                        flash(str(warning), "info")
 
         elif action == "save_customer_name":
             customer_name = normalize_customer_name(request.form.get("customer_name", ""))

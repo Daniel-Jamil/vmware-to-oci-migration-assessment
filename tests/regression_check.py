@@ -4885,12 +4885,13 @@ def validate_portable_assessments() -> None:
             app_module.save_step4_snapshot({"marker": "prior-step4"})
 
         import_response = client.post(
-            "/?portable_import=1",
+            "/assessment/import",
             data={
                 "action": "import_assessment",
                 "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
             },
             content_type="multipart/form-data",
+            follow_redirects=True,
         )
         with client.session_transaction() as sess:
             imported_session = dict(sess)
@@ -4952,19 +4953,22 @@ def validate_portable_assessments() -> None:
             and shell.assessment_import["tag"] == "button"
             and shell.assessment_import["attrs"].get("aria-disabled") is None
             and b'name="assessment_file"' in shell_response.data
+            and b'action="/assessment/import"' in shell_response.data
             and results_response.status_code == 200
             and b'value="export_assessment"' in results_response.data
-            and b'name="assessment_file"' in results_response.data,
+            and b'name="assessment_file"' in results_response.data
+            and b'action="/assessment/import"' in results_response.data,
             f"results_status={results_response.status_code}",
         )
 
         second_response = client.post(
-            "/?portable_import=1",
+            "/assessment/import",
             data={
                 "action": "import_assessment",
                 "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
             },
             content_type="multipart/form-data",
+            follow_redirects=True,
         )
         with client.session_transaction() as sess:
             second_name = str(sess.get("active_assessment_name", ""))
@@ -4997,14 +5001,6 @@ def validate_portable_assessments() -> None:
         )
         invalid_negative = json.loads(package_bytes.decode("utf-8"))
         invalid_negative["inventory"]["rows"][0]["cpus"] = -1
-        invalid_formula_name = json.loads(package_bytes.decode("utf-8"))
-        invalid_formula_name["assessment"]["name"] = " =1+1"
-        invalid_formula_rationale = json.loads(package_bytes.decode("utf-8"))
-        invalid_formula_rationale["assessment"]["app_state"][
-            "assessor_recommendation_rationale"
-        ] = "\t+HYPERLINK(\"bad\")"
-        invalid_formula_vm = json.loads(package_bytes.decode("utf-8"))
-        invalid_formula_vm["inventory"]["rows"][0]["name"] = " @SUM(A1:A2)"
         invalid_cases = [
             ("wrong extension", package_bytes, "portable.txt"),
             ("malformed JSON", b"{not-json", "portable.json"),
@@ -5013,13 +5009,6 @@ def validate_portable_assessments() -> None:
             ("missing section", json.dumps(invalid_missing).encode("utf-8"), "portable.json"),
             ("duplicate VM name", json.dumps(invalid_duplicate).encode("utf-8"), "portable.json"),
             ("negative number", json.dumps(invalid_negative).encode("utf-8"), "portable.json"),
-            ("formula assessment name", json.dumps(invalid_formula_name).encode("utf-8"), "portable.json"),
-            (
-                "formula rationale",
-                json.dumps(invalid_formula_rationale).encode("utf-8"),
-                "portable.json",
-            ),
-            ("formula VM name", json.dumps(invalid_formula_vm).encode("utf-8"), "portable.json"),
             (
                 "oversized package",
                 b"{" + (b" " * app_module.MAX_PACKAGE_BYTES),
@@ -5029,12 +5018,13 @@ def validate_portable_assessments() -> None:
         invalid_results: list[tuple[str, bool]] = []
         for label, invalid_bytes, filename in invalid_cases:
             response = client.post(
-                "/?portable_import=1",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (BytesIO(invalid_bytes), filename),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
             with client.session_transaction() as sess:
                 current_session = json.loads(json.dumps(dict(sess)))
@@ -5050,7 +5040,7 @@ def validate_portable_assessments() -> None:
                 )
             )
         check(
-            "Task 10 invalid and formula-bearing imports never reach workbook materialization",
+            "Task 10 invalid imports never mutate local assessment data",
             all(passed for _label, passed in invalid_results),
             str(invalid_results),
         )

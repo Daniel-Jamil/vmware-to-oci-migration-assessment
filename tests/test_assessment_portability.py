@@ -294,73 +294,43 @@ class PortableAssessmentTests(unittest.TestCase):
                 ):
                     portability.validate_portable_package(package)
 
-    def test_rejects_formula_leading_imported_text_but_keeps_numeric_fields(self) -> None:
-        mutations = (
-            ("assessment name", lambda package: package["assessment"].update(name=" =2+2")),
-            (
-                "recommendation rationale",
-                lambda package: package["assessment"]["app_state"].update(
-                    assessor_recommendation_rationale="\t+HYPERLINK(\"bad\")"
-                ),
-            ),
-            (
-                "VM name",
-                lambda package: package["inventory"]["rows"][0].update(
-                    name="\r@SUM(A1:A2)"
-                ),
-            ),
-            (
-                "VM source name",
-                lambda package: package["inventory"]["rows"][0].update(
-                    source_name=" -1+1"
-                ),
-            ),
-            (
-                "VM operating system",
-                lambda package: package["inventory"]["rows"][0].update(
-                    raw_os=" =cmd|' /C calc'!A0"
-                ),
-            ),
-            (
-                "app-state map key",
-                lambda package: package["assessment"]["app_state"].update(
-                    step4_vm_shapes={" @malicious-vm": "VM.Standard.E5.Flex"}
-                ),
-            ),
-            (
-                "snapshot VM setting",
-                lambda package: package["assessment"]["step4_snapshot"][
-                    "vm_settings"
-                ]["app-01"].update(oci_shape=" +1+1"),
-            ),
-            (
-                "pricing display name",
-                lambda package: package["pricing"]["document"]["items"][0].update(
-                    displayName=" =WEBSERVICE(\"bad\")"
-                ),
-            ),
-            (
-                "path-like source filename",
-                lambda package: package["inventory"].update(
-                    source_file_name="sender/path/ =1+1.csv"
-                ),
-            ),
-        )
-
-        for label, mutate in mutations:
-            with self.subTest(label=label):
+    def test_formula_marker_text_roundtrips_as_ordinary_portable_text(self) -> None:
+        for marker in "=+-@":
+            with self.subTest(marker=marker):
                 package = valid_package()
-                mutate(package)
-                with self.assertRaisesRegex(
-                    portability.PortableAssessmentError,
-                    "spreadsheet formula",
-                ):
-                    portability.validate_portable_package(package)
+                package["assessment"]["name"] = f"{marker}literal name"
+                package["assessment"]["notes"] = f"{marker}literal notes"
+                package["assessment"]["app_state"][
+                    "assessor_recommendation_rationale"
+                ] = f"{marker}literal rationale"
+                package["inventory"]["rows"][0].update(
+                    name=f"{marker}literal VM",
+                    source_name=f"{marker}literal source VM",
+                    raw_os=f"{marker}literal operating system",
+                    cpus="+4",
+                )
 
-        package = valid_package()
-        package["inventory"]["rows"][0]["cpus"] = "+4"
-        validated = portability.validate_portable_package(package)
-        self.assertEqual(4, validated["inventory"]["rows"][0]["cpus"])
+                validated = portability.validate_portable_package(package)
+
+                self.assertEqual(
+                    f"{marker}literal name",
+                    validated["assessment"]["name"],
+                )
+                self.assertEqual(
+                    f"{marker}literal notes",
+                    validated["assessment"]["notes"],
+                )
+                self.assertEqual(
+                    f"{marker}literal rationale",
+                    validated["assessment"]["app_state"][
+                        "assessor_recommendation_rationale"
+                    ],
+                )
+                self.assertEqual(
+                    f"{marker}literal VM",
+                    validated["inventory"]["rows"][0]["name"],
+                )
+                self.assertEqual(4, validated["inventory"]["rows"][0]["cpus"])
 
     def test_rejects_noncanonical_or_out_of_domain_assessment_state(self) -> None:
         def all_currencies(package: dict, value: str) -> None:
@@ -568,17 +538,37 @@ class PortableAssessmentTests(unittest.TestCase):
             app_module.normalize_app_state(validated_state),
         )
 
-    def test_internal_workbook_formulas_remain_explicit(self) -> None:
+    def test_only_trusted_workbook_formula_wrapper_emits_formula_xml(self) -> None:
         workbook = app_module._build_xlsx_workbook_bytes(
-            [{"name": "Proof", "rows": [["Safe text", "=1+1"]]}],
+            [
+                {
+                    "name": "Proof",
+                    "rows": [
+                        [
+                            "=literal equals",
+                            "+literal plus",
+                            "-literal minus",
+                            "@literal at",
+                            app_module._xlsx_formula("1+1"),
+                        ]
+                    ],
+                }
+            ],
             currency_fmt_code='"USD" #,##0.00',
         )
 
         with zipfile.ZipFile(BytesIO(workbook)) as archive:
             worksheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
+        self.assertEqual(1, worksheet.count("<f>"))
         self.assertIn("<f>1+1</f>", worksheet)
-        self.assertIn("<t>Safe text</t>", worksheet)
+        for literal in (
+            "=literal equals",
+            "+literal plus",
+            "-literal minus",
+            "@literal at",
+        ):
+            self.assertIn(f"<t>{literal}</t>", worksheet)
 
     def test_rejects_oversized_strings_anywhere_in_supported_sections(self) -> None:
         mutations = (
@@ -992,6 +982,137 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             if path.is_file()
         }
 
+    def test_portable_import_forms_use_dedicated_endpoint(self) -> None:
+        with isolated_portability_client() as fixture:
+            response = fixture["client"].get("/")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b'action="/assessment/import"', response.data)
+        with app_module.app.test_request_context("/step4?tab=price"):
+            template = app_module.app.jinja_env.get_template("_export_center.html")
+            export_center = template.render(
+                results={
+                    "customer_ready_export": False,
+                    "assessment_name": "Alpha migration",
+                    "assessment_notes": "Notes",
+                    "excel_export_label": "Export Draft",
+                }
+            )
+        self.assertIn('action="/assessment/import"', export_center)
+
+    def test_portable_import_rejects_missing_or_oversized_length_before_parsing(
+        self,
+    ) -> None:
+        class UnreadableMultipartBody:
+            def read(self, *_args: object, **_kwargs: object) -> bytes:
+                raise AssertionError("multipart body must not be parsed")
+
+            def readline(self, *_args: object, **_kwargs: object) -> bytes:
+                raise AssertionError("multipart body must not be parsed")
+
+        cases = (
+            {},
+            {"CONTENT_LENGTH": str(app_module.MAX_PORTABLE_REQUEST_BYTES + 1)},
+        )
+        for environ_overrides in cases:
+            overrides = {
+                "wsgi.input": UnreadableMultipartBody(),
+                **environ_overrides,
+            }
+            with self.subTest(environ_overrides=environ_overrides):
+                with app_module.app.test_request_context(
+                    "/assessment/import",
+                    method="POST",
+                    content_type="multipart/form-data; boundary=portable",
+                    environ_overrides=overrides,
+                ):
+                    if not environ_overrides:
+                        app_module.request.environ.pop("CONTENT_LENGTH", None)
+                    response = app_module.import_assessment_route()
+
+                self.assertEqual(303, response.status_code)
+
+    def test_large_nonportable_index_post_keeps_global_upload_allowance(self) -> None:
+        payload = b"x" * (27 * 1024 * 1024)
+        with isolated_portability_client() as fixture:
+            response = fixture["client"].post(
+                "/",
+                data={
+                    "action": "upload_rvtools_file",
+                    "inventory_mode": "upload",
+                    "rvtools_upload": (
+                        BytesIO(payload),
+                        "large-inventory.xlsx",
+                    ),
+                },
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"Input not accepted for sizing", response.data)
+        self.assertNotIn(b"Portable assessment upload exceeds", response.data)
+
+    def test_imported_formula_marker_text_stays_literal_in_workbook_xml(self) -> None:
+        package = valid_package()
+        package["assessment"]["name"] = "=SUM(1,1)"
+        package["assessment"]["app_state"][
+            "assessor_recommendation_rationale"
+        ] = "+CMD(1)"
+        package["inventory"]["rows"][0].update(
+            name="@SUM(A1:A2)",
+            source_name="@SUM(A1:A2)",
+        )
+
+        with isolated_portability_client() as fixture:
+            response = fixture["client"].post(
+                "/assessment/import",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(
+                            portability.dumps_portable_package(package).encode(
+                                "utf-8"
+                            )
+                        ),
+                        "literal-text.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+                follow_redirects=True,
+            )
+            with fixture["client"].session_transaction() as sess:
+                imported_name = str(sess.get("active_assessment_name", ""))
+                imported_inventory_path = str(sess.get("selected_rvtools_file", ""))
+            imported_state = app_module.load_app_state()
+            imported_rows, _ = app_module.load_vms_from_vinfo(
+                imported_inventory_path
+            )
+
+        workbook = app_module._build_xlsx_workbook_bytes(
+            [
+                {
+                    "name": "Proof",
+                    "rows": [
+                        [
+                            imported_name,
+                            imported_state["assessor_recommendation_rationale"],
+                            imported_rows[0]["name"],
+                        ]
+                    ],
+                }
+            ],
+            currency_fmt_code='"USD" #,##0.00',
+        )
+        with zipfile.ZipFile(BytesIO(workbook)) as archive:
+            worksheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+        self.assertEqual(200, response.status_code)
+        self.assertNotIn("<f>", worksheet)
+        self.assertIn("<t>=SUM(1,1)</t>", worksheet)
+        self.assertIn("<t>+CMD(1)</t>", worksheet)
+        self.assertIn("<t>@SUM(A1:A2)</t>", worksheet)
+
     def test_post_link_temp_cleanup_failure_does_not_hide_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir) / "published.json"
@@ -1033,12 +1154,13 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 ),
             ):
                 response = fixture["client"].post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (BytesIO(package_bytes), "portable.json"),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             saved_dir = fixture["app_state"] / "saved_assessments"
@@ -1256,30 +1378,198 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 side_effect=fail_after_concurrent_update,
             ):
                 response = client.post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (BytesIO(package_bytes), "portable.json"),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             self.assertEqual(200, response.status_code)
             self.assertIn(b"current assessment was kept", response.data)
             self.assertEqual(concurrent_bytes, preferences_path.read_bytes())
 
-    def test_portable_request_size_is_rejected_before_multipart_access(self) -> None:
-        with app_module.app.test_request_context(
-            "/?portable_import=1",
-            method="POST",
-            content_type="multipart/form-data; boundary=portable",
-            environ_overrides={
-                "CONTENT_LENGTH": str(app_module.MAX_PORTABLE_REQUEST_BYTES + 1)
-            },
-        ):
-            response = app_module.enforce_portable_assessment_request_limit()
+    def test_successful_import_merges_preferences_changed_before_cas(self) -> None:
+        with isolated_portability_client() as fixture:
+            preferences_path = fixture["app_state"] / "preferences.json"
+            preferences_path.write_text(
+                json.dumps(
+                    {
+                        "last_selected_pricelist_file": "old.json",
+                        "last_selected_currency": "USD",
+                        "unrelated": "before",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            real_compare = app_module._compare_and_swap_preferences
+            compare_calls = 0
 
-        self.assertEqual(303, response[1])
+            def concurrent_before_compare(
+                expected: tuple[bool, bytes],
+                desired: tuple[bool, bytes],
+            ) -> bool:
+                nonlocal compare_calls
+                compare_calls += 1
+                if compare_calls == 1:
+                    preferences_path.write_text(
+                        json.dumps(
+                            {
+                                "last_selected_pricelist_file": "old.json",
+                                "last_selected_currency": "USD",
+                                "unrelated": "concurrent",
+                                "new_preference": "preserve",
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                return real_compare(expected, desired)
+
+            with patch.object(
+                app_module,
+                "_compare_and_swap_preferences",
+                side_effect=concurrent_before_compare,
+            ):
+                response = fixture["client"].post(
+                    "/assessment/import",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(
+                                    valid_package()
+                                ).encode("utf-8")
+                            ),
+                            "portable.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                    follow_redirects=True,
+                )
+
+            preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"Assessment imported", response.data)
+            self.assertGreaterEqual(compare_calls, 2)
+            self.assertEqual("concurrent", preferences["unrelated"])
+            self.assertEqual("preserve", preferences["new_preference"])
+            self.assertEqual("EUR", preferences["last_selected_currency"])
+            self.assertIn(
+                "/imported_assessments/",
+                preferences["last_selected_pricelist_file"],
+            )
+
+    def test_failed_import_does_not_restore_over_post_write_preference_update(
+        self,
+    ) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            preferences_path = fixture["app_state"] / "preferences.json"
+            preferences_path.write_bytes(b'{"baseline":"preserve"}\n')
+            with client.session_transaction() as sess:
+                before_session = copy.deepcopy(dict(sess))
+            real_compare = app_module._compare_and_swap_preferences
+            concurrent_bytes = b""
+
+            def fail_after_concurrent_write(
+                expected: tuple[bool, bytes],
+                desired: tuple[bool, bytes],
+            ) -> bool:
+                nonlocal concurrent_bytes
+                published = real_compare(expected, desired)
+                if published:
+                    concurrent = json.loads(desired[1].decode("utf-8"))
+                    concurrent["concurrent_after_write"] = "must survive"
+                    concurrent_bytes = json.dumps(
+                        concurrent,
+                        indent=2,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    preferences_path.write_bytes(concurrent_bytes)
+                    raise OSError("injected failure after concurrent preference write")
+                return published
+
+            with patch.object(
+                app_module,
+                "_compare_and_swap_preferences",
+                side_effect=fail_after_concurrent_write,
+            ):
+                response = client.post(
+                    "/assessment/import",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(
+                                    valid_package()
+                                ).encode("utf-8")
+                            ),
+                            "portable.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                    follow_redirects=True,
+                )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            saved_dir = fixture["app_state"] / "saved_assessments"
+            imported_root = fixture["downloads"] / "imported_assessments"
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"current assessment was kept", response.data)
+            self.assertEqual(before_session, after_session)
+            self.assertTrue(concurrent_bytes)
+            self.assertEqual(concurrent_bytes, preferences_path.read_bytes())
+            self.assertFalse(saved_dir.exists() and list(saved_dir.glob("*.json")))
+            self.assertFalse(
+                imported_root.exists() and any(imported_root.iterdir())
+            )
+
+    def test_failed_preference_publication_restores_exact_prior_bytes(self) -> None:
+        with isolated_portability_client() as fixture:
+            preferences_path = fixture["app_state"] / "preferences.json"
+            prior_bytes = b'{"exact" : "spacing"}\n'
+            preferences_path.write_bytes(prior_bytes)
+            real_compare = app_module._compare_and_swap_preferences
+
+            def fail_after_publication(
+                expected: tuple[bool, bytes],
+                desired: tuple[bool, bytes],
+            ) -> bool:
+                published = real_compare(expected, desired)
+                if published:
+                    raise OSError("injected preference publication failure")
+                return published
+
+            with patch.object(
+                app_module,
+                "_compare_and_swap_preferences",
+                side_effect=fail_after_publication,
+            ):
+                response = fixture["client"].post(
+                    "/assessment/import",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (
+                            BytesIO(
+                                portability.dumps_portable_package(
+                                    valid_package()
+                                ).encode("utf-8")
+                            ),
+                            "portable.json",
+                        ),
+                    },
+                    content_type="multipart/form-data",
+                    follow_redirects=True,
+                )
+
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"current assessment was kept", response.data)
+            self.assertEqual(prior_bytes, preferences_path.read_bytes())
 
     def test_import_rejects_extra_duplicate_files_and_ignored_fields(self) -> None:
         package_bytes = portability.dumps_portable_package(valid_package()).encode(
@@ -1312,9 +1602,10 @@ class PortableAssessmentRouteTests(unittest.TestCase):
         for index, data in enumerate(cases):
             with self.subTest(case=index), isolated_portability_client() as fixture:
                 response = fixture["client"].post(
-                    "/?portable_import=1",
+                    "/assessment/import",
                     data=data,
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
                 imported_root = fixture["downloads"] / "imported_assessments"
@@ -1333,7 +1624,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             before_files = self._file_tree_bytes(fixture["app_state"].parent)
 
             response = fixture["client"].post(
-                "/?portable_import=1",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1346,6 +1637,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
 
             self.assertEqual(200, response.status_code)
@@ -1373,7 +1665,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             )
 
             response = fixture["client"].post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1386,6 +1678,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
 
             with fixture["client"].session_transaction() as sess:
@@ -1456,7 +1749,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     before_files = self._file_tree_bytes(fixture["app_state"].parent)
 
                     response = client.post(
-                        "/",
+                        "/assessment/import",
                         data={
                             "action": "import_assessment",
                             "assessment_file": (
@@ -1465,6 +1758,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                             ),
                         },
                         content_type="multipart/form-data",
+                        follow_redirects=True,
                     )
 
                     with client.session_transaction() as sess:
@@ -1487,7 +1781,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             package = valid_package()
 
             response = fixture["client"].post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1500,6 +1794,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
 
             with fixture["client"].session_transaction() as sess:
@@ -1538,7 +1833,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             before_files = self._file_tree_bytes(fixture["app_state"].parent)
 
             response = client.post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1547,6 +1842,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
 
             with client.session_transaction() as sess:
@@ -1576,7 +1872,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 return_value=({}, "", ""),
             ):
                 response = fixture["client"].post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (
@@ -1589,6 +1885,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                         ),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             with fixture["client"].session_transaction() as sess:
@@ -1631,7 +1928,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             )
 
             response = fixture["client"].post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1640,6 +1937,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
             with fixture["client"].session_transaction() as sess:
                 imported_inventory = str(sess.get("selected_rvtools_file", ""))
@@ -1684,7 +1982,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 ],
             ) as id_generator:
                 response = fixture["client"].post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (
@@ -1697,6 +1995,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                         ),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             with fixture["client"].session_transaction() as sess:
@@ -1748,7 +2047,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 ),
             ):
                 response = fixture["client"].post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (
@@ -1761,6 +2060,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                         ),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             with fixture["client"].session_transaction() as sess:
@@ -1865,12 +2165,13 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             fixture["pricing_path"].unlink()
 
             first_response = client.post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (BytesIO(portable_bytes), "alpha.json"),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
             with client.session_transaction() as sess:
                 first_id = str(sess.get("active_assessment_id", ""))
@@ -1918,12 +2219,13 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             )
 
             second_response = client.post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (BytesIO(portable_bytes), "alpha.json"),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
             with client.session_transaction() as sess:
                 second_id = str(sess.get("active_assessment_id", ""))
@@ -1958,7 +2260,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             invalid["package_type"] = "wrong"
 
             response = client.post(
-                "/",
+                "/assessment/import",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (
@@ -1967,6 +2269,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                     ),
                 },
                 content_type="multipart/form-data",
+                follow_redirects=True,
             )
 
             with client.session_transaction() as sess:
@@ -2015,7 +2318,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                 side_effect=fail_after_mutation,
             ):
                 response = client.post(
-                    "/",
+                    "/assessment/import",
                     data={
                         "action": "import_assessment",
                         "assessment_file": (
@@ -2024,6 +2327,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
                         ),
                     },
                     content_type="multipart/form-data",
+                    follow_redirects=True,
                 )
 
             with client.session_transaction() as sess:

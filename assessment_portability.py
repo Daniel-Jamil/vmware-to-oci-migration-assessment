@@ -97,11 +97,6 @@ def _clean_text(value: Any, field: str, *, default: str = "") -> str:
         raise PortableAssessmentError(
             f"{field} exceeds the maximum length of {MAX_TEXT_LENGTH} characters."
         )
-    formula_candidate = value.lstrip()
-    if formula_candidate and formula_candidate[0] in "=+-@":
-        raise PortableAssessmentError(
-            f"{field} cannot begin with a spreadsheet formula marker."
-        )
     return value
 
 
