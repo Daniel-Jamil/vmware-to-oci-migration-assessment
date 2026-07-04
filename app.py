@@ -6765,8 +6765,201 @@ def _build_xlsx_workbook_bytes(
     return buffer.getvalue()
 
 
+def _workbook_readiness_metadata(
+    readiness: Any,
+    assessor_recommendation: Any = "",
+    recommendation_rationale: Any = "",
+) -> dict[str, Any]:
+    readiness_labels = {
+        "draft_review_required": "Draft review required",
+        "incomplete": "Incomplete",
+        "customer_ready": "Customer ready",
+    }
+    recommendation_labels = {
+        "native": "OCI Native",
+        "ocvs": "OCVS",
+        "hybrid": "Hybrid",
+    }
+    malformed = not isinstance(readiness, dict)
+    source = readiness if isinstance(readiness, dict) else {}
+
+    overall_state = source.get("overall_state")
+    if not isinstance(overall_state, str) or overall_state not in readiness_labels:
+        overall_state = "incomplete"
+        malformed = True
+
+    customer_ready_export = source.get("customer_ready_export")
+    if not isinstance(customer_ready_export, bool):
+        customer_ready_export = False
+        malformed = True
+
+    if not isinstance(assessor_recommendation, str):
+        recommendation = ""
+        malformed = True
+    else:
+        recommendation = assessor_recommendation.strip()
+        if recommendation not in {"", *recommendation_labels}:
+            recommendation = ""
+            malformed = True
+
+    if not isinstance(recommendation_rationale, str):
+        rationale = ""
+        malformed = True
+    else:
+        rationale = recommendation_rationale.strip()
+
+    scenario_values = source.get("scenarios")
+    if not isinstance(scenario_values, dict):
+        scenario_values = {}
+        malformed = True
+    scenarios: dict[str, dict[str, Any]] = {}
+    for scenario_id in ("native", "ocvs", "hybrid"):
+        scenario = scenario_values.get(scenario_id)
+        if not isinstance(scenario, dict):
+            scenario = {}
+            malformed = True
+
+        pricing_state = scenario.get("pricing_state")
+        if pricing_state not in {"complete", "incomplete"}:
+            pricing_state = "incomplete"
+            malformed = True
+        rankable = scenario.get("rankable")
+        if not isinstance(rankable, bool):
+            rankable = False
+            malformed = True
+        scenario_customer_ready = scenario.get("customer_ready")
+        if not isinstance(scenario_customer_ready, bool):
+            scenario_customer_ready = False
+            malformed = True
+        remediation_required = scenario.get("remediation_required")
+        if not isinstance(remediation_required, bool):
+            remediation_required = False
+            malformed = True
+
+        raw_names = scenario.get("affected_vm_names")
+        affected_vm_names: list[str] = []
+        if not isinstance(raw_names, list):
+            malformed = True
+        else:
+            for name in raw_names:
+                if not isinstance(name, str) or not name.strip():
+                    malformed = True
+                    continue
+                clean_name = name.strip()
+                if clean_name in affected_vm_names:
+                    malformed = True
+                    continue
+                affected_vm_names.append(clean_name)
+        scenarios[scenario_id] = {
+            "pricing_state": pricing_state,
+            "rankable": rankable,
+            "customer_ready": scenario_customer_ready,
+            "remediation_required": remediation_required,
+            "affected_vm_names": affected_vm_names,
+        }
+
+    def normalize_issues(key: str) -> list[dict[str, str]]:
+        nonlocal malformed
+        values = source.get(key)
+        if not isinstance(values, list):
+            malformed = True
+            return []
+        normalized: list[dict[str, str]] = []
+        for value in values:
+            if not isinstance(value, dict):
+                malformed = True
+                continue
+            issue_id = value.get("id")
+            title = value.get("title")
+            detail = value.get("detail")
+            if not isinstance(issue_id, str):
+                issue_id = ""
+                malformed = True
+            if not isinstance(title, str):
+                title = ""
+                malformed = True
+            if not isinstance(detail, str):
+                detail = ""
+                malformed = True
+            issue_id = issue_id.strip()
+            title = title.strip() or issue_id.replace("-", " ").title() or "Readiness item"
+            detail = detail.strip() or "No additional detail provided."
+
+            raw_names = value.get("affected_vm_names")
+            names: list[str] = []
+            if not isinstance(raw_names, list):
+                malformed = True
+            else:
+                for name in raw_names:
+                    if not isinstance(name, str) or not name.strip():
+                        malformed = True
+                        continue
+                    clean_name = name.strip()
+                    if clean_name not in names:
+                        names.append(clean_name)
+            normalized.append(
+                {
+                    "title": title,
+                    "detail": detail,
+                    "affected_vms": ", ".join(names) or "None",
+                }
+            )
+        return normalized
+
+    blockers = normalize_issues("blocking_items")
+    advisories = normalize_issues("advisory_items")
+    selected_scenario = scenarios.get(recommendation, {})
+    is_customer_ready = bool(
+        not malformed
+        and overall_state == "customer_ready"
+        and customer_ready_export is True
+        and recommendation in recommendation_labels
+        and selected_scenario.get("rankable") is True
+        and selected_scenario.get("customer_ready") is True
+        and not blockers
+        and not (
+            recommendation == "native"
+            and selected_scenario.get("remediation_required") is True
+            and not rationale
+        )
+    )
+    if overall_state == "customer_ready" and not is_customer_ready:
+        malformed = True
+
+    workbook_status = "Customer ready" if is_customer_ready else "Draft"
+    readiness_label = (
+        "Incomplete"
+        if malformed
+        else readiness_labels.get(overall_state, "Incomplete")
+    )
+    native = scenarios["native"]
+    return {
+        "workbook_status": workbook_status,
+        "readiness_label": readiness_label,
+        "recommendation": recommendation_labels.get(recommendation, "Not provided"),
+        "recommendation_rationale": rationale or "Not provided",
+        "native_remediation_status": (
+            "Required" if native["remediation_required"] else "Not required"
+        ),
+        "native_affected_vm_count": len(native["affected_vm_names"]),
+        "native_affected_vm_names": ", ".join(native["affected_vm_names"]) or "None",
+        "ocvs_pricing_completeness": (
+            "Complete" if scenarios["ocvs"]["pricing_state"] == "complete" else "Incomplete"
+        ),
+        "hybrid_pricing_completeness": (
+            "Complete" if scenarios["hybrid"]["pricing_state"] == "complete" else "Incomplete"
+        ),
+        "blockers": blockers,
+        "advisories": advisories,
+        "customer_ready_export": is_customer_ready,
+    }
+
+
 def build_migration_price_workbook_xlsx(
     *,
+    readiness: dict[str, Any],
+    assessor_recommendation: str = "",
+    recommendation_rationale: str = "",
     customer_name: str,
     pricing_currency: str,
     source_pricelist_file: str,
@@ -6827,6 +7020,11 @@ def build_migration_price_workbook_xlsx(
     ocvs_commitment_term = normalize_ocvs_commitment_term(ocvs_commitment_term)
     ocvs_commitment_label = OCVS_COMMITMENT_LABELS.get(ocvs_commitment_term, OCVS_COMMITMENT_LABELS["payg"])
     ocvs_commitment_discount_pct = float(ocvs_price.get("selected", {}).get("commitment_discount_pct", 0.0) or 0.0)
+    readiness_metadata = _workbook_readiness_metadata(
+        readiness,
+        assessor_recommendation,
+        recommendation_rationale,
+    )
 
     def money(value: Any) -> float:
         return float(value or 0.0)
@@ -7234,7 +7432,11 @@ def build_migration_price_workbook_xlsx(
 
     # Executive Summary
     rows, row_styles, cell_styles = new_sheet()
-    add_title(rows, row_styles, "Executive Summary")
+    add_title(
+        rows,
+        row_styles,
+        f"Executive Summary - {readiness_metadata['workbook_status']}",
+    )
     add_section(rows, row_styles, "Assessment Context")
     add_key_values(
         rows,
@@ -7248,8 +7450,41 @@ def build_migration_price_workbook_xlsx(
             ["Selected RAM GB", integer(workload_summary.get("total_memory_gb")), ""],
             ["Selected Storage GB", integer(workload_summary.get("total_storage_gb")), ""],
             ["Generated At", generated_at, ""],
+            ["Workbook Status", readiness_metadata["workbook_status"], ""],
+            ["Assessment Readiness", readiness_metadata["readiness_label"], ""],
+            ["Assessor Recommendation", readiness_metadata["recommendation"], ""],
+            ["Recommendation Rationale", readiness_metadata["recommendation_rationale"], ""],
+            ["Native Remediation Status", readiness_metadata["native_remediation_status"], ""],
+            ["Native Affected VM Count", readiness_metadata["native_affected_vm_count"], ""],
+            ["Native Affected VMs", readiness_metadata["native_affected_vm_names"], ""],
+            ["OCVS Pricing Completeness", readiness_metadata["ocvs_pricing_completeness"], ""],
+            ["Hybrid Pricing Completeness", readiness_metadata["hybrid_pricing_completeness"], ""],
         ],
-        integer_rows={3, 4, 5, 6},
+        integer_rows={3, 4, 5, 6, 13},
+    )
+    add_section(rows, row_styles, "Unresolved Blockers")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Title", "Detail", "Affected VMs"],
+        [
+            [item["title"], item["detail"], item["affected_vms"]]
+            for item in readiness_metadata["blockers"]
+        ]
+        or [["None", "No unresolved blockers.", "None"]],
+    )
+    add_section(rows, row_styles, "Unresolved Advisories")
+    add_table(
+        rows,
+        row_styles,
+        cell_styles,
+        ["Title", "Detail", "Affected VMs"],
+        [
+            [item["title"], item["detail"], item["affected_vms"]]
+            for item in readiness_metadata["advisories"]
+        ]
+        or [["None", "No unresolved advisories.", "None"]],
     )
     add_section(rows, row_styles, "Migration Path Price Comparison")
     add_table(
@@ -9719,6 +9954,36 @@ def step4() -> str:
         unsupported_ocvs_rows=analysis["unsupported_ocvs_rows"],
     )
 
+    if request.method == "GET":
+        has_unsaved_scenario_changes = bool(
+            session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, False) is True
+        )
+    readiness = build_current_readiness_context(
+        inventory_rows=all_vms,
+        selected_vm_names=selected_vm_names,
+        scenario_analysis=analysis,
+        scenario_views=scenario_views,
+        app_state=app_state,
+        setup_metadata={
+            "assessment_name": normalize_assessment_name(
+                session.get("active_assessment_name", "")
+            ),
+            "customer_name": customer_name,
+            "has_price_list": bool(source_pricelist_file and price_lookup),
+            "has_inventory": bool(all_vms),
+        },
+        has_unsaved_scenario_changes=has_unsaved_scenario_changes,
+        inventory_issues=inventory_issues,
+        pricing_inputs={
+            "source_pricelist_file": source_pricelist_file,
+            "price_lookup": price_lookup,
+            "modeled_vm_rows": vm_rows,
+            "block_storage_unit_price": block_storage_unit_price,
+            "block_perf_unit_price": block_perf_unit_price,
+            "windows_os_unit_price": windows_os_unit_price,
+        },
+    )
+
     if export_format == "excel":
         generated_at = datetime.now().isoformat(timespec="seconds")
         filename = build_export_filename(customer_name, "migration_price_comparison", "xlsx")
@@ -9726,6 +9991,11 @@ def step4() -> str:
         export_path = EXPORTS_DIR / filename
         export_path_display = str(export_path.resolve())
         workbook_bytes = build_migration_price_workbook_xlsx(
+            readiness=readiness,
+            assessor_recommendation=app_state.get("assessor_recommendation", ""),
+            recommendation_rationale=app_state.get(
+                "assessor_recommendation_rationale", ""
+            ),
             customer_name=customer_name,
             pricing_currency=pricing_currency,
             source_pricelist_file=source_pricelist_file,
@@ -9757,35 +10027,6 @@ def step4() -> str:
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             max_age=0,
         )
-    if request.method == "GET":
-        has_unsaved_scenario_changes = bool(
-            session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, False) is True
-        )
-    readiness = build_current_readiness_context(
-        inventory_rows=all_vms,
-        selected_vm_names=selected_vm_names,
-        scenario_analysis=analysis,
-        scenario_views=scenario_views,
-        app_state=app_state,
-        setup_metadata={
-            "assessment_name": normalize_assessment_name(
-                session.get("active_assessment_name", "")
-            ),
-            "customer_name": customer_name,
-            "has_price_list": bool(source_pricelist_file and price_lookup),
-            "has_inventory": bool(all_vms),
-        },
-        has_unsaved_scenario_changes=has_unsaved_scenario_changes,
-        inventory_issues=inventory_issues,
-        pricing_inputs={
-            "source_pricelist_file": source_pricelist_file,
-            "price_lookup": price_lookup,
-            "modeled_vm_rows": vm_rows,
-            "block_storage_unit_price": block_storage_unit_price,
-            "block_perf_unit_price": block_perf_unit_price,
-            "windows_os_unit_price": windows_os_unit_price,
-        },
-    )
     native_readiness = readiness.get("scenarios", {}).get("native", {})
     if not isinstance(native_readiness, dict):
         native_readiness = {}

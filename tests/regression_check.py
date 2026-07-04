@@ -603,13 +603,139 @@ def validate_current_readiness_routes() -> None:
                 response.status_code == 200
                 and response.mimetype
                 == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                and len(readiness_results) == prior_calls
+                and len(readiness_results) == prior_calls + 1
                 and export_marker_cleared,
                 f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, cleared={export_marker_cleared}",
             )
             response.close()
             if exported_readiness_workbook:
+                with zipfile.ZipFile(exported_readiness_workbook) as zf:
+                    sheet_map = workbook_sheet_map(zf)
+                    executive_rows = sheet_text_rows(
+                        zf, sheet_map["Executive Summary"]
+                    )
+                    executive_text = " ".join(
+                        value for row in executive_rows for value in row
+                    )
+                    check(
+                        "draft workbook includes readiness status and scenario completeness",
+                        all(
+                            token in executive_text
+                            for token in (
+                                "Executive Summary - Draft",
+                                "Workbook Status",
+                                "Draft",
+                                "Assessment Readiness",
+                                "Draft review required",
+                                "Native Remediation Status",
+                                "Required",
+                                "Native Affected VM Count",
+                                "OCVS Pricing Completeness",
+                                "Hybrid Pricing Completeness",
+                                "Incomplete",
+                            )
+                        )
+                        and any(
+                            row[:2] == ["Native Affected VM Count", "1"]
+                            for row in executive_rows
+                        ),
+                        executive_text,
+                    )
+                    check(
+                        "draft workbook includes recommendation fields and unresolved issue detail",
+                        all(
+                            token in executive_text
+                            for token in (
+                                "Assessor Recommendation",
+                                "Recommendation Rationale",
+                                "Unresolved Blockers",
+                                "Unresolved Advisories",
+                                "VCF license price not set",
+                                "OCVS and Hybrid costs exclude VCF license cost",
+                                "Affected VMs",
+                                "vm-legacy-01",
+                            )
+                        ),
+                        executive_text,
+                    )
                 Path(exported_readiness_workbook).unlink(missing_ok=True)
+
+            with app_module.app.test_request_context("/"):
+                app_module.session["state_id"] = state_id
+                customer_ready_state = app_module.load_app_state()
+                customer_ready_state["assessor_recommendation"] = "native"
+                customer_ready_state["assessor_recommendation_rationale"] = (
+                    "Remediate the affected legacy guest before Native migration."
+                )
+                app_module.save_app_state(customer_ready_state)
+
+            prior_calls = len(readiness_results)
+            response = client.post("/step4", data=export_data)
+            with client.session_transaction() as sess:
+                customer_ready_workbook = str(
+                    sess.get("last_export_file", "")
+                ).strip()
+            check(
+                "customer-ready Excel export uses one central readiness result",
+                response.status_code == 200
+                and len(readiness_results) == prior_calls + 1
+                and readiness_results[-1].get("customer_ready_export") is True,
+                f"status={response.status_code}, calls={len(readiness_results) - prior_calls}, readiness={readiness_results[-1]}",
+            )
+            response.close()
+            if customer_ready_workbook:
+                with zipfile.ZipFile(customer_ready_workbook) as zf:
+                    sheet_map = workbook_sheet_map(zf)
+                    customer_ready_rows = sheet_text_rows(
+                        zf, sheet_map["Executive Summary"]
+                    )
+                    executive_text = " ".join(
+                        value for row in customer_ready_rows for value in row
+                    )
+                    check(
+                        "customer-ready workbook status follows central readiness",
+                        all(
+                            token in executive_text
+                            for token in (
+                                "Executive Summary - Customer ready",
+                                "Workbook Status",
+                                "Assessment Readiness",
+                                "Customer ready",
+                                "Assessor Recommendation",
+                                "OCI Native",
+                                "Remediate the affected legacy guest before Native migration.",
+                                "OCVS Pricing Completeness",
+                                "Hybrid Pricing Completeness",
+                                "Incomplete",
+                            )
+                        )
+                        and any(
+                            row[:2] == ["Native Affected VM Count", "1"]
+                            for row in customer_ready_rows
+                        ),
+                        executive_text,
+                    )
+                Path(customer_ready_workbook).unlink(missing_ok=True)
+
+            malformed_metadata = app_module._workbook_readiness_metadata(
+                {
+                    "overall_state": "customer_ready",
+                    "customer_ready_export": "true",
+                    "scenarios": [],
+                    "blocking_items": "none",
+                    "advisory_items": {"title": "not a list"},
+                },
+                assessor_recommendation={"value": "native"},
+                recommendation_rationale=["not text"],
+            )
+            check(
+                "malformed workbook readiness metadata fails closed",
+                malformed_metadata.get("workbook_status") == "Draft"
+                and malformed_metadata.get("readiness_label") == "Incomplete"
+                and malformed_metadata.get("customer_ready_export") is False
+                and malformed_metadata.get("recommendation") == "Not provided",
+                str(malformed_metadata),
+            )
 
             with client.session_transaction() as sess:
                 sess[app_module.STEP4_UNSAVED_READINESS_SESSION_KEY] = True
@@ -5303,6 +5429,22 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
             str(bursts),
         )
 
+        literal_rationale = "=1+1; preserve this assessor rationale as literal text."
+        recommendation_response = client.post(
+            "/step4?tab=price",
+            data={
+                "action": "save_recommendation",
+                "recommendation": "hybrid",
+                "recommendation_rationale": literal_rationale,
+            },
+            follow_redirects=False,
+        )
+        check(
+            "workbook recommendation fixture saved",
+            recommendation_response.status_code == 303,
+            str(recommendation_response.status_code),
+        )
+
         response = client.post(
             "/step4",
             data={
@@ -5387,6 +5529,32 @@ def validate_workbook(workbook_path: Path) -> None:
                     "Report Scope",
                 ]
             ),
+        )
+        check(
+            "executive summary includes draft readiness and assessor recommendation",
+            all(
+                token in sheet_data["Executive Summary"][0]
+                for token in (
+                    "Executive Summary - Draft",
+                    "Workbook Status",
+                    "Draft",
+                    "Assessment Readiness",
+                    "Incomplete",
+                    "Assessor Recommendation",
+                    "Hybrid",
+                    "Recommendation Rationale",
+                    "=1+1; preserve this assessor rationale as literal text.",
+                )
+            ),
+            sheet_data["Executive Summary"][0],
+        )
+        executive_xml = zf.read(sheet_map["Executive Summary"]).decode("utf-8")
+        check(
+            "assessor recommendation text stays literal in workbook XML",
+            "<t>=1+1; preserve this assessor rationale as literal text.</t>"
+            in executive_xml
+            and "<f>=1+1; preserve this assessor rationale as literal text.</f>"
+            not in executive_xml,
         )
         executive_rows = sheet_text_rows(zf, sheet_map["Executive Summary"])
         check(
