@@ -15,31 +15,35 @@ MAX_TEXT_LENGTH = 4000
 
 _MAX_NUMBER = 1_000_000_000_000_000.0
 
+_SUPPORTED_CURRENCIES = {"USD", "EUR", "GBP", "CHF", "SEK", "NOK", "DKK"}
+_RECOMMENDATION_VALUES = {"", "native", "ocvs", "hybrid"}
+_BURST_VALUES = {"100%", "50%", "12.5%", "1:1"}
+_LICENSE_VALUES = {"", "BYOL", "Lic Include"}
+_PLACEMENT_VALUES = {"native", "ocvs", "review"}
+_COMMITMENT_VALUES = {"payg", "1_year", "3_year"}
+_OCVS_PROFILE_VALUES = {
+    "best_fit",
+    "BM.DenseIO2.52",
+    "BM.DenseIO.E4.128",
+    "BM.DenseIO.E5.128",
+    "BM.Standard2.52",
+    "BM.Standard3.64",
+    "BM.Standard.E4.128",
+    "BM.Standard.E5.192",
+}
+_VPU_VALUES = set(range(10, 121, 10))
+_OCVS_POLICY_RULES = {
+    "vcpu_per_ocpu": (1.0, 16.0, False, None),
+    "cpu_headroom_pct": (0.0, 90.0, False, None),
+    "memory_headroom_pct": (0.0, 90.0, False, None),
+    "storage_headroom_pct": (0.0, 90.0, False, None),
+    "dense_vsan_usable_pct": (10.0, 95.0, False, None),
+    "standard_storage_vpu": (10.0, 120.0, True, _VPU_VALUES),
+}
+
 _APP_STATE_TEXT_LIST_FIELDS = {
     "selected_vm_names",
     "acknowledged_warning_ids",
-}
-_APP_STATE_TEXT_MAP_FIELDS = {
-    "step4_os_shapes",
-    "step4_vm_shapes",
-    "step4_vm_bursts",
-    "step4_vm_os_license",
-    "step4_hybrid_placements",
-}
-_APP_STATE_NUMBER_MAP_FIELDS = {
-    "step4_vm_ocpus",
-    "step4_vm_vpus",
-}
-_APP_STATE_TEXT_FIELDS = {
-    "assessor_recommendation",
-    "assessor_recommendation_rationale",
-    "step4_ocvs_profile",
-    "step4_ocvs_commitment_term",
-}
-_APP_STATE_NUMBER_FIELDS = {
-    "step4_iaas_discount_pct",
-    "step4_vmware_license_price_per_core_yearly",
-    "step4_ocvs_dr_nodes",
 }
 _OCVS_POLICY_FIELDS = {
     "vcpu_per_ocpu",
@@ -61,14 +65,6 @@ _INVENTORY_SUMMARY_NUMBER_FIELDS = {
     "missing_storage_count",
     "duplicate_name_count",
     "duplicate_row_count",
-}
-_SNAPSHOT_TEXT_FIELDS = {
-    "ocvs_profile",
-    "ocvs_commitment_term",
-}
-_SNAPSHOT_NUMBER_FIELDS = {
-    "ocvs_dr_nodes",
-    "vmware_license_price_per_core_yearly",
 }
 _SNAPSHOT_VM_TEXT_FIELDS = {
     "oci_shape",
@@ -101,6 +97,11 @@ def _clean_text(value: Any, field: str, *, default: str = "") -> str:
         raise PortableAssessmentError(
             f"{field} exceeds the maximum length of {MAX_TEXT_LENGTH} characters."
         )
+    formula_candidate = value.lstrip()
+    if formula_candidate and formula_candidate[0] in "=+-@":
+        raise PortableAssessmentError(
+            f"{field} cannot begin with a spreadsheet formula marker."
+        )
     return value
 
 
@@ -113,6 +114,7 @@ def _clean_required_text(value: Any, field: str) -> str:
 
 def _clean_display_filename(value: Any, field: str) -> str:
     clean = _clean_text(value, field).replace("\\", "/").rsplit("/", 1)[-1]
+    _clean_text(clean, field)
     clean = re.sub(r"[^A-Za-z0-9._ -]+", "_", clean).strip(" ._")
     return clean[:255]
 
@@ -131,9 +133,48 @@ def _clean_timestamp(value: Any, field: str, *, required: bool = False) -> str:
 
 
 def _clean_currency(value: Any, field: str) -> str:
-    clean = _clean_text(value, field).strip().upper()
+    raw = _clean_text(value, field)
+    clean = raw.strip()
     if clean and not re.fullmatch(r"[A-Z]{3}", clean):
         raise PortableAssessmentError(f"{field} must be a three-letter currency code.")
+    if raw != clean:
+        raise PortableAssessmentError(f"{field} must use its canonical currency code.")
+    if clean and clean not in _SUPPORTED_CURRENCIES:
+        raise PortableAssessmentError(f"{field} is not a supported currency.")
+    return clean
+
+
+def _clean_state_number(
+    value: Any,
+    field: str,
+    *,
+    minimum: float,
+    maximum: float,
+    whole: bool = False,
+    allowed: set[int] | None = None,
+) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PortableAssessmentError(f"{field} must be a JSON number.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise PortableAssessmentError(f"{field} must be a finite number.")
+    if number < 0:
+        raise PortableAssessmentError(f"{field} cannot be negative.")
+    if number < minimum or number > maximum:
+        raise PortableAssessmentError(
+            f"{field} must be between {minimum:g} and {maximum:g}."
+        )
+    if whole and not number.is_integer():
+        raise PortableAssessmentError(f"{field} must be a whole number.")
+    if allowed is not None and int(number) not in allowed:
+        raise PortableAssessmentError(f"{field} is not a supported value.")
+    return int(number) if whole else number
+
+
+def _clean_enum(value: Any, field: str, allowed: set[str]) -> str:
+    clean = _clean_text(value, field)
+    if clean not in allowed:
+        raise PortableAssessmentError(f"{field} is not a supported value.")
     return clean
 
 
@@ -195,23 +236,24 @@ def _clean_text_map(value: Any, field: str) -> dict[str, str]:
     return cleaned
 
 
-def _clean_number_map(value: Any, field: str) -> dict[str, int | float]:
-    mapping = _require_mapping(value, field)
-    cleaned: dict[str, int | float] = {}
-    for key, item in mapping.items():
-        clean_key = _clean_text(key, f"{field} key")
-        if clean_key:
-            cleaned[clean_key] = _clean_vm_number(item, f"{field}.{clean_key}")
-    return cleaned
-
-
 def _clean_ocvs_policy(value: Any, field: str) -> dict[str, int | float]:
     policy = _require_mapping(value, field)
-    return {
-        key: _clean_vm_number(policy[key], f"{field}.{key}")
-        for key in _OCVS_POLICY_FIELDS
-        if key in policy
-    }
+    missing = _OCVS_POLICY_FIELDS - set(policy)
+    if missing:
+        raise PortableAssessmentError(
+            f"{field} must include every supported sizing policy value."
+        )
+    cleaned: dict[str, int | float] = {}
+    for key, (minimum, maximum, whole, allowed) in _OCVS_POLICY_RULES.items():
+        cleaned[key] = _clean_state_number(
+            policy[key],
+            f"{field}.{key}",
+            minimum=minimum,
+            maximum=maximum,
+            whole=whole,
+            allowed=allowed,
+        )
+    return cleaned
 
 
 def _clean_app_state(value: Any) -> dict[str, Any]:
@@ -223,29 +265,110 @@ def _clean_app_state(value: Any) -> dict[str, Any]:
                 state[key],
                 f"assessment.app_state.{key}",
             )
-    for key in _APP_STATE_TEXT_MAP_FIELDS:
+    warning_ids = cleaned.get("acknowledged_warning_ids")
+    if warning_ids is not None:
+        if any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", warning_id)
+            for warning_id in warning_ids
+        ):
+            raise PortableAssessmentError(
+                "assessment.app_state.acknowledged_warning_ids contains an invalid warning id."
+            )
+        if len(warning_ids) != len(set(warning_ids)):
+            raise PortableAssessmentError(
+                "assessment.app_state.acknowledged_warning_ids must be unique."
+            )
+    for key in {"step4_os_shapes", "step4_vm_shapes"}:
         if key in state:
             cleaned[key] = _clean_text_map(
                 state[key],
                 f"assessment.app_state.{key}",
             )
-    for key in _APP_STATE_NUMBER_MAP_FIELDS:
+    enum_maps = {
+        "step4_vm_bursts": _BURST_VALUES,
+        "step4_vm_os_license": _LICENSE_VALUES,
+        "step4_hybrid_placements": _PLACEMENT_VALUES,
+    }
+    for key, allowed in enum_maps.items():
         if key in state:
-            cleaned[key] = _clean_number_map(
-                state[key],
-                f"assessment.app_state.{key}",
+            mapping = _require_mapping(state[key], f"assessment.app_state.{key}")
+            cleaned[key] = {
+                _clean_text(vm_name, f"assessment.app_state.{key} key"): _clean_enum(
+                    item,
+                    f"assessment.app_state.{key}.{vm_name}",
+                    allowed,
+                )
+                for vm_name, item in mapping.items()
+                if _clean_text(vm_name, f"assessment.app_state.{key} key")
+            }
+    number_map_rules = {
+        "step4_vm_ocpus": (1.0, _MAX_NUMBER, True, None),
+        "step4_vm_vpus": (10.0, 120.0, True, _VPU_VALUES),
+    }
+    for key, (minimum, maximum, whole, allowed) in number_map_rules.items():
+        if key in state:
+            mapping = _require_mapping(state[key], f"assessment.app_state.{key}")
+            clean_mapping: dict[str, int | float] = {}
+            for vm_name, item in mapping.items():
+                clean_name = _clean_text(vm_name, f"assessment.app_state.{key} key")
+                if clean_name:
+                    clean_mapping[clean_name] = _clean_state_number(
+                        item,
+                        f"assessment.app_state.{key}.{clean_name}",
+                        minimum=minimum,
+                        maximum=maximum,
+                        whole=whole,
+                        allowed=allowed,
+                    )
+            cleaned[key] = clean_mapping
+    if "assessor_recommendation" in state:
+        cleaned["assessor_recommendation"] = _clean_enum(
+            state["assessor_recommendation"],
+            "assessment.app_state.assessor_recommendation",
+            _RECOMMENDATION_VALUES,
+        )
+    if "assessor_recommendation_rationale" in state:
+        rationale = _clean_text(
+            state["assessor_recommendation_rationale"],
+            "assessment.app_state.assessor_recommendation_rationale",
+        )
+        normalized_rationale = rationale.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if rationale != normalized_rationale:
+            raise PortableAssessmentError(
+                "assessment.app_state.assessor_recommendation_rationale must be canonical text."
             )
-    for key in _APP_STATE_TEXT_FIELDS:
+        cleaned["assessor_recommendation_rationale"] = rationale
+    if "step4_ocvs_profile" in state:
+        cleaned["step4_ocvs_profile"] = _clean_enum(
+            state["step4_ocvs_profile"],
+            "assessment.app_state.step4_ocvs_profile",
+            _OCVS_PROFILE_VALUES,
+        )
+    if "step4_ocvs_commitment_term" in state:
+        cleaned["step4_ocvs_commitment_term"] = _clean_enum(
+            state["step4_ocvs_commitment_term"],
+            "assessment.app_state.step4_ocvs_commitment_term",
+            _COMMITMENT_VALUES,
+        )
+    scalar_rules = {
+        "step4_iaas_discount_pct": (0.0, 100.0, False, None),
+        "step4_vmware_license_price_per_core_yearly": (
+            0.0,
+            1_000_000.0,
+            False,
+            None,
+        ),
+        "step4_ocvs_dr_nodes": (0.0, 2.0, True, {0, 1, 2}),
+    }
+    for key, (minimum, maximum, whole, allowed) in scalar_rules.items():
         if key in state:
-            cleaned[key] = _clean_text(
+            cleaned[key] = _clean_state_number(
                 state[key],
                 f"assessment.app_state.{key}",
-            )
-    for key in _APP_STATE_NUMBER_FIELDS:
-        if key in state:
-            cleaned[key] = _clean_vm_number(
-                state[key],
-                f"assessment.app_state.{key}",
+                minimum=minimum,
+                maximum=maximum,
+                whole=whole,
+                allowed=allowed,
             )
     if "step4_ocvs_policy" in state:
         cleaned["step4_ocvs_policy"] = _clean_ocvs_policy(
@@ -281,15 +404,31 @@ def _clean_snapshot_vm_settings(value: Any) -> dict[str, dict[str, Any]]:
             clean_config["selected"] = config["selected"]
         for key in _SNAPSHOT_VM_TEXT_FIELDS:
             if key in config:
-                clean_config[key] = _clean_text(
-                    config[key],
-                    f"assessment.step4_snapshot.vm_settings.{clean_name}.{key}",
+                field = f"assessment.step4_snapshot.vm_settings.{clean_name}.{key}"
+                enum_values = {
+                    "burst": _BURST_VALUES,
+                    "os_license": _LICENSE_VALUES,
+                    "hybrid_placement": _PLACEMENT_VALUES,
+                }.get(key)
+                clean_config[key] = (
+                    _clean_enum(config[key], field, enum_values)
+                    if enum_values is not None
+                    else _clean_text(config[key], field)
                 )
         for key in _SNAPSHOT_VM_NUMBER_FIELDS:
             if key in config:
-                clean_config[key] = _clean_vm_number(
+                minimum, maximum, allowed = (
+                    (1.0, _MAX_NUMBER, None)
+                    if key == "ocpu"
+                    else (10.0, 120.0, _VPU_VALUES)
+                )
+                clean_config[key] = _clean_state_number(
                     config[key],
                     f"assessment.step4_snapshot.vm_settings.{clean_name}.{key}",
+                    minimum=minimum,
+                    maximum=maximum,
+                    whole=True,
+                    allowed=allowed,
                 )
         if clean_name and clean_config:
             cleaned[clean_name] = clean_config
@@ -304,18 +443,33 @@ def _clean_step4_snapshot(value: Any) -> dict[str, Any]:
             snapshot["saved_at"],
             "assessment.step4_snapshot.saved_at",
         )
-    for key in _SNAPSHOT_TEXT_FIELDS:
+    snapshot_enums = {
+        "ocvs_profile": _OCVS_PROFILE_VALUES,
+        "ocvs_commitment_term": _COMMITMENT_VALUES,
+    }
+    for key, allowed in snapshot_enums.items():
         if key in snapshot:
-            cleaned[key] = _clean_text(
+            cleaned[key] = _clean_enum(
                 snapshot[key],
                 f"assessment.step4_snapshot.{key}",
+                allowed,
             )
-    for key in _SNAPSHOT_NUMBER_FIELDS:
-        if key in snapshot:
-            cleaned[key] = _clean_vm_number(
-                snapshot[key],
-                f"assessment.step4_snapshot.{key}",
-            )
+    if "ocvs_dr_nodes" in snapshot:
+        cleaned["ocvs_dr_nodes"] = _clean_state_number(
+            snapshot["ocvs_dr_nodes"],
+            "assessment.step4_snapshot.ocvs_dr_nodes",
+            minimum=0.0,
+            maximum=2.0,
+            whole=True,
+            allowed={0, 1, 2},
+        )
+    if "vmware_license_price_per_core_yearly" in snapshot:
+        cleaned["vmware_license_price_per_core_yearly"] = _clean_state_number(
+            snapshot["vmware_license_price_per_core_yearly"],
+            "assessment.step4_snapshot.vmware_license_price_per_core_yearly",
+            minimum=0.0,
+            maximum=1_000_000.0,
+        )
     if "ocvs_policy" in snapshot:
         cleaned["ocvs_policy"] = _clean_ocvs_policy(
             snapshot["ocvs_policy"],

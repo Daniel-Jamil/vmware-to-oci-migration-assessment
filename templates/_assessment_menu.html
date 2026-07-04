@@ -28,7 +28,7 @@
         data-assessment-export
       >Export current assessment</button>
     </form>
-    <form method="post" action="{{ url_for('index') }}" enctype="multipart/form-data">
+    <form method="post" action="{{ url_for('index', portable_import=1) }}" enctype="multipart/form-data">
       <input type="hidden" name="action" value="import_assessment" />
       <input
         type="file"

@@ -28,7 +28,7 @@
       <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
       <button type="submit" class="results-button results-button--secondary">Export assessment JSON</button>
     </form>
-    <form method="post" action="{{ url_for('index') }}" enctype="multipart/form-data">
+    <form method="post" action="{{ url_for('index', portable_import=1) }}" enctype="multipart/form-data">
       <input type="hidden" name="action" value="import_assessment" />
       <input
         type="file"

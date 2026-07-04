@@ -94,6 +94,8 @@ app.config["MAX_FORM_PARTS"] = _env_int(
     default=50000,
     min_value=1000,
 )
+PORTABLE_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+MAX_PORTABLE_REQUEST_BYTES = MAX_PACKAGE_BYTES + PORTABLE_MULTIPART_OVERHEAD_BYTES
 APP_INSTANCE_ID = uuid4().hex
 
 
@@ -108,6 +110,24 @@ def request_entity_too_large(_: RequestEntityTooLarge) -> Any:
     if request.path.startswith(("/step4", "/scenario", "/step5")):
         return redirect(step4_tab_redirect("native")), 303
     return redirect(url_for("index")), 303
+
+
+@app.before_request
+def enforce_portable_assessment_request_limit() -> Any:
+    """Reject oversized portable multipart bodies before Werkzeug parses them."""
+    if (
+        request.method == "POST"
+        and request.path == "/"
+        and request.mimetype == "multipart/form-data"
+        and request.content_length is not None
+        and request.content_length > MAX_PORTABLE_REQUEST_BYTES
+    ):
+        flash(
+            "Portable assessment upload exceeds the 25 MiB package limit.",
+            "error",
+        )
+        return redirect(url_for("index")), 303
+    return None
 
 
 @app.before_request
@@ -550,7 +570,10 @@ def _write_new_json_atomically(file_path: Path, payload: Any) -> None:
         temporary_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.link(temporary_file, file_path)
     finally:
-        temporary_file.unlink(missing_ok=True)
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            app.logger.exception("Temporary exclusive JSON cleanup failed")
 
 
 def _read_optional_file_bytes(file_path: Path) -> tuple[bool, bytes]:
@@ -717,8 +740,15 @@ def save_app_state(state: dict[str, Any]) -> None:
 
 
 def _saved_assessments_dir() -> Path:
+    if APP_STATE_DIR.is_symlink():
+        raise PortableAssessmentError("The saved assessment root cannot be a symlink.")
+    APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
     saved_dir = APP_STATE_DIR / "saved_assessments"
+    if saved_dir.is_symlink():
+        raise PortableAssessmentError("The saved assessment root cannot be a symlink.")
     saved_dir.mkdir(parents=True, exist_ok=True)
+    if saved_dir.resolve().parent != APP_STATE_DIR.resolve():
+        raise PortableAssessmentError("The saved assessment root is outside local storage.")
     return saved_dir
 
 
@@ -855,13 +885,19 @@ def build_saved_assessment_snapshot(name: Any, notes: Any, assessment_id: str = 
 
 
 def save_current_assessment(name: Any, notes: Any) -> dict[str, Any]:
-    active_id = _clean_assessment_id(session.get("active_assessment_id", ""))
-    snapshot = build_saved_assessment_snapshot(name, notes, active_id)
-    assessment_id = str(snapshot["id"])
-    file_path = _saved_assessment_file_path(assessment_id)
-    if file_path is None:
-        raise ValueError("Assessment id is not valid.")
-    file_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    prior_session = copy.deepcopy(dict(session))
+    try:
+        active_id = _clean_assessment_id(session.get("active_assessment_id", ""))
+        snapshot = build_saved_assessment_snapshot(name, notes, active_id)
+        assessment_id = str(snapshot["id"])
+        file_path = _saved_assessment_file_path(assessment_id)
+        if file_path is None:
+            raise ValueError("Assessment id is not valid.")
+        _write_json_atomically(file_path, snapshot)
+    except Exception:
+        session.clear()
+        session.update(prior_session)
+        raise
     session["active_assessment_id"] = assessment_id
     session["active_assessment_name"] = snapshot["name"]
     session["active_assessment_notes"] = snapshot["notes"]
@@ -950,7 +986,11 @@ def stage_saved_assessment_load(
     }
 
 
-def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
+def load_saved_assessment(
+    assessment_id: Any,
+    *,
+    apply_preferences: bool = True,
+) -> dict[str, Any]:
     file_path = _saved_assessment_file_path(assessment_id)
     if file_path is None or not file_path.exists():
         return {"ok": False, "message": "Saved assessment was not found.", "warnings": []}
@@ -975,7 +1015,7 @@ def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
         save_step4_snapshot(staged["step4_snapshot"])
         session.clear()
         session.update(copy.deepcopy(staged["session"]))
-        if staged["apply_price_preference"]:
+        if apply_preferences and staged["apply_price_preference"]:
             save_preferences(staged["preferences"])
     except Exception:
         app.logger.exception("Saved assessment transactional load failed")
@@ -987,10 +1027,6 @@ def load_saved_assessment(assessment_id: Any) -> dict[str, Any]:
             save_step4_snapshot(prior_step4_snapshot)
         except Exception:
             app.logger.exception("Saved assessment Step 4 rollback failed")
-        try:
-            save_preferences(prior_preferences)
-        except Exception:
-            app.logger.exception("Saved assessment preferences rollback failed")
         session.clear()
         session.update(copy.deepcopy(prior_session))
         return {"ok": False, "message": "Saved assessment could not be loaded.", "warnings": []}
@@ -1025,13 +1061,11 @@ def build_current_portable_assessment(
 ) -> tuple[dict[str, Any], str]:
     """Build a path-free package from the current server-side workspace."""
     active_id = _clean_assessment_id(session.get("active_assessment_id", ""))
-    if active_id:
-        snapshot = save_current_assessment(assessment_name, assessment_notes)
-    else:
-        snapshot = build_saved_assessment_snapshot(
-            assessment_name,
-            assessment_notes,
-        )
+    snapshot = build_saved_assessment_snapshot(
+        assessment_name,
+        assessment_notes,
+        active_id,
+    )
 
     selected_inventory = str(snapshot.get("selected_rvtools_file") or "").strip()
     inventory_rows: list[dict[str, Any]] = []
@@ -1120,12 +1154,20 @@ def _next_imported_assessment_name(value: Any) -> str:
 def _allocate_imported_assessment_paths(
     assessment_name: str,
 ) -> tuple[str, Path, Path]:
+    imported_root = DOWNLOADS_DIR / "imported_assessments"
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    if DOWNLOADS_DIR.is_symlink() or imported_root.is_symlink():
+        raise PortableAssessmentError("The imported assessment root cannot be a symlink.")
+    if imported_root.exists() and not imported_root.is_dir():
+        raise PortableAssessmentError("The imported assessment root is not a directory.")
+    if imported_root.exists() and imported_root.resolve().parent != DOWNLOADS_DIR.resolve():
+        raise PortableAssessmentError("The imported assessment root is outside local storage.")
     for _attempt in range(1000):
         assessment_id = _new_assessment_id(assessment_name)
         snapshot_file = _saved_assessment_file_path(assessment_id)
         if snapshot_file is None:
             continue
-        import_dir = DOWNLOADS_DIR / "imported_assessments" / assessment_id
+        import_dir = imported_root / assessment_id
         if not snapshot_file.exists() and not import_dir.exists():
             return assessment_id, import_dir, snapshot_file
     raise PortableAssessmentError(
@@ -1200,10 +1242,9 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
         if prior_state_id
         else None
     )
-    prior_preferences_file = APP_STATE_DIR / "preferences.json"
     prior_persistence = {
         path: _read_optional_file_bytes(path)
-        for path in (prior_state_file, prior_step4_file, prior_preferences_file)
+        for path in (prior_state_file, prior_step4_file)
         if path is not None
     }
 
@@ -1280,20 +1321,26 @@ def import_portable_assessment(package: Any) -> dict[str, Any]:
         }
         _write_new_json_atomically(snapshot_file, snapshot)
         created_snapshot = True
-        load_result = load_saved_assessment(assessment_id)
+        load_result = load_saved_assessment(
+            assessment_id,
+            apply_preferences=False,
+        )
         if not load_result.get("ok"):
             raise PortableAssessmentError(
                 "The imported assessment could not be loaded after reconstruction."
             )
-        if not has_pricing:
+        preferences = load_preferences()
+        updated_preferences = copy.deepcopy(preferences)
+        if has_pricing:
+            updated_preferences["last_selected_pricelist_file"] = pricing_path
+            updated_preferences["last_selected_currency"] = currency
+        else:
             session.pop("selected_pricelist_file", None)
             session.pop("selected_currency", None)
-            preferences = load_preferences()
-            cleared_preferences = copy.deepcopy(preferences)
-            cleared_preferences.pop("last_selected_pricelist_file", None)
-            cleared_preferences.pop("last_selected_currency", None)
-            if cleared_preferences != preferences:
-                save_preferences(cleared_preferences)
+            updated_preferences.pop("last_selected_pricelist_file", None)
+            updated_preferences.pop("last_selected_currency", None)
+        if updated_preferences != preferences:
+            save_preferences(updated_preferences)
     except Exception:
         failed_state_id = str(session.get("state_id") or "").strip()
         try:
@@ -1418,11 +1465,9 @@ def load_latest_price_lookup() -> tuple[dict[str, float], str, str]:
 def list_downloaded_price_lists() -> list[str]:
     """List saved OCI price list JSON files (newest first)."""
     files = list(DOWNLOADS_DIR.glob("oci_pricing_*.json"))
-    files.extend(
-        (DOWNLOADS_DIR / "imported_assessments").glob(
-            "*/oci_pricing_*.json"
-        )
-    )
+    imported_root = DOWNLOADS_DIR / "imported_assessments"
+    if not imported_root.is_symlink():
+        files.extend(imported_root.glob("*/oci_pricing_*.json"))
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [str(p).replace("\\", "/") for p in files]
 
@@ -2489,7 +2534,10 @@ def parse_vinfo_from_xlsx(xlsx_path: Path) -> tuple[list[dict[str, str]], str]:
 def _load_imported_normalized_inventory(
     selected: Path,
 ) -> tuple[list[dict[str, Any]], str]:
-    imported_root = (DOWNLOADS_DIR / "imported_assessments").resolve()
+    imported_root_path = DOWNLOADS_DIR / "imported_assessments"
+    if DOWNLOADS_DIR.is_symlink() or imported_root_path.is_symlink():
+        raise ValueError("The imported normalized inventory root is unsafe.")
+    imported_root = imported_root_path.resolve()
     try:
         resolved = selected.resolve(strict=True)
     except OSError as exc:
@@ -8147,11 +8195,28 @@ def index() -> Any:
 
         if action == "export_assessment":
             try:
+                requested_name = request.form.get(
+                    "assessment_name",
+                    active_assessment_name,
+                )
+                requested_notes = request.form.get(
+                    "assessment_notes",
+                    active_assessment_notes,
+                )
                 package, filename = build_current_portable_assessment(
-                    request.form.get("assessment_name", active_assessment_name),
-                    request.form.get("assessment_notes", active_assessment_notes),
+                    requested_name,
+                    requested_notes,
                 )
                 payload = dumps_portable_package(package).encode("utf-8")
+                response = send_file(
+                    io.BytesIO(payload),
+                    mimetype="application/json",
+                    as_attachment=True,
+                    download_name=filename,
+                )
+                response.headers["Content-Type"] = "application/json; charset=utf-8"
+                if _clean_assessment_id(session.get("active_assessment_id", "")):
+                    save_current_assessment(requested_name, requested_notes)
             except PortableAssessmentError as exc:
                 flash(str(exc), "error")
             except Exception:
@@ -8161,19 +8226,29 @@ def index() -> Any:
                     "error",
                 )
             else:
-                response = send_file(
-                    io.BytesIO(payload),
-                    mimetype="application/json",
-                    as_attachment=True,
-                    download_name=filename,
-                )
-                response.headers["Content-Type"] = "application/json; charset=utf-8"
                 return response
 
         elif action == "import_assessment":
-            upload = request.files.get("assessment_file")
+            valid_form = (
+                set(request.form) == {"action"}
+                and request.form.getlist("action") == ["import_assessment"]
+            )
+            valid_files = (
+                set(request.files) == {"assessment_file"}
+                and len(request.files.getlist("assessment_file")) == 1
+            )
+            if not valid_form or not valid_files:
+                flash(
+                    "Submit exactly one portable assessment JSON file and no other fields.",
+                    "error",
+                )
+                upload = None
+            else:
+                upload = request.files.get("assessment_file")
             original_name = secure_filename(upload.filename if upload else "")
-            if not upload or not original_name:
+            if not valid_form or not valid_files:
+                pass
+            elif not upload or not original_name:
                 flash("Choose a portable assessment JSON file to import.", "error")
             elif Path(original_name).suffix.lower() != ".json":
                 flash("Only .json portable assessment files can be imported.", "error")
@@ -8223,6 +8298,10 @@ def index() -> Any:
                 flash("Customer name cleared.", "customer_success")
 
         elif action == "save_assessment":
+            prior_customer = (
+                "customer_name" in session,
+                session.get("customer_name"),
+            )
             if "customer_name" in request.form:
                 customer_name = normalize_customer_name(request.form.get("customer_name", ""))
                 if customer_name:
@@ -8236,6 +8315,10 @@ def index() -> Any:
                 )
             except Exception:
                 app.logger.exception("Stage 1 assessment save failed")
+                if prior_customer[0]:
+                    session["customer_name"] = prior_customer[1]
+                else:
+                    session.pop("customer_name", None)
                 flash("Assessment could not be saved. Try again.", "error")
             else:
                 active_assessment_id = str(saved_snapshot.get("id") or "")

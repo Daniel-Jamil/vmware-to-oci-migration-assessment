@@ -4885,7 +4885,7 @@ def validate_portable_assessments() -> None:
             app_module.save_step4_snapshot({"marker": "prior-step4"})
 
         import_response = client.post(
-            "/",
+            "/?portable_import=1",
             data={
                 "action": "import_assessment",
                 "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
@@ -4959,7 +4959,7 @@ def validate_portable_assessments() -> None:
         )
 
         second_response = client.post(
-            "/",
+            "/?portable_import=1",
             data={
                 "action": "import_assessment",
                 "assessment_file": (BytesIO(package_bytes), "portable_assessment.json"),
@@ -4984,6 +4984,7 @@ def validate_portable_assessments() -> None:
         preserved_library = file_tree_bytes(saved_dir)
         imported_root = app_module.DOWNLOADS_DIR / "imported_assessments"
         preserved_artifacts = file_tree_bytes(imported_root)
+        preserved_workbooks = file_tree_bytes(app_module.EXPORTS_DIR)
         invalid_wrong_type = json.loads(package_bytes.decode("utf-8"))
         invalid_wrong_type["package_type"] = "wrong"
         invalid_version = json.loads(package_bytes.decode("utf-8"))
@@ -4996,6 +4997,14 @@ def validate_portable_assessments() -> None:
         )
         invalid_negative = json.loads(package_bytes.decode("utf-8"))
         invalid_negative["inventory"]["rows"][0]["cpus"] = -1
+        invalid_formula_name = json.loads(package_bytes.decode("utf-8"))
+        invalid_formula_name["assessment"]["name"] = " =1+1"
+        invalid_formula_rationale = json.loads(package_bytes.decode("utf-8"))
+        invalid_formula_rationale["assessment"]["app_state"][
+            "assessor_recommendation_rationale"
+        ] = "\t+HYPERLINK(\"bad\")"
+        invalid_formula_vm = json.loads(package_bytes.decode("utf-8"))
+        invalid_formula_vm["inventory"]["rows"][0]["name"] = " @SUM(A1:A2)"
         invalid_cases = [
             ("wrong extension", package_bytes, "portable.txt"),
             ("malformed JSON", b"{not-json", "portable.json"),
@@ -5004,6 +5013,13 @@ def validate_portable_assessments() -> None:
             ("missing section", json.dumps(invalid_missing).encode("utf-8"), "portable.json"),
             ("duplicate VM name", json.dumps(invalid_duplicate).encode("utf-8"), "portable.json"),
             ("negative number", json.dumps(invalid_negative).encode("utf-8"), "portable.json"),
+            ("formula assessment name", json.dumps(invalid_formula_name).encode("utf-8"), "portable.json"),
+            (
+                "formula rationale",
+                json.dumps(invalid_formula_rationale).encode("utf-8"),
+                "portable.json",
+            ),
+            ("formula VM name", json.dumps(invalid_formula_vm).encode("utf-8"), "portable.json"),
             (
                 "oversized package",
                 b"{" + (b" " * app_module.MAX_PACKAGE_BYTES),
@@ -5013,7 +5029,7 @@ def validate_portable_assessments() -> None:
         invalid_results: list[tuple[str, bool]] = []
         for label, invalid_bytes, filename in invalid_cases:
             response = client.post(
-                "/",
+                "/?portable_import=1",
                 data={
                     "action": "import_assessment",
                     "assessment_file": (BytesIO(invalid_bytes), filename),
@@ -5029,11 +5045,12 @@ def validate_portable_assessments() -> None:
                     and current_session == preserved_session
                     and file_tree_bytes(app_module.APP_STATE_DIR) == preserved_app_state
                     and file_tree_bytes(saved_dir) == preserved_library
-                    and file_tree_bytes(imported_root) == preserved_artifacts,
+                    and file_tree_bytes(imported_root) == preserved_artifacts
+                    and file_tree_bytes(app_module.EXPORTS_DIR) == preserved_workbooks,
                 )
             )
         check(
-            "Task 10 invalid imports preserve session library and artifacts byte-for-byte",
+            "Task 10 invalid and formula-bearing imports never reach workbook materialization",
             all(passed for _label, passed in invalid_results),
             str(invalid_results),
         )

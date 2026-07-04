@@ -2,6 +2,7 @@ import copy
 import json
 import tempfile
 import unittest
+import zipfile
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 import assessment_portability as portability
 import app as app_module
+from werkzeug.datastructures import MultiDict
 
 
 def valid_sections() -> tuple[dict, dict, dict]:
@@ -291,6 +293,292 @@ class PortableAssessmentTests(unittest.TestCase):
                     "negative",
                 ):
                     portability.validate_portable_package(package)
+
+    def test_rejects_formula_leading_imported_text_but_keeps_numeric_fields(self) -> None:
+        mutations = (
+            ("assessment name", lambda package: package["assessment"].update(name=" =2+2")),
+            (
+                "recommendation rationale",
+                lambda package: package["assessment"]["app_state"].update(
+                    assessor_recommendation_rationale="\t+HYPERLINK(\"bad\")"
+                ),
+            ),
+            (
+                "VM name",
+                lambda package: package["inventory"]["rows"][0].update(
+                    name="\r@SUM(A1:A2)"
+                ),
+            ),
+            (
+                "VM source name",
+                lambda package: package["inventory"]["rows"][0].update(
+                    source_name=" -1+1"
+                ),
+            ),
+            (
+                "VM operating system",
+                lambda package: package["inventory"]["rows"][0].update(
+                    raw_os=" =cmd|' /C calc'!A0"
+                ),
+            ),
+            (
+                "app-state map key",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vm_shapes={" @malicious-vm": "VM.Standard.E5.Flex"}
+                ),
+            ),
+            (
+                "snapshot VM setting",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(oci_shape=" +1+1"),
+            ),
+            (
+                "pricing display name",
+                lambda package: package["pricing"]["document"]["items"][0].update(
+                    displayName=" =WEBSERVICE(\"bad\")"
+                ),
+            ),
+            (
+                "path-like source filename",
+                lambda package: package["inventory"].update(
+                    source_file_name="sender/path/ =1+1.csv"
+                ),
+            ),
+        )
+
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                package = valid_package()
+                mutate(package)
+                with self.assertRaisesRegex(
+                    portability.PortableAssessmentError,
+                    "spreadsheet formula",
+                ):
+                    portability.validate_portable_package(package)
+
+        package = valid_package()
+        package["inventory"]["rows"][0]["cpus"] = "+4"
+        validated = portability.validate_portable_package(package)
+        self.assertEqual(4, validated["inventory"]["rows"][0]["cpus"])
+
+    def test_rejects_noncanonical_or_out_of_domain_assessment_state(self) -> None:
+        def all_currencies(package: dict, value: str) -> None:
+            package["assessment"]["selected_currency"] = value
+            package["pricing"]["currency"] = value
+            package["pricing"]["document"]["items"][0][
+                "currencyCodeLocalizations"
+            ][0]["currencyCode"] = value
+
+        cases = (
+            ("unsupported currency", lambda package: all_currencies(package, "CAD")),
+            (
+                "noncanonical currency",
+                lambda package: all_currencies(package, "eur"),
+            ),
+            (
+                "recommendation enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    assessor_recommendation="maybe"
+                ),
+            ),
+            (
+                "lossy rationale whitespace",
+                lambda package: package["assessment"]["app_state"].update(
+                    assessor_recommendation_rationale="Review this. "
+                ),
+            ),
+            (
+                "warning id syntax",
+                lambda package: package["assessment"]["app_state"].update(
+                    acknowledged_warning_ids=["Not Canonical"]
+                ),
+            ),
+            (
+                "duplicate warning ids",
+                lambda package: package["assessment"]["app_state"].update(
+                    acknowledged_warning_ids=["review", "review"]
+                ),
+            ),
+            (
+                "placement enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_hybrid_placements={"app-01": "Native"}
+                ),
+            ),
+            (
+                "burst enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vm_bursts={"app-01": "75%"}
+                ),
+            ),
+            (
+                "license enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vm_os_license={"app-01": "included"}
+                ),
+            ),
+            (
+                "profile enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_profile="BM.Unknown"
+                ),
+            ),
+            (
+                "commitment canonical enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_commitment_term="1yr"
+                ),
+            ),
+            (
+                "discount range",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_iaas_discount_pct=100.01
+                ),
+            ),
+            (
+                "finite discount",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_iaas_discount_pct=float("nan")
+                ),
+            ),
+            (
+                "numeric JSON type",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_iaas_discount_pct="12.5"
+                ),
+            ),
+            (
+                "license price range",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vmware_license_price_per_core_yearly=1_000_000.01
+                ),
+            ),
+            (
+                "DR node enum",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_dr_nodes=3
+                ),
+            ),
+            (
+                "whole OCPU",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vm_ocpus={"app-01": 1.5}
+                ),
+            ),
+            (
+                "VPU options",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_vm_vpus={"app-01": 15}
+                ),
+            ),
+            (
+                "complete policy",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_policy={"vcpu_per_ocpu": 4}
+                ),
+            ),
+            (
+                "policy range",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_policy={
+                        **app_module.OCVS_DEFAULT_SIZING_POLICY,
+                        "cpu_headroom_pct": 91,
+                    }
+                ),
+            ),
+            (
+                "policy whole VPU",
+                lambda package: package["assessment"]["app_state"].update(
+                    step4_ocvs_policy={
+                        **app_module.OCVS_DEFAULT_SIZING_POLICY,
+                        "standard_storage_vpu": 10.5,
+                    }
+                ),
+            ),
+            (
+                "snapshot burst enum",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(burst="75%"),
+            ),
+            (
+                "snapshot license enum",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(os_license="invalid"),
+            ),
+            (
+                "snapshot placement enum",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(hybrid_placement="elsewhere"),
+            ),
+            (
+                "snapshot whole OCPU",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(ocpu=2.5),
+            ),
+            (
+                "snapshot VPU options",
+                lambda package: package["assessment"]["step4_snapshot"][
+                    "vm_settings"
+                ]["app-01"].update(vpu=15),
+            ),
+        )
+
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                package = valid_package()
+                mutate(package)
+                with self.assertRaises(portability.PortableAssessmentError):
+                    portability.validate_portable_package(package)
+
+    def test_valid_full_app_state_is_unchanged_by_application_normalization(self) -> None:
+        package = valid_package()
+        state = app_module._default_app_state()
+        state.update(
+            selected_vm_names=["app-01", "db-01"],
+            acknowledged_warning_ids=["unsupported-native"],
+            assessor_recommendation="hybrid",
+            assessor_recommendation_rationale="Retain db-01 on OCVS.",
+            step4_os_shapes={"Oracle Linux 8": "VM.Standard.E5.Flex"},
+            step4_vm_shapes={"app-01": "VM.Standard.E5.Flex"},
+            step4_vm_ocpus={"app-01": 2},
+            step4_vm_bursts={"app-01": "100%"},
+            step4_vm_vpus={"app-01": 20},
+            step4_vm_os_license={"app-01": "BYOL"},
+            step4_hybrid_placements={"app-01": "native", "db-01": "ocvs"},
+            step4_iaas_discount_pct=12.5,
+            step4_ocvs_profile="best_fit",
+            step4_ocvs_policy=dict(app_module.OCVS_DEFAULT_SIZING_POLICY),
+            step4_ocvs_commitment_term="3_year",
+            step4_vmware_license_price_per_core_yearly=3500.0,
+            step4_ocvs_dr_nodes=1,
+            step4_last_updated_at="2026-07-04T09:30:00",
+        )
+        package["assessment"]["app_state"] = state
+
+        validated = portability.validate_portable_package(package)
+        validated_state = validated["assessment"]["app_state"]
+
+        self.assertEqual(
+            validated_state,
+            app_module.normalize_app_state(validated_state),
+        )
+
+    def test_internal_workbook_formulas_remain_explicit(self) -> None:
+        workbook = app_module._build_xlsx_workbook_bytes(
+            [{"name": "Proof", "rows": [["Safe text", "=1+1"]]}],
+            currency_fmt_code='"USD" #,##0.00',
+        )
+
+        with zipfile.ZipFile(BytesIO(workbook)) as archive:
+            worksheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+        self.assertIn("<f>1+1</f>", worksheet)
+        self.assertIn("<t>Safe text</t>", worksheet)
 
     def test_rejects_oversized_strings_anywhere_in_supported_sections(self) -> None:
         mutations = (
@@ -703,6 +991,367 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             for path in sorted(root.rglob("*"))
             if path.is_file()
         }
+
+    def test_post_link_temp_cleanup_failure_does_not_hide_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "published.json"
+            real_unlink = Path.unlink
+
+            def fail_temp_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path.name.startswith(".published.json.") and path.name.endswith(".tmp"):
+                    raise OSError("injected post-link cleanup failure")
+                real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", autospec=True, side_effect=fail_temp_unlink):
+                app_module._write_new_json_atomically(destination, {"published": True})
+
+            self.assertEqual({"published": True}, json.loads(destination.read_text()))
+
+    def test_import_rolls_back_published_snapshot_after_post_link_cleanup_failure(self) -> None:
+        with isolated_portability_client() as fixture:
+            package_bytes = portability.dumps_portable_package(valid_package()).encode(
+                "utf-8"
+            )
+            real_unlink = Path.unlink
+
+            def fail_temp_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path.name.endswith(".tmp") and "saved_assessments" in path.parts:
+                    raise OSError("injected post-link cleanup failure")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(
+                    Path,
+                    "unlink",
+                    autospec=True,
+                    side_effect=fail_temp_unlink,
+                ),
+                patch.object(
+                    app_module,
+                    "load_saved_assessment",
+                    return_value={"ok": False, "warnings": []},
+                ),
+            ):
+                response = fixture["client"].post(
+                    "/",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (BytesIO(package_bytes), "portable.json"),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            saved_dir = fixture["app_state"] / "saved_assessments"
+            imported_root = fixture["downloads"] / "imported_assessments"
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"could not be loaded after reconstruction", response.data)
+            self.assertFalse(saved_dir.exists() and list(saved_dir.glob("*.json")))
+            self.assertFalse(imported_root.exists() and any(imported_root.iterdir()))
+
+    def test_save_current_assessment_never_truncates_on_atomic_replace_failure(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Atomic save",
+                    "assessment_notes": "Original bytes",
+                },
+            )
+            with client.session_transaction() as sess:
+                assessment_id = str(sess["active_assessment_id"])
+                before_session = copy.deepcopy(dict(sess))
+            snapshot_path = (
+                fixture["app_state"] / "saved_assessments" / f"{assessment_id}.json"
+            )
+            before_snapshot = snapshot_path.read_bytes()
+
+            with patch.object(
+                app_module.os,
+                "replace",
+                side_effect=OSError("injected atomic replace failure"),
+            ):
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "save_assessment",
+                        "assessment_name": "Atomic save changed",
+                        "assessment_notes": "Must not replace",
+                        "customer_name": "Must not partially save",
+                    },
+                )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"could not be saved", response.data)
+            self.assertEqual(before_snapshot, snapshot_path.read_bytes())
+            self.assertEqual(before_session, after_session)
+
+    def test_save_current_assessment_restores_new_session_on_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_state = Path(temp_dir) / "app_state"
+            with (
+                patch.object(app_module, "APP_STATE_DIR", app_state),
+                app_module.app.test_request_context("/"),
+            ):
+                app_module.session["marker"] = "preserve"
+                before_session = copy.deepcopy(dict(app_module.session))
+                with patch.object(
+                    app_module,
+                    "_write_json_atomically",
+                    side_effect=OSError("injected first save failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "first save failure"):
+                        app_module.save_current_assessment("First save", "No mutation")
+
+                self.assertEqual(before_session, dict(app_module.session))
+                saved_dir = app_state / "saved_assessments"
+                self.assertFalse(saved_dir.exists() and list(saved_dir.glob("*.json")))
+
+    def test_saved_export_build_failure_preserves_snapshot_and_session_bytes(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Transactional export",
+                    "assessment_notes": "Original notes",
+                },
+            )
+            with client.session_transaction() as sess:
+                assessment_id = str(sess["active_assessment_id"])
+                before_session = copy.deepcopy(dict(sess))
+            snapshot_path = (
+                fixture["app_state"] / "saved_assessments" / f"{assessment_id}.json"
+            )
+            before_snapshot = snapshot_path.read_bytes()
+
+            with patch.object(
+                app_module,
+                "build_portable_package",
+                side_effect=portability.PortableAssessmentError("injected build failure"),
+            ):
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "export_assessment",
+                        "assessment_name": "Changed by failed export",
+                        "assessment_notes": "Must roll back",
+                    },
+                )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"injected build failure", response.data)
+            self.assertEqual(before_snapshot, snapshot_path.read_bytes())
+            self.assertEqual(before_session, after_session)
+
+    def test_saved_export_serialization_failure_preserves_snapshot_and_session_bytes(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Transactional export",
+                    "assessment_notes": "Original notes",
+                },
+            )
+            with client.session_transaction() as sess:
+                assessment_id = str(sess["active_assessment_id"])
+                before_session = copy.deepcopy(dict(sess))
+            snapshot_path = (
+                fixture["app_state"] / "saved_assessments" / f"{assessment_id}.json"
+            )
+            before_snapshot = snapshot_path.read_bytes()
+
+            with patch.object(
+                app_module,
+                "dumps_portable_package",
+                side_effect=OSError("injected serialization failure"),
+            ):
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "export_assessment",
+                        "assessment_name": "Changed by failed export",
+                        "assessment_notes": "Must roll back",
+                    },
+                )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"could not be exported", response.data)
+            self.assertEqual(before_snapshot, snapshot_path.read_bytes())
+            self.assertEqual(before_session, after_session)
+
+    def test_saved_export_refresh_write_failure_preserves_snapshot_and_session_bytes(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Transactional export",
+                    "assessment_notes": "Original notes",
+                },
+            )
+            with client.session_transaction() as sess:
+                assessment_id = str(sess["active_assessment_id"])
+                before_session = copy.deepcopy(dict(sess))
+            snapshot_path = (
+                fixture["app_state"] / "saved_assessments" / f"{assessment_id}.json"
+            )
+            before_snapshot = snapshot_path.read_bytes()
+            real_atomic_write = app_module._write_json_atomically
+
+            def fail_snapshot_refresh(path: Path, payload: object) -> None:
+                if path == snapshot_path:
+                    raise OSError("injected snapshot refresh failure")
+                real_atomic_write(path, payload)
+
+            with patch.object(
+                app_module,
+                "_write_json_atomically",
+                side_effect=fail_snapshot_refresh,
+            ):
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "export_assessment",
+                        "assessment_name": "Changed by failed export",
+                        "assessment_notes": "Must roll back",
+                    },
+                )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"could not be exported", response.data)
+            self.assertEqual(before_snapshot, snapshot_path.read_bytes())
+            self.assertEqual(before_session, after_session)
+
+    def test_failed_import_does_not_clobber_concurrent_preference_update(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            package_bytes = portability.dumps_portable_package(valid_package()).encode(
+                "utf-8"
+            )
+            preferences_path = fixture["app_state"] / "preferences.json"
+            preferences_path.write_bytes(b'{"before":"import"}\n')
+            concurrent_bytes = b'{"concurrent":"must survive"}\n'
+
+            def fail_after_concurrent_update(*_args: object, **_kwargs: object) -> dict:
+                preferences_path.write_bytes(concurrent_bytes)
+                raise OSError("injected load failure after concurrent update")
+
+            with patch.object(
+                app_module,
+                "load_saved_assessment",
+                side_effect=fail_after_concurrent_update,
+            ):
+                response = client.post(
+                    "/",
+                    data={
+                        "action": "import_assessment",
+                        "assessment_file": (BytesIO(package_bytes), "portable.json"),
+                    },
+                    content_type="multipart/form-data",
+                )
+
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"current assessment was kept", response.data)
+            self.assertEqual(concurrent_bytes, preferences_path.read_bytes())
+
+    def test_portable_request_size_is_rejected_before_multipart_access(self) -> None:
+        with app_module.app.test_request_context(
+            "/?portable_import=1",
+            method="POST",
+            content_type="multipart/form-data; boundary=portable",
+            environ_overrides={
+                "CONTENT_LENGTH": str(app_module.MAX_PORTABLE_REQUEST_BYTES + 1)
+            },
+        ):
+            response = app_module.enforce_portable_assessment_request_limit()
+
+        self.assertEqual(303, response[1])
+
+    def test_import_rejects_extra_duplicate_files_and_ignored_fields(self) -> None:
+        package_bytes = portability.dumps_portable_package(valid_package()).encode(
+            "utf-8"
+        )
+        cases = (
+            MultiDict(
+                [
+                    ("action", "import_assessment"),
+                    ("assessment_file", (BytesIO(package_bytes), "portable.json")),
+                    ("ignored_file", (BytesIO(b"ignored"), "ignored.txt")),
+                ]
+            ),
+            MultiDict(
+                [
+                    ("action", "import_assessment"),
+                    ("assessment_file", (BytesIO(package_bytes), "one.json")),
+                    ("assessment_file", (BytesIO(package_bytes), "two.json")),
+                ]
+            ),
+            MultiDict(
+                [
+                    ("action", "import_assessment"),
+                    ("assessment_file", (BytesIO(package_bytes), "portable.json")),
+                    ("ignored_field", "x" * 5000),
+                ]
+            ),
+        )
+
+        for index, data in enumerate(cases):
+            with self.subTest(case=index), isolated_portability_client() as fixture:
+                response = fixture["client"].post(
+                    "/?portable_import=1",
+                    data=data,
+                    content_type="multipart/form-data",
+                )
+
+                imported_root = fixture["downloads"] / "imported_assessments"
+                self.assertEqual(200, response.status_code)
+                self.assertIn(b"exactly one portable assessment", response.data)
+                self.assertFalse(
+                    imported_root.exists() and any(imported_root.iterdir())
+                )
+
+    def test_symlinked_import_root_is_rejected_without_touching_target(self) -> None:
+        with isolated_portability_client() as fixture:
+            outside_root = fixture["downloads"].parent / "outside-import-root"
+            outside_root.mkdir()
+            imported_root = fixture["downloads"] / "imported_assessments"
+            imported_root.symlink_to(outside_root, target_is_directory=True)
+            before_files = self._file_tree_bytes(fixture["app_state"].parent)
+
+            response = fixture["client"].post(
+                "/?portable_import=1",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(
+                            portability.dumps_portable_package(valid_package()).encode(
+                                "utf-8"
+                            )
+                        ),
+                        "portable.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"cannot be a symlink", response.data)
+            self.assertFalse(any(outside_root.iterdir()))
+            self.assertEqual(before_files, self._file_tree_bytes(fixture["app_state"].parent))
 
     def test_empty_pricing_import_clears_prior_selection_and_preferences(self) -> None:
         with isolated_portability_client() as fixture:
@@ -1353,12 +2002,11 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             before_step4 = step4_path.read_bytes()
             before_preferences = preferences_path.read_bytes()
 
-            def fail_after_mutation(_assessment_id: str) -> dict:
+            def fail_after_mutation(*_args: object, **_kwargs: object) -> dict:
                 app_module.session.clear()
                 app_module.session["mutated"] = True
                 state_path.write_bytes(b'{"mutated":true}')
                 step4_path.write_bytes(b'{"mutated":true}')
-                preferences_path.write_bytes(b'{"mutated":true}')
                 raise OSError("injected final load failure")
 
             with patch.object(
