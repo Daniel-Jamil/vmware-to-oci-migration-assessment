@@ -480,16 +480,35 @@ class PortableAssessmentTests(unittest.TestCase):
 
     def test_empty_pricing_items_are_valid_without_currency(self) -> None:
         package = valid_package()
-        package["pricing"] = {
-            "currency": "",
-            "source_file_name": "",
-            "document": {"items": []},
-        }
+        package["pricing"]["document"] = {"items": []}
 
         validated = portability.validate_portable_package(package)
 
+        self.assertEqual("", validated["assessment"]["selected_currency"])
         self.assertEqual("", validated["pricing"]["currency"])
         self.assertEqual({"items": []}, validated["pricing"]["document"])
+
+    def test_nonempty_pricing_requires_matching_assessment_currency(self) -> None:
+        for selected_currency in ("", "USD"):
+            with self.subTest(selected_currency=selected_currency):
+                package = valid_package()
+                package["assessment"]["selected_currency"] = selected_currency
+
+                with self.assertRaisesRegex(
+                    portability.PortableAssessmentError,
+                    "assessment.selected_currency",
+                ):
+                    portability.validate_portable_package(package)
+
+        matched = portability.validate_portable_package(valid_package())
+        self.assertEqual("EUR", matched["assessment"]["selected_currency"])
+        self.assertEqual("EUR", matched["pricing"]["currency"])
+        self.assertEqual(
+            "EUR",
+            matched["pricing"]["document"]["items"][0][
+                "currencyCodeLocalizations"
+            ][0]["currencyCode"],
+        )
 
     def test_rejects_serialized_package_over_size_limit(self) -> None:
         package = valid_package()
@@ -851,6 +870,49 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             self.assertEqual("EUR", loaded_currency)
             self.assertEqual(imported_path, loaded_source)
             self.assertEqual(package["pricing"]["document"], materialized)
+
+    def test_currency_mismatch_rejection_preserves_every_local_byte(self) -> None:
+        with isolated_portability_client() as fixture:
+            client = fixture["client"]
+            client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Preserve currency baseline",
+                    "assessment_notes": "USD and EUR must not be mixed.",
+                },
+            )
+            package = valid_package()
+            package["assessment"]["selected_currency"] = "USD"
+            with client.session_transaction() as sess:
+                before_session = copy.deepcopy(dict(sess))
+            before_files = self._file_tree_bytes(fixture["app_state"].parent)
+
+            response = client.post(
+                "/",
+                data={
+                    "action": "import_assessment",
+                    "assessment_file": (
+                        BytesIO(json.dumps(package).encode("utf-8")),
+                        "currency-mismatch.json",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+
+            with client.session_transaction() as sess:
+                after_session = dict(sess)
+            self.assertEqual(200, response.status_code)
+            self.assertIn(b"assessment.selected_currency", response.data)
+            self.assertEqual(before_session, after_session)
+            self.assertEqual(
+                before_files,
+                self._file_tree_bytes(fixture["app_state"].parent),
+            )
+            imported_root = fixture["downloads"] / "imported_assessments"
+            self.assertFalse(
+                imported_root.exists() and any(imported_root.iterdir())
+            )
 
     def test_materialized_pricing_lookup_mismatch_rolls_back(self) -> None:
         with isolated_portability_client() as fixture:

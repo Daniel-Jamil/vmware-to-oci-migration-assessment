@@ -607,6 +607,23 @@ def validate_portable_package(package: Any) -> dict[str, Any]:
         if section not in root:
             raise PortableAssessmentError(f"{section} section is required.")
 
+    assessment = _clean_assessment(root["assessment"])
+    pricing = _clean_pricing(root["pricing"])
+    has_pricing = bool(pricing["document"].get("items"))
+    assessment_currency = assessment["selected_currency"]
+    if has_pricing:
+        if not assessment_currency:
+            raise PortableAssessmentError(
+                "assessment.selected_currency is required when pricing items are present."
+            )
+        if assessment_currency != pricing["currency"]:
+            raise PortableAssessmentError(
+                "assessment.selected_currency must match pricing.currency."
+            )
+    else:
+        assessment["selected_currency"] = ""
+        pricing["currency"] = ""
+
     canonical = {
         "package_type": PACKAGE_TYPE,
         "schema_version": SCHEMA_VERSION,
@@ -616,9 +633,9 @@ def validate_portable_package(package: Any) -> dict[str, Any]:
             required=True,
         ),
         "source": _clean_source(root.get("source")),
-        "assessment": _clean_assessment(root["assessment"]),
+        "assessment": assessment,
         "inventory": _clean_inventory(root["inventory"]),
-        "pricing": _clean_pricing(root["pricing"]),
+        "pricing": pricing,
     }
     try:
         compact = json.dumps(
