@@ -2845,6 +2845,82 @@ def build_native_editor_page(
     }
 
 
+NATIVE_EDITOR_FORM_FIELDS = (
+    "vm_name",
+    "oci_shape",
+    "vm_ocpu",
+    "vm_burst",
+    "vm_vpu",
+    "vm_os_license",
+)
+
+
+def parse_native_editor_page_fields(
+    form: Any,
+    expected_rows: list[dict[str, Any]],
+    valid_shape_values: set[str],
+    valid_burst_values: set[str],
+    valid_vpu_values: set[int],
+) -> tuple[dict[str, dict[str, Any]] | None, list[str]]:
+    if not any(field_name in form for field_name in NATIVE_EDITOR_FORM_FIELDS):
+        return None, []
+
+    expected_vm_names = [str(row.get("vm_name") or "") for row in expected_rows]
+    submitted_values = {
+        field_name: form.getlist(field_name)
+        for field_name in NATIVE_EDITOR_FORM_FIELDS
+    }
+    submitted_vm_names = [str(value).strip() for value in submitted_values["vm_name"]]
+    errors: list[str] = []
+
+    if submitted_vm_names != expected_vm_names:
+        errors.append("Native editor rows do not match the requested page and filters.")
+    if len(submitted_vm_names) != len(set(submitted_vm_names)):
+        errors.append("Each Native editor VM must be submitted exactly once.")
+    expected_count = len(expected_vm_names)
+    for field_name in NATIVE_EDITOR_FORM_FIELDS[1:]:
+        if len(submitted_values[field_name]) != expected_count:
+            errors.append("Every Native editor row must include one value for every setting.")
+            break
+    if errors:
+        return None, errors
+
+    parsed: dict[str, dict[str, Any]] = {}
+    for row_index, expected_row in enumerate(expected_rows):
+        vm_name = expected_vm_names[row_index]
+        shape = str(submitted_values["oci_shape"][row_index]).strip()
+        ocpu_raw = str(submitted_values["vm_ocpu"][row_index]).strip()
+        burst = str(submitted_values["vm_burst"][row_index]).strip()
+        vpu_raw = str(submitted_values["vm_vpu"][row_index]).strip()
+        os_license = str(submitted_values["vm_os_license"][row_index]).strip()
+
+        if shape not in valid_shape_values:
+            errors.append(f"Choose a valid OCI shape for {vm_name}.")
+        if not re.fullmatch(r"[1-9][0-9]*", ocpu_raw):
+            errors.append(f"Choose a positive whole OCPU count for {vm_name}.")
+        if burst not in valid_burst_values:
+            errors.append(f"Choose a valid burst setting for {vm_name}.")
+        if not re.fullmatch(r"[0-9]+", vpu_raw) or int(vpu_raw) not in valid_vpu_values:
+            errors.append(f"Choose a valid VPU setting for {vm_name}.")
+
+        is_windows_server = "windows server" in str(expected_row.get("raw_os") or "").lower()
+        if is_windows_server and os_license not in OS_LICENSE_VALUES:
+            errors.append(f"Choose a valid Windows license setting for {vm_name}.")
+        elif not is_windows_server and os_license:
+            errors.append(f"OS license must be empty for non-Windows VM {vm_name}.")
+
+        if not errors:
+            parsed[vm_name] = {
+                "oci_shape": shape,
+                "ocpu": int(ocpu_raw),
+                "burst": burst,
+                "vpu": int(vpu_raw),
+                "os_license": os_license,
+            }
+
+    return (parsed if not errors else None), errors
+
+
 WORKSPACE_STAGE_MAP = {
     "setup": {
         "number": 1,
@@ -7786,6 +7862,7 @@ def step4() -> str:
 
     vm_index = {vm["name"]: vm for vm in all_vms}
     app_state = load_app_state()
+    persisted_app_state = copy.deepcopy(app_state)
     selected_vm_names = app_state.get("selected_vm_names", [])
     if not isinstance(selected_vm_names, list):
         selected_vm_names = []
@@ -7832,74 +7909,6 @@ def step4() -> str:
                 "error",
             )
             return redirect(step4_tab_redirect(active_tab, **request.form))
-
-        action = str(request.form.get("action", "save")).strip().lower()
-        if action == "save":
-            submitted_vm_names = request.form.getlist("vm_name")
-            native_control_values = [
-                request.form.getlist(field_name)
-                for field_name in (
-                    "oci_shape",
-                    "vm_ocpu",
-                    "vm_burst",
-                    "vm_vpu",
-                    "vm_os_license",
-                )
-            ]
-            selected_vm_set = set(selected_vm_names)
-            has_native_row_control = any(
-                str(vm_name).strip() in selected_vm_set
-                and any(row_index < len(values) for values in native_control_values)
-                for row_index, vm_name in enumerate(submitted_vm_names)
-            )
-            scenario_setting_fields = (
-                "iaas_discount_pct",
-                "vmware_license_price_per_core_yearly",
-                "ocvs_profile",
-                "ocvs_commitment_term",
-                "ocvs_dr_nodes",
-                "ocvs_vcpu_per_ocpu",
-                "ocvs_cpu_headroom_pct",
-                "ocvs_memory_headroom_pct",
-                "ocvs_storage_headroom_pct",
-                "ocvs_dense_vsan_usable_pct",
-                "ocvs_standard_storage_vpu",
-            )
-            has_scenario_setting = any(
-                field_name in request.form
-                and str(request.form.get(field_name, "")).strip()
-                for field_name in scenario_setting_fields
-            )
-            has_bulk_setting = any(
-                str(request.form.get(field_name, "")).strip()
-                for field_name in (
-                    "bulk_apply_oci_shape",
-                    "bulk_apply_burst",
-                    "bulk_apply_vpu",
-                    "bulk_apply_os_license",
-                )
-            )
-            has_native_strategy = (
-                str(request.form.get("native_shape_strategy_enabled", "")).strip()
-                == "1"
-                and bool(request.form.getlist("native_strategy_os"))
-            )
-            has_hybrid_setting = bool(submitted_hybrid_placements)
-            if not any(
-                (
-                    has_native_row_control,
-                    has_scenario_setting,
-                    has_bulk_setting,
-                    has_native_strategy,
-                    has_hybrid_setting,
-                )
-            ):
-                session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
-                flash(
-                    "No scenario settings were submitted. No changes were saved.",
-                    "error",
-                )
-                return redirect(step4_tab_redirect(posted_scenario, **request.form))
 
     shape_options = load_oci_target_shapes()
     shape_pricing_map = load_oci_price_mapping_details()
@@ -7963,6 +7972,7 @@ def step4() -> str:
     # Restore last saved Step 4 sizing/costing settings. Step 3 remains the
     # source of truth for which VMs are selected.
     snapshot = load_step4_snapshot()
+    persisted_step4_snapshot = copy.deepcopy(snapshot)
     snapshot_source = str(snapshot.get("source_vinfo_csv", ""))
     snapshot_settings = snapshot.get("vm_settings", {}) if isinstance(snapshot.get("vm_settings", {}), dict) else {}
     if snapshot_settings and snapshot_source == source_vinfo_csv:
@@ -8039,7 +8049,8 @@ def step4() -> str:
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
         if snapshot.get("saved_at") and not app_state.get("step4_last_updated_at"):
             app_state["step4_last_updated_at"] = str(snapshot.get("saved_at"))
-        save_app_state(app_state)
+        if request.method == "GET":
+            save_app_state(app_state)
 
     selected_vms = [vm_index[name] for name in selected_vm_names if name in vm_index]
     if not selected_vms:
@@ -8052,6 +8063,22 @@ def step4() -> str:
     native_editor_query = normalize_native_editor_query(
         request.form if request.method == "POST" else request.args
     )
+    native_scope_rows = sorted(
+        [
+            {
+                "vm_name": str(vm.get("name") or ""),
+                "os_name": str(vm.get("raw_os") or "Unknown / Empty"),
+                "raw_os": str(vm.get("raw_os") or ""),
+            }
+            for vm in selected_vms
+        ],
+        key=lambda row: str(row["vm_name"]).lower(),
+    )
+    native_editor_scope = build_native_editor_page(
+        native_scope_rows,
+        native_editor_query,
+        load_supported_os_signatures(),
+    )
 
     if request.method == "POST":
         action = str(request.form.get("action", "save")).strip().lower()
@@ -8060,12 +8087,13 @@ def step4() -> str:
             request.form.get("active_scenario", "native"),
             "native",
         )
-        vm_names = request.form.getlist("vm_name")
-        selected_shapes = request.form.getlist("oci_shape")
-        selected_ocpus = request.form.getlist("vm_ocpu")
-        selected_bursts = request.form.getlist("vm_burst")
-        selected_vpus = request.form.getlist("vm_vpu")
-        selected_os_license = request.form.getlist("vm_os_license")
+        submitted_native_settings, native_field_errors = parse_native_editor_page_fields(
+            request.form,
+            native_editor_scope["rows"],
+            valid_shape_values,
+            valid_burst_values,
+            valid_vpu_values,
+        )
         bulk_apply_shape = str(request.form.get("bulk_apply_oci_shape", "")).strip()
         bulk_apply_burst = str(request.form.get("bulk_apply_burst", "")).strip()
         bulk_apply_vpu_raw = str(request.form.get("bulk_apply_vpu", "")).strip()
@@ -8074,6 +8102,75 @@ def step4() -> str:
         native_strategy_os = request.form.getlist("native_strategy_os")
         native_strategy_shapes = request.form.getlist("native_strategy_shape")
         native_strategy_bursts = request.form.getlist("native_strategy_burst")
+        native_post_errors = list(native_field_errors)
+        if bulk_apply_shape and bulk_apply_shape not in valid_shape_values:
+            native_post_errors.append("Choose a valid bulk OCI shape.")
+        if bulk_apply_burst and bulk_apply_burst not in valid_burst_values:
+            native_post_errors.append("Choose a valid bulk burst setting.")
+        if bulk_apply_vpu_raw:
+            if not re.fullmatch(r"[0-9]+", bulk_apply_vpu_raw) or int(bulk_apply_vpu_raw) not in valid_vpu_values:
+                native_post_errors.append("Choose a valid bulk VPU setting.")
+        if bulk_apply_os_license and bulk_apply_os_license not in OS_LICENSE_VALUES:
+            native_post_errors.append("Choose a valid bulk Windows license setting.")
+        if native_shape_strategy_enabled:
+            strategy_count = len(native_strategy_os)
+            if (
+                not strategy_count
+                or len(native_strategy_shapes) != strategy_count
+                or len(native_strategy_bursts) != strategy_count
+                or len({str(value).strip().lower() for value in native_strategy_os}) != strategy_count
+            ):
+                native_post_errors.append("Default shape strategy rows are incomplete or duplicated.")
+            elif any(str(value).strip() not in valid_shape_values for value in native_strategy_shapes):
+                native_post_errors.append("Choose a valid shape for every default shape strategy row.")
+            elif any(normalize_burst_value(value) not in valid_burst_values for value in native_strategy_bursts):
+                native_post_errors.append("Choose a valid burst for every default shape strategy row.")
+
+        scenario_setting_fields = (
+            "iaas_discount_pct",
+            "vmware_license_price_per_core_yearly",
+            "ocvs_profile",
+            "ocvs_commitment_term",
+            "ocvs_dr_nodes",
+            "ocvs_vcpu_per_ocpu",
+            "ocvs_cpu_headroom_pct",
+            "ocvs_memory_headroom_pct",
+            "ocvs_storage_headroom_pct",
+            "ocvs_dense_vsan_usable_pct",
+            "ocvs_standard_storage_vpu",
+        )
+        has_scenario_setting = any(
+            field_name in request.form
+            and str(request.form.get(field_name, "")).strip()
+            for field_name in scenario_setting_fields
+        )
+        has_bulk_setting = any(
+            str(request.form.get(field_name, "")).strip()
+            for field_name in (
+                "bulk_apply_oci_shape",
+                "bulk_apply_burst",
+                "bulk_apply_vpu",
+                "bulk_apply_os_license",
+            )
+        )
+        if action == "save" and not any(
+            (
+                submitted_native_settings is not None,
+                has_scenario_setting,
+                has_bulk_setting,
+                native_shape_strategy_enabled,
+                bool(submitted_hybrid_placements),
+            )
+        ):
+            native_post_errors.append("No scenario settings were submitted.")
+        if native_post_errors:
+            session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+            flash(
+                f"{native_post_errors[0]} No scenario settings were saved.",
+                "error",
+            )
+            return redirect(step4_tab_redirect(active_scenario, **request.form))
+
         iaas_discount_raw = str(request.form.get("iaas_discount_pct", iaas_discount_pct)).strip()
         vmware_license_raw = str(
             request.form.get("vmware_license_price_per_core_yearly", vmware_license_price_per_core_yearly)
@@ -8113,44 +8210,13 @@ def step4() -> str:
         updated_hybrid_placements = dict(hybrid_placement_selection)
         if submitted_hybrid_placements is not None:
             updated_hybrid_placements.update(submitted_hybrid_placements)
-        for vm_name, shape in zip(vm_names, selected_shapes):
-            clean_vm = str(vm_name).strip()
-            clean_shape = str(shape).strip()
-            if clean_vm and clean_shape in valid_shape_values and clean_vm in vm_index:
-                updated_shapes[clean_vm] = clean_shape
-
-        for vm_name, ocpu_raw in zip(vm_names, selected_ocpus):
-            clean_vm = str(vm_name).strip()
-            try:
-                ocpu_val = int(float(str(ocpu_raw).strip()))
-            except (TypeError, ValueError):
-                continue
-            if clean_vm and clean_vm in vm_index:
-                updated_ocpus[clean_vm] = max(1, ocpu_val)
-
-        for vm_name, burst_raw in zip(vm_names, selected_bursts):
-            clean_vm = str(vm_name).strip()
-            burst_val = str(burst_raw).strip()
-            if clean_vm and clean_vm in vm_index and burst_val in valid_burst_values:
-                updated_bursts[clean_vm] = burst_val
-
-        for vm_name, vpu_raw in zip(vm_names, selected_vpus):
-            clean_vm = str(vm_name).strip()
-            try:
-                vpu_val = int(float(str(vpu_raw).strip()))
-            except (TypeError, ValueError):
-                continue
-            if clean_vm and clean_vm in vm_index and vpu_val in valid_vpu_values:
-                updated_vpus[clean_vm] = vpu_val
-
-        for vm_name, license_raw in zip(vm_names, selected_os_license):
-            clean_vm = str(vm_name).strip()
-            raw_os = str(vm_index.get(clean_vm, {}).get("raw_os", "")).lower()
-            if "windows server" not in raw_os:
-                continue
-            license_val = str(license_raw).strip()
-            if clean_vm and clean_vm in vm_index and license_val in OS_LICENSE_VALUES:
-                updated_os_license[clean_vm] = license_val
+        for vm_name, settings in (submitted_native_settings or {}).items():
+            updated_shapes[vm_name] = str(settings["oci_shape"])
+            updated_ocpus[vm_name] = int(settings["ocpu"])
+            updated_bursts[vm_name] = str(settings["burst"])
+            updated_vpus[vm_name] = int(settings["vpu"])
+            if str(settings["os_license"]):
+                updated_os_license[vm_name] = str(settings["os_license"])
 
         if native_shape_strategy_enabled:
             strategy_shape_by_os: dict[str, str] = {}
@@ -8222,23 +8288,9 @@ def step4() -> str:
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
         step4_last_updated_at = datetime.now().isoformat(timespec="seconds")
         app_state["step4_last_updated_at"] = step4_last_updated_at
-        save_app_state(app_state)
-        session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, None)
-
-        # Apply latest form selections to in-request variables so export can use them immediately.
-        vm_shape_selection = updated_shapes
-        vm_ocpu_selection = updated_ocpus
-        vm_burst_selection = updated_bursts
-        vm_vpu_selection = updated_vpus
-        vm_os_license_selection = updated_os_license
-        hybrid_placement_selection = updated_hybrid_placements
-
-        if action == "export_excel":
-            export_format = "excel"
-        elif action == "save":
-            # Persist snapshot for all VMs (selected + non-selected) with selected status.
+        staged_step4_snapshot: dict[str, Any] | None = None
+        if action == "save":
             all_vm_settings: dict[str, dict[str, Any]] = {}
-
             for vm in all_vms:
                 vm_name = str(vm.get("name") or "").strip()
                 if not vm_name:
@@ -8286,20 +8338,52 @@ def step4() -> str:
                     "os_license": license_val,
                     "hybrid_placement": normalize_hybrid_placement(updated_hybrid_placements.get(vm_name), ""),
                 }
+            staged_step4_snapshot = {
+                "saved_at": step4_last_updated_at,
+                "source_vinfo_csv": source_vinfo_csv,
+                "ocvs_profile": ocvs_profile_choice,
+                "ocvs_policy": ocvs_policy,
+                "ocvs_commitment_term": ocvs_commitment_term,
+                "ocvs_dr_nodes": ocvs_dr_nodes,
+                "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
+                "vm_settings": all_vm_settings,
+            }
 
-            save_step4_snapshot(
-                {
-                    "saved_at": step4_last_updated_at,
-                    "source_vinfo_csv": source_vinfo_csv,
-                    "ocvs_profile": ocvs_profile_choice,
-                    "ocvs_policy": ocvs_policy,
-                    "ocvs_commitment_term": ocvs_commitment_term,
-                    "ocvs_dr_nodes": ocvs_dr_nodes,
-                    "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
-                    "vm_settings": all_vm_settings,
-                }
-            )
+        try:
+            save_app_state(app_state)
+            if staged_step4_snapshot is not None:
+                save_step4_snapshot(staged_step4_snapshot)
+        except Exception:
+            app.logger.exception("Native scenario persistence failed")
+            try:
+                _write_json_atomically(_state_file_path(), persisted_app_state)
+            except Exception:
+                app.logger.exception("Native scenario app state rollback failed")
+            try:
+                if persisted_step4_snapshot:
+                    _write_json_atomically(
+                        _step4_snapshot_file_path(),
+                        persisted_step4_snapshot,
+                    )
+                else:
+                    clear_step4_snapshot()
+            except Exception:
+                app.logger.exception("Native scenario snapshot rollback failed")
+            session[STEP4_UNSAVED_READINESS_SESSION_KEY] = True
+            flash("Scenario settings could not be saved. Your prior saved settings were kept.", "error")
+            return redirect(step4_tab_redirect(active_scenario, **request.form))
 
+        session.pop(STEP4_UNSAVED_READINESS_SESSION_KEY, None)
+        vm_shape_selection = updated_shapes
+        vm_ocpu_selection = updated_ocpus
+        vm_burst_selection = updated_bursts
+        vm_vpu_selection = updated_vpus
+        vm_os_license_selection = updated_os_license
+        hybrid_placement_selection = updated_hybrid_placements
+
+        if action == "export_excel":
+            export_format = "excel"
+        elif action == "save":
             flash("Migration path settings saved.", "success")
             return redirect(step4_tab_redirect(active_scenario, **request.form))
 

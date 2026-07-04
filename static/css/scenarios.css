@@ -16,7 +16,7 @@
 html,
 body {
   max-width: 100%;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 .container {
@@ -41,6 +41,10 @@ body {
 .price-comparison {
   padding: 0;
   border: 1px solid var(--scenario-line);
+}
+
+#scenario-panel-native {
+  overflow: visible !important;
 }
 
 .top-actions {

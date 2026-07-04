@@ -306,7 +306,7 @@ def create_regression_fixtures() -> None:
             "8192",
             "102400",
         ]
-        for index in range(75)
+        for index in range(76)
     )
     NATIVE_SCENARIO_INVENTORY.write_text(
         "\n".join(",".join(value for value in row) for row in native_scenario_rows) + "\n",
@@ -2944,12 +2944,14 @@ def validate_large_inventory_review_containment() -> None:
 
 def validate_task7_native_scenario_workspace() -> None:
     rows, _source = app_module.load_vms_from_vinfo(str(NATIVE_SCENARIO_INVENTORY))
-    check("Task 7 Native fixture has 75 VMs", len(rows) == 75, str(len(rows)))
-    selected_names = [str(row["name"]) for row in rows]
+    check("Task 7 Native fixture has 75 selected and one non-selected VM", len(rows) == 76, str(len(rows)))
+    selected_names = [str(row["name"]) for row in rows[:75]]
+    non_selected_name = str(rows[75]["name"])
+    rows_by_name = {str(row["name"]): row for row in rows}
     supported_signatures = app_module.load_supported_os_signatures()
     placements = {
-        str(row["name"]): app_module.default_inventory_placement(row, supported_signatures)
-        for row in rows
+        name: app_module.default_inventory_placement(rows_by_name[name], supported_signatures)
+        for name in selected_names
     }
     state_id = f"task7_native_{uuid4().hex}"
     price_file = find_price_file()
@@ -2969,6 +2971,7 @@ def validate_task7_native_scenario_workspace() -> None:
             selected_names[50]: "12.5%",
         }
         app_module.save_app_state(state)
+        app_module.save_step4_snapshot({"marker": "task7-prior-snapshot"})
 
     client = app_module.app.test_client()
     with client.session_transaction() as sess:
@@ -3193,9 +3196,103 @@ def validate_task7_native_scenario_workspace() -> None:
         f"status={empty_save.status_code}, location={empty_save.headers.get('Location')}",
     )
 
-    partial_post = client.post(
-        "/step4",
-        data=MultiDict(
+    def native_page_form(page_names: list[str], page: int) -> MultiDict:
+        form = MultiDict(
+            [
+                ("action", "save"),
+                ("active_scenario", "native"),
+                ("native_page", str(page)),
+                ("native_page_size", "50"),
+                ("native_search", ""),
+                ("native_support", "all"),
+            ]
+        )
+        form.setlist("vm_name", page_names)
+        form.setlist("oci_shape", ["E6"] * len(page_names))
+        form.setlist("vm_ocpu", ["3"] * len(page_names))
+        form.setlist("vm_burst", ["50%"] * len(page_names))
+        form.setlist("vm_vpu", ["20"] * len(page_names))
+        form.setlist(
+            "vm_os_license",
+            [
+                "BYOL"
+                if "windows server" in str(rows_by_name.get(name, {}).get("raw_os", "")).lower()
+                else ""
+                for name in page_names
+            ],
+        )
+        return form
+
+    def persistence_bytes() -> tuple[bytes, bytes]:
+        with app_module.app.test_request_context("/"):
+            app_module.session["state_id"] = state_id
+            return (
+                app_module._state_file_path().read_bytes(),
+                app_module._step4_snapshot_file_path().read_bytes(),
+            )
+
+    page_one_names = selected_names[:50]
+    page_two_names = selected_names[50:]
+    adversarial_forms: list[tuple[str, MultiDict]] = []
+
+    duplicate_identity = native_page_form(page_one_names, 1)
+    duplicate_identity.setlist("vm_name", [page_one_names[0], page_one_names[0], *page_one_names[2:]])
+    adversarial_forms.append(("duplicate Native VM identity", duplicate_identity))
+
+    unknown_identity = native_page_form(page_one_names, 1)
+    unknown_identity.setlist("vm_name", ["unknown-native-vm", *page_one_names[1:]])
+    adversarial_forms.append(("unknown Native VM identity mixed with valid rows", unknown_identity))
+
+    non_selected_identity = native_page_form(page_one_names, 1)
+    non_selected_identity.setlist("vm_name", [non_selected_name, *page_one_names[1:]])
+    adversarial_forms.append(("non-selected Native VM identity", non_selected_identity))
+
+    off_page_identity = native_page_form(page_one_names, 1)
+    off_page_identity.setlist("vm_name", [page_two_names[0], *page_one_names[1:]])
+    adversarial_forms.append(("off-page Native VM identity", off_page_identity))
+
+    missing_identity = native_page_form(page_one_names[:-1], 1)
+    adversarial_forms.append(("missing Native VM identity", missing_identity))
+
+    extra_identity = native_page_form([*page_one_names, page_two_names[0]], 1)
+    adversarial_forms.append(("extra Native VM identity", extra_identity))
+
+    tampered_page = native_page_form(page_two_names, 1)
+    adversarial_forms.append(("tampered Native page declaration", tampered_page))
+
+    missing_control = native_page_form(page_one_names, 1)
+    missing_control.setlist("vm_vpu", missing_control.getlist("vm_vpu")[:-1])
+    adversarial_forms.append(("missing Native positional control", missing_control))
+
+    extra_control = native_page_form(page_one_names, 1)
+    extra_control.setlist("oci_shape", [*extra_control.getlist("oci_shape"), "E6"])
+    adversarial_forms.append(("extra Native positional control", extra_control))
+
+    for field_name, invalid_value in (
+        ("oci_shape", "not-a-shape"),
+        ("vm_ocpu", "1.5"),
+        ("vm_burst", "75%"),
+        ("vm_vpu", "15"),
+    ):
+        invalid_form = native_page_form(page_one_names, 1)
+        invalid_values = invalid_form.getlist(field_name)
+        invalid_values[1] = invalid_value
+        invalid_form.setlist(field_name, invalid_values)
+        adversarial_forms.append((f"invalid Native {field_name} mixed with valid rows", invalid_form))
+
+    invalid_license = native_page_form(page_two_names, 2)
+    invalid_license_values = invalid_license.getlist("vm_os_license")
+    invalid_license_values[20] = "invalid-license"
+    invalid_license.setlist("vm_os_license", invalid_license_values)
+    adversarial_forms.append(("invalid Native license mixed with valid rows", invalid_license))
+
+    for field_name, invalid_value in (
+        ("bulk_apply_oci_shape", "not-a-shape"),
+        ("bulk_apply_burst", "75%"),
+        ("bulk_apply_vpu", "15"),
+        ("bulk_apply_os_license", "invalid-license"),
+    ):
+        invalid_bulk = MultiDict(
             [
                 ("action", "save"),
                 ("active_scenario", "native"),
@@ -3203,28 +3300,82 @@ def validate_task7_native_scenario_workspace() -> None:
                 ("native_page_size", "50"),
                 ("native_search", ""),
                 ("native_support", "all"),
-                ("vm_name", first_vm),
-                ("vm_os_license", ""),
-                ("vm_ocpu", "3"),
-                ("vm_burst", "50%"),
-                ("vm_vpu", "20"),
-                ("oci_shape", "E6"),
+                (field_name, invalid_value),
             ]
-        ),
+        )
+        adversarial_forms.append((f"invalid Native {field_name}", invalid_bulk))
+
+    adversarial_results: list[tuple[str, bool, str]] = []
+    for label, form in adversarial_forms:
+        before_state_bytes, before_snapshot_bytes = persistence_bytes()
+        invalid_response = client.post("/step4", data=form, follow_redirects=False)
+        after_state_bytes, after_snapshot_bytes = persistence_bytes()
+        with client.session_transaction() as sess:
+            marked_unsaved = sess.get(app_module.STEP4_UNSAVED_READINESS_SESSION_KEY) is True
+        adversarial_results.append(
+            (
+                label,
+                invalid_response.status_code in {302, 303}
+                and marked_unsaved
+                and after_state_bytes == before_state_bytes
+                and after_snapshot_bytes == before_snapshot_bytes,
+                invalid_response.headers.get("Location", ""),
+            )
+        )
+    check(
+        "Adversarial Native page payloads reject transactionally",
+        all(passed for _label, passed, _location in adversarial_results),
+        str(adversarial_results),
+    )
+
+    prior_state_bytes, prior_snapshot_bytes = persistence_bytes()
+    original_save_step4_snapshot = app_module.save_step4_snapshot
+
+    def reject_native_snapshot(_snapshot: dict[str, object]) -> None:
+        raise OSError("injected Native snapshot persistence failure")
+
+    app_module.save_step4_snapshot = reject_native_snapshot
+    try:
+        persistence_failure = client.post(
+            "/step4",
+            data=native_page_form(page_one_names, 1),
+            follow_redirects=False,
+        )
+    finally:
+        app_module.save_step4_snapshot = original_save_step4_snapshot
+    after_failure_state_bytes, after_failure_snapshot_bytes = persistence_bytes()
+    with client.session_transaction() as sess:
+        persistence_failure_marked_unsaved = (
+            sess.get(app_module.STEP4_UNSAVED_READINESS_SESSION_KEY) is True
+        )
+    check(
+        "Native persistence failure rolls back app state and snapshot byte-for-byte",
+        persistence_failure.status_code in {302, 303}
+        and persistence_failure_marked_unsaved
+        and after_failure_state_bytes == prior_state_bytes
+        and after_failure_snapshot_bytes == prior_snapshot_bytes,
+        f"status={persistence_failure.status_code}",
+    )
+
+    page_two_post = client.post(
+        "/step4",
+        data=native_page_form(page_two_names, 2),
         follow_redirects=False,
     )
     with app_module.app.test_request_context("/"):
         app_module.session["state_id"] = state_id
         updated_state = app_module.load_app_state()
     check(
-        "Partial Native page POST updates submitted controls and preserves omitted pages",
-        partial_post.status_code in {302, 303}
-        and updated_state.get("step4_vm_shapes", {}).get(first_vm) == "E6"
-        and updated_state.get("step4_vm_shapes", {}).get(selected_names[50]) == "E5"
-        and updated_state.get("step4_vm_bursts", {}).get(first_vm) == "50%"
-        and updated_state.get("step4_vm_bursts", {}).get(selected_names[50]) == "12.5%"
+        "Valid Native page 2 POST updates its exact controls and preserves page 1",
+        page_two_post.status_code in {302, 303}
+        and updated_state.get("step4_vm_shapes", {}).get(first_vm) == "E4"
+        and updated_state.get("step4_vm_shapes", {}).get(selected_names[1]) is None
+        and all(updated_state.get("step4_vm_shapes", {}).get(name) == "E6" for name in page_two_names)
+        and updated_state.get("step4_vm_bursts", {}).get(first_vm) == "100%"
+        and all(updated_state.get("step4_vm_bursts", {}).get(name) == "50%" for name in page_two_names)
+        and all(updated_state.get("step4_vm_vpus", {}).get(name) == 20 for name in page_two_names)
         and updated_state.get("step4_hybrid_placements") == placements,
-        f"location={partial_post.headers.get('Location')}, state={updated_state}",
+        f"location={page_two_post.headers.get('Location')}, state={updated_state}",
     )
 
     task7_export = client.post(
@@ -3333,7 +3484,32 @@ def validate_task7_native_scenario_workspace() -> None:
             'data-native-mobile-active="true"',
             "--oracle-red",
             "--status-green",
-        ]),
+        ])
+        and re.search(
+            r"html,\s*body\s*\{[^}]*overflow-x:\s*clip;",
+            scenarios_css,
+            re.S,
+        ) is not None
+        and re.search(
+            r"html,\s*body\s*\{[^}]*overflow-x:\s*hidden;",
+            scenarios_css,
+            re.S,
+        ) is None
+        and re.search(
+            r"#scenario-panel-native\s*\{[^}]*overflow:\s*visible\s*!important;",
+            scenarios_css,
+            re.S,
+        ) is not None
+        and re.search(
+            r"#scenario-panel-native\s*\{[^}]*overflow:\s*(?:hidden|clip);",
+            scenarios_css,
+            re.S,
+        ) is None
+        and re.search(
+            r"\.native-editor-scroll\s*\{[^}]*overflow-x:\s*auto;",
+            scenarios_css,
+            re.S,
+        ) is not None,
     )
 
 
