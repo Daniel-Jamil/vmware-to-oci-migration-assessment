@@ -5,7 +5,6 @@ from typing import Any, Mapping
 
 
 VALID_RECOMMENDATIONS = {"", "native", "ocvs", "hybrid"}
-CRITICAL_INVENTORY_ISSUES = {"missing-storage", "missing-cpu", "missing-memory"}
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -139,8 +138,7 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
     critical = [
         issue
         for issue in issues
-        if issue["id"] in CRITICAL_INVENTORY_ISSUES
-        or issue["severity"] == "critical"
+        if issue["severity"] == "critical"
     ]
     critical_ids = {id(issue) for issue in critical}
     unacknowledged = [
@@ -239,7 +237,6 @@ def build_assessment_readiness(context: Mapping[str, Any]) -> dict[str, Any]:
         and included_valid
         and acknowledged_valid
         and not critical
-        and not unacknowledged
         and all(
             placements.get(name) in {"native", "ocvs", "review"}
             for name in included

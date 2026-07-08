@@ -193,21 +193,17 @@ def current_adapter_inputs(vcf_price_per_core_yearly: float = 400.0) -> dict:
             "ocvs": {"physical_cores": physical_cores["ocvs"]},
             "hybrid": {"physical_cores": physical_cores["hybrid"]},
         },
-        "fit_warnings": [
-            {
-                "severity": "warning" if vcf_price_per_core_yearly == 0 else "info",
-                "title": (
-                    "VCF license price not set"
-                    if vcf_price_per_core_yearly == 0
-                    else "VCF license cost included"
-                ),
-                "detail": (
-                    "OCVS and Hybrid costs exclude VCF license cost until a list price per physical core is entered."
-                    if vcf_price_per_core_yearly == 0
-                    else "VCF license cost is included in the modeled scenarios."
-                ),
-            }
-        ],
+        "fit_warnings": (
+            [
+                {
+                    "severity": "info",
+                    "title": "VCF license cost included",
+                    "detail": "VCF license cost is included in the modeled scenarios.",
+                }
+            ]
+            if vcf_price_per_core_yearly > 0
+            else []
+        ),
     }
     return {
         "inventory_rows": inventory_rows,
@@ -293,6 +289,7 @@ def current_step4_client(vcf_price_per_core_yearly: float = 400.0):
         "app-01": "native",
         "legacy-01": "ocvs",
     }
+    state["step4_ocvs_profile"] = "BM.Standard3.64"
     state["acknowledged_warning_ids"] = ["unsupported-native"]
     state["step4_vmware_license_price_per_core_yearly"] = vcf_price_per_core_yearly
 
@@ -569,7 +566,7 @@ class ReadinessTests(unittest.TestCase):
                 self.assertNotIn("_step4_unsaved_scenario_changes", sess)
             response.close()
 
-    def test_results_page_keeps_incomplete_scenarios_visible_and_unranked(self) -> None:
+    def test_results_page_treats_blank_vcf_price_as_optional_extra(self) -> None:
         with current_step4_client(vcf_price_per_core_yearly=0.0) as (client, _state):
             response = client.get("/step4?tab=price")
 
@@ -584,8 +581,8 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(3, html.count("Scenario readiness"))
         for scenario_id, state, label, tone in (
             ("native", "needs_attention", "Needs attention", "attention"),
-            ("ocvs", "incomplete", "Incomplete", "blocked"),
-            ("hybrid", "incomplete", "Incomplete", "blocked"),
+            ("ocvs", "ready", "Ready", "ready"),
+            ("hybrid", "ready", "Ready", "ready"),
         ):
             with self.subTest(scenario_id=scenario_id):
                 card = result_scenario_card(html, scenario_id)
@@ -603,29 +600,121 @@ class ReadinessTests(unittest.TestCase):
             "Assumptions and sizing",
             "Benefits",
             "Trade-offs",
-            "Remediation requirements",
         ):
             self.assertIn(label, html)
-        self.assertGreaterEqual(html.count("Incomplete pricing"), 2)
-        self.assertGreaterEqual(html.count("Partial modeled amount"), 2)
-        self.assertEqual(1, html.count("Lowest complete modeled price"))
+        self.assertNotIn("Remediation requirements", html)
+        self.assertNotIn("Partial pricing", html)
+        self.assertNotIn("Incomplete pricing", html)
+        self.assertNotIn("Partial modeled amount", html)
+        self.assertNotIn("VCF license price not set", html)
+        self.assertIn("Complete pricing", html)
+        self.assertIn("Complete modeled amount", html)
+        self.assertNotIn("Lowest complete modeled price", html)
         self.assertNotRegex(
             visible_page_text(html).lower(),
-            r"\b(medal|winner|best|recommended)\b",
+            r"\b(medal|winner|best)\b",
         )
         self.assertIn('name="recommendation"', html)
         for value in ("native", "ocvs", "hybrid", ""):
             self.assertIn(f'value="{value}"', html)
-        self.assertIn("No recommendation yet", html)
+        self.assertIn("Migration specialist recommendation", html)
+        self.assertIn("Recommended path", html)
+        self.assertIn("Undecided", html)
+        self.assertIn("Internal notes", html)
+        self.assertIn("Optional notes explaining the recommendation.", html)
+        self.assertIn("Save decision", html)
+        self.assertNotIn("Assessor recommendation", html)
+        self.assertNotIn("Required for customer-ready Native treatment", html)
         self.assertIn('name="recommendation_rationale"', html)
         self.assertIn('maxlength="4000"', html)
+        self.assertIn("data-workload-profile", html)
+        self.assertIn("Workload profile", html)
+        self.assertIn("Operating system mix", html)
+        self.assertIn("Power state", html)
+        self.assertIn("OCI Native readiness", html)
+        self.assertIn("Avg vCPU / VM", html)
         self.assertIn("Save assessment", html)
         self.assertRegex(
             html,
-            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+            r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
         )
         self.assertNotIn("export_json", html)
         self.assertNotIn("Portable JSON", html)
+
+    def test_results_save_assessment_returns_to_results_page(self) -> None:
+        def fake_save_current_assessment(name: object, notes: object) -> dict:
+            normalized_name = app_module.normalize_assessment_name(name)
+            normalized_notes = app_module.normalize_assessment_notes(notes)
+            app_module.session["active_assessment_id"] = "saved-from-results"
+            app_module.session["active_assessment_name"] = normalized_name
+            app_module.session["active_assessment_notes"] = normalized_notes
+            return {
+                "id": "saved-from-results",
+                "name": normalized_name,
+                "notes": normalized_notes,
+            }
+
+        with current_step4_client(vcf_price_per_core_yearly=0.0) as (
+            client,
+            _state,
+        ), patch.object(
+            app_module,
+            "save_current_assessment",
+            side_effect=fake_save_current_assessment,
+        ):
+            page = client.get("/step4?tab=price")
+            html = page.data.decode("utf-8", errors="replace")
+            self.assertIn('name="return_to"', html)
+            self.assertIn('value="/step4?tab=price"', html)
+
+            response = client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Current assessment",
+                    "assessment_notes": "",
+                    "return_to": "/step4?tab=price",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/step4?tab=price", response.headers.get("Location"))
+
+    def test_results_save_assessment_uses_referrer_when_return_target_is_missing(self) -> None:
+        def fake_save_current_assessment(name: object, notes: object) -> dict:
+            normalized_name = app_module.normalize_assessment_name(name)
+            normalized_notes = app_module.normalize_assessment_notes(notes)
+            app_module.session["active_assessment_id"] = "saved-from-stale-results"
+            app_module.session["active_assessment_name"] = normalized_name
+            app_module.session["active_assessment_notes"] = normalized_notes
+            return {
+                "id": "saved-from-stale-results",
+                "name": normalized_name,
+                "notes": normalized_notes,
+            }
+
+        with current_step4_client(vcf_price_per_core_yearly=0.0) as (
+            client,
+            _state,
+        ), patch.object(
+            app_module,
+            "save_current_assessment",
+            side_effect=fake_save_current_assessment,
+        ):
+            response = client.post(
+                "/",
+                data={
+                    "action": "save_assessment",
+                    "assessment_name": "Current assessment",
+                    "assessment_notes": "",
+                },
+                headers={"Referer": "http://localhost/step4?tab=price"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/step4?tab=price", response.headers.get("Location"))
 
         ready_readiness = {
             "overall_state": "draft_review_required",
@@ -667,7 +756,7 @@ class ReadinessTests(unittest.TestCase):
                 r'(?s)result-status--ready"[^>]*>.*?Ready',
             )
 
-    def test_recommendation_save_persists_incomplete_selection_and_rationale(self) -> None:
+    def test_recommendation_save_persists_optional_vcf_selection_and_rationale(self) -> None:
         rationale = "Retain the legacy workload on OCVS during the first migration wave."
         with current_step4_client(vcf_price_per_core_yearly=0.0) as (client, state):
             response = client.post(
@@ -690,10 +779,11 @@ class ReadinessTests(unittest.TestCase):
         html = reloaded.data.decode("utf-8", errors="replace")
         self.assertRegex(html, r'value="ocvs"\s+checked')
         self.assertIn(rationale, html)
-        self.assertIn("Incomplete pricing", html)
+        self.assertIn("Complete pricing", html)
+        self.assertNotIn("VCF license price not set", html)
         self.assertRegex(
             html,
-            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+            r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
         )
 
     def test_recommendation_submission_rejects_invalid_payloads_transactionally(self) -> None:
@@ -778,7 +868,7 @@ class ReadinessTests(unittest.TestCase):
             "none": None,
         }
         for field_name, expected_error in (
-            ("recommendation", "Assessor recommendation must be text."),
+            ("recommendation", "Specialist recommendation must be text."),
             ("recommendation_rationale", "Recommendation rationale must be text."),
         ):
             for value_label, malformed_value in non_string_values.items():
@@ -842,7 +932,7 @@ class ReadinessTests(unittest.TestCase):
             self.assertEqual(prior_state, state)
             redirected = client.get(response.headers["Location"])
 
-        self.assertIn(b"prior recommendation was kept", redirected.data)
+        self.assertIn(b"prior decision was kept", redirected.data)
 
     def test_native_treatment_rationale_enables_customer_ready_excel_label(self) -> None:
         rationale = "Remediate the legacy guest before placing it on OCI Native."
@@ -858,7 +948,7 @@ class ReadinessTests(unittest.TestCase):
             )
             self.assertRegex(
                 draft_response.data.decode("utf-8", errors="replace"),
-                r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+                r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
             )
 
             ready_response = client.post(
@@ -879,8 +969,8 @@ class ReadinessTests(unittest.TestCase):
         )
         for scenario_id, state, label, tone in (
             ("native", "needs_attention", "Needs attention", "attention"),
-            ("ocvs", "incomplete", "Incomplete", "blocked"),
-            ("hybrid", "incomplete", "Incomplete", "blocked"),
+            ("ocvs", "ready", "Ready", "ready"),
+            ("hybrid", "ready", "Ready", "ready"),
         ):
             with self.subTest(scenario_id=scenario_id):
                 card = result_scenario_card(ready_html, scenario_id)
@@ -891,6 +981,79 @@ class ReadinessTests(unittest.TestCase):
                 )
         self.assertIn(rationale.encode(), ready_response.data)
         self.assertIn(b'role="status"', ready_response.data)
+
+    def test_results_banner_uses_draft_copy_when_setup_identity_is_missing(self) -> None:
+        with current_step4_client(vcf_price_per_core_yearly=0.0) as (client, _state):
+            with client.session_transaction() as sess:
+                sess["active_assessment_name"] = ""
+                sess["customer_name"] = ""
+
+            response = client.get("/step4?tab=price")
+
+        self.assertEqual(200, response.status_code)
+        html = response.data.decode("utf-8", errors="replace")
+        text = visible_page_text(html)
+        self.assertIn('data-overall-readiness="incomplete"', html)
+        self.assertIn("Draft results available", text)
+        self.assertIn("customer-ready export", text)
+        self.assertIn("Export Excel", text)
+        self.assertNotIn("Assessment incomplete", text)
+        self.assertNotIn("Review outstanding setup, inventory, scenario, or pricing requirements.", text)
+
+    def test_inventory_review_stage_footer_exposes_save_continue_submit(self) -> None:
+        with current_step4_client() as (client, _state):
+            response = client.get("/step3")
+
+        self.assertEqual(200, response.status_code)
+        html = response.data.decode("utf-8", errors="replace")
+        self.assertIn('id="continue_step4_form"', html)
+        self.assertRegex(
+            html,
+            r'(?s)<footer[^>]*class="workspace-stage-actions"[^>]*>.*?'
+            r'<button[^>]*class="[^"]*workspace-action--primary[^"]*"[^>]*'
+            r'form="continue_step4_form"[^>]*name="continue_to_scenarios"[^>]*'
+            r'value="1"[^>]*>.*?Save &amp; Continue.*?</button>',
+        )
+
+    def test_scenario_stage_footer_exposes_save_continue_submit(self) -> None:
+        with current_step4_client() as (client, _state):
+            response = client.get("/step4?tab=ocvs")
+
+        self.assertEqual(200, response.status_code)
+        html = response.data.decode("utf-8", errors="replace")
+        self.assertIn('id="step4-form"', html)
+        self.assertRegex(
+            html,
+            r'(?s)<footer[^>]*class="workspace-stage-actions"[^>]*>.*?'
+            r'<button[^>]*class="[^"]*workspace-action--primary[^"]*"[^>]*'
+            r'form="step4-form"[^>]*name="continue_to_results"[^>]*'
+            r'value="1"[^>]*>.*?Save &amp; Continue.*?</button>',
+        )
+
+    def test_scenario_footer_save_continue_redirects_to_results(self) -> None:
+        with current_step4_client() as (client, _state):
+            response = client.post(
+                "/step4",
+                data={
+                    "active_scenario": "ocvs",
+                    "continue_to_results": "1",
+                    "iaas_discount_pct": "0",
+                    "ocvs_profile": "best_fit",
+                    "ocvs_commitment_term": "payg",
+                    "ocvs_vcpu_per_ocpu": "4",
+                    "ocvs_cpu_headroom_pct": "20",
+                    "ocvs_memory_headroom_pct": "20",
+                    "ocvs_storage_headroom_pct": "20",
+                    "ocvs_dense_vsan_usable_pct": "80",
+                    "ocvs_standard_storage_vpu": "10",
+                    "ocvs_dr_nodes": "0",
+                    "vmware_license_price_per_core_yearly": "400.00",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertIn(response.status_code, {302, 303})
+        self.assertTrue(response.headers.get("Location", "").endswith("/step4?tab=price"))
 
     def test_critical_fit_warning_centrally_blocks_customer_ready_export(self) -> None:
         inputs = current_adapter_inputs()
@@ -983,7 +1146,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(2, len(set(first_ids)))
         self.assertNotIn("fit-capacity-alert", first_ids)
 
-    def test_ocvs_pricing_fails_closed_for_missing_or_malformed_capacity(self) -> None:
+    def test_ocvs_pricing_fails_closed_for_missing_or_malformed_host_pricing(self) -> None:
         mutations = {
             "missing summary": lambda values: values["scenario_analysis"].update(
                 ocvs_price=None
@@ -1000,15 +1163,6 @@ class ReadinessTests(unittest.TestCase):
             "pricing unavailable": lambda values: values["scenario_analysis"][
                 "ocvs_price"
             ]["selected"].update(pricing_available=False),
-            "missing physical cores": lambda values: values["scenario_analysis"][
-                "vmware_license_summary"
-            ].update(ocvs={}),
-            "zero physical cores": lambda values: values["scenario_analysis"][
-                "vmware_license_summary"
-            ]["ocvs"].update(physical_cores=0),
-            "malformed physical cores": lambda values: values["scenario_analysis"][
-                "vmware_license_summary"
-            ]["ocvs"].update(physical_cores="not-a-count"),
         }
         for label, mutate in mutations.items():
             with self.subTest(case=label):
@@ -1276,7 +1430,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertTrue(result["scenarios"]["hybrid"]["rankable"])
         self.assertTrue(result["customer_ready_export"])
 
-    def test_hybrid_positive_ocvs_subset_requires_hosts_pricing_cores_and_vcf(self) -> None:
+    def test_hybrid_positive_ocvs_subset_requires_hosts_and_pricing(self) -> None:
         mutations = {
             "missing summary": lambda values: values["scenario_analysis"].update(
                 hybrid_ocvs_price=None
@@ -1287,17 +1441,6 @@ class ReadinessTests(unittest.TestCase):
             "pricing unavailable": lambda values: values["scenario_analysis"][
                 "hybrid_ocvs_price"
             ]["selected"].update(pricing_available=False),
-            "zero cores": lambda values: values["scenario_analysis"][
-                "vmware_license_summary"
-            ]["hybrid"].update(physical_cores=0),
-            "zero VCF": lambda values: (
-                values["app_state"].update(
-                    step4_vmware_license_price_per_core_yearly=0.0
-                ),
-                values["scenario_analysis"]["vmware_license_summary"].update(
-                    price_per_core_yearly=0.0
-                ),
-            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(case=label):
@@ -1412,7 +1555,7 @@ class ReadinessTests(unittest.TestCase):
                 )
                 self.assertFalse(result["customer_ready_export"])
 
-    def test_current_adapter_blocks_ocvs_ranking_without_vcf_unit_price(self) -> None:
+    def test_current_adapter_allows_ocvs_ranking_without_vcf_unit_price(self) -> None:
         adapter = getattr(app_module, "build_current_readiness_context", None)
         self.assertTrue(callable(adapter), "current readiness adapter is missing")
 
@@ -1421,13 +1564,13 @@ class ReadinessTests(unittest.TestCase):
         for scenario_id in ("ocvs", "hybrid"):
             with self.subTest(scenario=scenario_id):
                 scenario = result["scenarios"][scenario_id]
-                self.assertEqual("incomplete", scenario["pricing_state"])
-                self.assertFalse(scenario["rankable"])
-        self.assertIn(
+                self.assertEqual("complete", scenario["pricing_state"])
+                self.assertTrue(scenario["rankable"])
+        self.assertNotIn(
             "VCF license price not set",
             {item["title"] for item in result["advisory_items"]},
         )
-        self.assertIn(
+        self.assertNotIn(
             "VCF license price not set",
             {
                 item["title"]
@@ -1610,7 +1753,7 @@ class ReadinessTests(unittest.TestCase):
         context["inventory"]["acknowledged_warning_ids"] = []
         unacknowledged = build_assessment_readiness(context)
 
-        self.assertEqual("incomplete", unacknowledged["overall_state"])
+        self.assertEqual("draft_review_required", unacknowledged["overall_state"])
         self.assertFalse(unacknowledged["customer_ready_export"])
 
         context["inventory"]["acknowledged_warning_ids"] = ["unsupported-native"]
@@ -1620,16 +1763,24 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual("draft_review_required", draft["overall_state"])
         self.assertFalse(draft["customer_ready_export"])
 
-    def test_critical_inventory_issue_blocks_stage_two(self) -> None:
+    def test_missing_inventory_values_are_nonblocking_advisories(self) -> None:
         context = complete_context()
+        context["recommendation"] = "ocvs"
         context["inventory"]["issues"].append(
-            {"id": "missing-storage", "severity": "critical", "vm_names": ["app-01"]}
+            {"id": "missing-storage", "severity": "advisory", "vm_names": ["app-01"]}
         )
 
         result = build_assessment_readiness(context)
 
-        self.assertEqual("needs_attention", result["stages"]["inventory"]["state"])
-        self.assertEqual("incomplete", result["overall_state"])
+        self.assertEqual("complete", result["stages"]["inventory"]["state"])
+        self.assertEqual("customer_ready", result["overall_state"])
+        self.assertTrue(result["customer_ready_export"])
+        self.assertNotIn(
+            "missing-storage", {item["id"] for item in result["blocking_items"]}
+        )
+        self.assertIn(
+            "missing-storage", {item["id"] for item in result["advisory_items"]}
+        )
 
     def test_customer_ready_requires_all_prerequisite_stages(self) -> None:
         cases = (

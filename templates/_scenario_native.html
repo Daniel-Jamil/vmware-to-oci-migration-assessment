@@ -272,8 +272,8 @@
     </form>
 
     <nav class="native-pagination" aria-label="Native editor pages">
-      <span>Page {{ native_editor.page }} of {{ native_editor.page_count }}</span>
-      <div>
+      <span class="native-pagination__status">Page {{ native_editor.page }} of {{ native_editor.page_count }}</span>
+      <div class="native-pagination__list">
         {% if native_editor.page > 1 %}
           <a
             data-dirty-navigation

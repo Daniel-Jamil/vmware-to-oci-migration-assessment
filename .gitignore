@@ -21,6 +21,7 @@ desktop.ini
 .worktrees/
 downloads/app_state/
 downloads/exports/
+downloads/imported_assessments/
 *.zip
 /vmware2oci/
 /vmware2oci [0-9]*/

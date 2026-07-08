@@ -27,8 +27,16 @@
         <span class="workspace-save-state__icon" aria-hidden="true"></span>
         {{ "Saved assessment" if workspace_is_saved else "Unsaved assessment" }}
       </span>
+      <form
+        method="post"
+        action="{{ url_for('index') }}"
+        class="workspace-start-fresh-form"
+        data-start-fresh-assessment
+        onsubmit="return confirm('Start a fresh assessment? This clears the current active assessment, inventory, and scenario settings. Saved assessments and the selected OCI price list will remain.');"
+      >
+        <button type="submit" name="action" value="start_fresh_assessment" class="workspace-action workspace-action--primary workspace-start-fresh-action">Start Fresh Assessment</button>
+      </form>
     </div>
-    {% include "_assessment_menu.html" %}
   </header>
 
   <div class="workspace-shell">
@@ -39,6 +47,7 @@
         <strong>{{ workspace_stage_name }}</strong>
       </div>
 
+      {% set readiness_panel_variant = "compact" if workspace_stage == 'results' else "" %}
       {% include "_readiness_panel.html" %}
 
       {% set workspace_messages = get_flashed_messages(with_categories=true) %}
@@ -87,6 +96,17 @@
               </span>
               <span class="workspace-continue-prerequisite">{{ workspace_continue_unavailable_message }}</span>
             </div>
+          {% elif workspace_continue_presentation == "form" and workspace_continue_form_id %}
+            <button
+              class="workspace-action workspace-action--primary"
+              type="submit"
+              form="{{ workspace_continue_form_id }}"
+              name="{{ workspace_continue_submit_name }}"
+              value="{{ workspace_continue_submit_value }}"
+            >
+              {{ workspace_continue_label }}
+              <span aria-hidden="true">&#8594;</span>
+            </button>
           {% endif %}
         </footer>
       {% endif %}

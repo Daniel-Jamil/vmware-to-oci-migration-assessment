@@ -10,9 +10,11 @@
         <p class="inventory-review__eyebrow">Workload scope and initial placement</p>
         <h1 id="inventory-review-title">Inventory Review</h1>
       </div>
-      <span class="inventory-review__selection-status" data-selection-status role="status" aria-live="polite" aria-atomic="true">
-        {{ selected_vm_count }} of {{ inventory_summary.vm_count }} included
-      </span>
+      <div class="inventory-review__heading-actions">
+        <span class="inventory-review__selection-status" data-selection-status role="status" aria-live="polite" aria-atomic="true">
+          {{ selected_vm_count }} of {{ inventory_summary.vm_count }} included
+        </span>
+      </div>
     </header>
 
     <dl class="inventory-summary" aria-label="Inventory summary">
@@ -22,7 +24,7 @@
       <div><dt>Storage</dt><dd>{{ "{:,}".format(inventory_summary.total_storage_gb) }} GB</dd></div>
       <div><dt>Powered on</dt><dd>{{ "{:,}".format(inventory_summary.powered_on_count) }}</dd></div>
       <div><dt>Native-supported</dt><dd>{{ "{:,}".format(inventory_summary.native_supported_count) }}</dd></div>
-      <div><dt>Review</dt><dd>{{ "{:,}".format(inventory_summary.review_count) }}</dd></div>
+      <div><dt title="Unique VMs with one or more inventory notes">VMs to review</dt><dd>{{ "{:,}".format(inventory_summary.review_count) }}</dd></div>
     </dl>
 
     <form method="post" id="continue_step4_form" class="inventory-review__form" novalidate>
@@ -100,18 +102,8 @@
 
       {% include "_inventory_table.html" %}
 
-      <div class="inventory-review__actions">
-        <a class="inventory-button inventory-button--secondary" href="{{ url_for('index') }}">Back to Setup</a>
-        <button class="inventory-button inventory-button--primary" type="submit" name="continue_to_scenarios" value="1">
-          Save & Continue
-        </button>
-      </div>
     </form>
 
-    <div id="inventory-undo" class="inventory-undo" role="status" aria-live="polite" hidden>
-      <span data-undo-message></span>
-      <button type="button" class="inventory-undo__button" data-undo>Undo</button>
-    </div>
   </section>
 {% endblock %}
 {% block scripts %}

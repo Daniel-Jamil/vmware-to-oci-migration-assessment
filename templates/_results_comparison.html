@@ -9,9 +9,9 @@
     <div>
       <p class="results-eyebrow">Assessment results</p>
       <h2>Migration path comparison</h2>
-      <p>Review technical fit, pricing completeness, and modeled amounts independently before recording the assessor decision.</p>
+      <p>Review technical fit, pricing completeness, and modeled amounts independently before recording the specialist decision.</p>
     </div>
-    <div class="results-readiness results-readiness--{{ results.overall_state }}" role="status">
+    <div class="results-readiness results-readiness--{{ results.overall_display_state }}" role="status">
       <span class="results-readiness__indicator" aria-hidden="true"></span>
       <span>
         <strong>{{ results.overall_label }}</strong>
@@ -33,9 +33,16 @@
             <p class="result-scenario__path">Migration path</p>
             <h2>{{ scenario.title }}</h2>
           </div>
-          {% if scenario.is_lowest_complete %}
-            <span class="result-scenario__price-label">Lowest complete modeled price</span>
-          {% endif %}
+          <div class="result-scenario__badges">
+            <span
+              class="result-rank-medal result-rank-medal--{{ scenario.rank_tone }}"
+              aria-label="Cost rank {{ scenario.price_rank }}"
+            >
+              <span class="result-rank-number">{{ scenario.price_rank }}</span>
+              <span>Rank {{ scenario.price_rank }}</span>
+              <small>{{ scenario.rank_qualifier }}</small>
+            </span>
+          </div>
         </header>
         <p class="result-scenario__intro">{{ scenario.intro }}</p>
 
@@ -129,13 +136,6 @@
             </ul>
           </section>
         </div>
-
-        <section class="result-detail-section result-detail-section--remediation" aria-labelledby="result-{{ scenario.id }}-remediation">
-          <h3 id="result-{{ scenario.id }}-remediation">Remediation requirements</h3>
-          <ul class="result-detail-list">
-            {% for requirement in scenario.remediation_requirements %}<li>{{ requirement }}</li>{% endfor %}
-          </ul>
-        </section>
       </article>
     {% endfor %}
   </div>
@@ -144,16 +144,16 @@
 <section class="results-recommendation" aria-labelledby="assessor-recommendation-title">
   <div class="results-recommendation__heading">
     <div>
-      <p class="results-eyebrow">Assessor decision</p>
-      <h2 id="assessor-recommendation-title">Assessor recommendation</h2>
+      <p class="results-eyebrow">Internal decision</p>
+      <h2 id="assessor-recommendation-title">Migration specialist recommendation</h2>
+      <p class="results-recommendation__summary">Save the recommended path for the report. This choice does not recalculate costs or change the ranking.</p>
     </div>
-    <p>Incomplete paths remain available for internal draft review.</p>
   </div>
 
   <form method="post" action="{{ url_for('step4') }}" class="recommendation-form" novalidate>
     <input type="hidden" name="action" value="save_recommendation" />
     <fieldset>
-      <legend>Migration path</legend>
+      <legend>Recommended path</legend>
       <div class="recommendation-options">
         {% for option in results.recommendation_options %}
           {% set option_id = 'recommendation-none' if option.value == '' else 'recommendation-' ~ option.value %}
@@ -172,7 +172,7 @@
     </fieldset>
 
     <label class="recommendation-rationale" for="recommendation-rationale">
-      <span>Rationale</span>
+      <span>Internal notes</span>
       <textarea
         id="recommendation-rationale"
         name="recommendation_rationale"
@@ -180,19 +180,19 @@
         maxlength="4000"
         aria-describedby="recommendation-rationale-help recommendation-errors"
       >{{ results.rationale }}</textarea>
-      <small id="recommendation-rationale-help">Required for customer-ready Native treatment when unsupported VMs remain in scope. Maximum 4,000 characters.</small>
+      <small id="recommendation-rationale-help">Optional notes explaining the recommendation. Maximum 4,000 characters.</small>
     </label>
     <div id="recommendation-errors" class="recommendation-errors" role="status" aria-live="polite"></div>
 
     {% if results.rationale %}
       <div class="recommendation-recorded">
-        <strong>Recorded rationale</strong>
+        <strong>Saved internal notes</strong>
         <p>{{ results.rationale }}</p>
       </div>
     {% endif %}
 
     <div class="recommendation-actions">
-      <button type="submit">Save recommendation</button>
+      <button type="submit">Save decision</button>
     </div>
   </form>
 </section>

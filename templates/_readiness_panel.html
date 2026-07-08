@@ -1,30 +1,57 @@
 {% set readiness_blockers = workspace_readiness.get('blockers', []) %}
 {% set readiness_advisories = workspace_readiness.get('advisories', []) %}
 {% if readiness_blockers or readiness_advisories %}
-  <section class="readiness-panel" aria-labelledby="readiness-panel-title">
-    <div class="readiness-panel__heading">
-      <span class="readiness-panel__icon" aria-hidden="true">!</span>
-      <h2 id="readiness-panel-title">Readiness review</h2>
-    </div>
-    {% if readiness_blockers %}
-      <div class="readiness-panel__group readiness-panel__group--blocker">
-        <h3>Required before completion</h3>
-        <ul>
-          {% for item in readiness_blockers %}
-            <li>{{ item.message if item is mapping and item.message else item }}</li>
-          {% endfor %}
-        </ul>
+  {% set readiness_has_blockers = readiness_blockers|length > 0 %}
+  {% set readiness_is_compact = readiness_panel_variant|default('') == 'compact' and not readiness_has_blockers %}
+  <section
+    class="readiness-panel {% if readiness_has_blockers %}readiness-panel--attention{% else %}readiness-panel--info{% endif %}{% if readiness_is_compact %} readiness-panel--compact{% endif %}"
+    aria-labelledby="readiness-panel-title"
+  >
+    {% if readiness_is_compact %}
+      <details class="readiness-panel__details">
+        <summary class="readiness-panel__summary">
+          <span class="readiness-panel__icon" aria-hidden="true">i</span>
+          <span>
+            <span id="readiness-panel-title" class="readiness-panel__summary-title">Readiness notes</span>
+            <span class="readiness-panel__summary-meta">
+              View informational notes ({{ readiness_advisories|length }})
+            </span>
+          </span>
+        </summary>
+        <div class="readiness-panel__group readiness-panel__group--advisory">
+          <h3>Informational review</h3>
+          <ul>
+            {% for item in readiness_advisories %}
+              <li>{{ item.message if item is mapping and item.message else item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      </details>
+    {% else %}
+      <div class="readiness-panel__heading">
+        <span class="readiness-panel__icon" aria-hidden="true">{{ '!' if readiness_has_blockers else 'i' }}</span>
+        <h2 id="readiness-panel-title">{{ 'Readiness review' if readiness_has_blockers else 'Readiness notes' }}</h2>
       </div>
-    {% endif %}
-    {% if readiness_advisories %}
-      <div class="readiness-panel__group readiness-panel__group--advisory">
-        <h3>Review advised</h3>
-        <ul>
-          {% for item in readiness_advisories %}
-            <li>{{ item.message if item is mapping and item.message else item }}</li>
-          {% endfor %}
-        </ul>
-      </div>
+      {% if readiness_blockers %}
+        <div class="readiness-panel__group readiness-panel__group--blocker">
+          <h3>Required before completion</h3>
+          <ul>
+            {% for item in readiness_blockers %}
+              <li>{{ item.message if item is mapping and item.message else item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+      {% if readiness_advisories %}
+        <div class="readiness-panel__group readiness-panel__group--advisory">
+          <h3>{{ 'Review advised' if readiness_has_blockers else 'Informational review' }}</h3>
+          <ul>
+            {% for item in readiness_advisories %}
+              <li>{{ item.message if item is mapping and item.message else item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
     {% endif %}
   </section>
 {% endif %}

@@ -35,7 +35,7 @@
             <button type="button" class="inventory-sort" data-sort="placement">Suggested placement</button>
           </th>
           <th class="inventory-col-warning" scope="col" aria-sort="none">
-            <button type="button" class="inventory-sort" data-sort="warning">Warning</button>
+            <button type="button" class="inventory-sort" data-sort="warning">Notes</button>
           </th>
           <th class="inventory-col-details" scope="col">Details</th>
         </tr>
@@ -82,7 +82,14 @@
             <td class="inventory-col-placement"><span data-placement-label>{{ vm.placement_label }}</span></td>
             <td class="inventory-col-warning">
               {% if vm.warning_titles %}
-                <span class="inventory-warning">{{ vm.warning_titles|length }} warning{% if vm.warning_titles|length != 1 %}s{% endif %}</span>
+                <button
+                  type="button"
+                  class="inventory-warning inventory-warning-button"
+                  data-note-details-target="inventory-details-{{ vm.row_index }}"
+                  aria-controls="inventory-details-{{ vm.row_index }}"
+                  aria-expanded="false"
+                  aria-label="View {{ vm.warning_titles|length }} inventory note{% if vm.warning_titles|length != 1 %}s{% endif %} for {{ vm.name }}"
+                >{{ vm.warning_titles|length }} note{% if vm.warning_titles|length != 1 %}s{% endif %}</button>
               {% else %}
                 <span class="inventory-clear">None</span>
               {% endif %}
@@ -97,7 +104,7 @@
               >Details</button>
             </td>
           </tr>
-          <tr class="inventory-details-row" data-inventory-detail="{{ vm.row_index }}">
+          <tr class="inventory-details-row" data-inventory-detail="{{ vm.row_index }}" hidden>
             <td colspan="11">
               <details class="inventory-row-details" id="inventory-details-{{ vm.row_index }}">
                 <summary>Details for {{ vm.name }}</summary>
@@ -109,7 +116,25 @@
                     <div><dt>vCPU</dt><dd>{{ vm.cpus }}</dd></div>
                     <div><dt>RAM</dt><dd>{{ "%.1f"|format(vm.memory_gb) }} GB</dd></div>
                     <div><dt>Storage</dt><dd>{{ "%.1f"|format(vm.storage_gb) }} GB</dd></div>
-                    <div><dt>Warnings</dt><dd>{{ vm.warning_titles|join(', ') or 'None' }}</dd></div>
+                    <div class="inventory-row-details__notes">
+                      <dt>Notes</dt>
+                      <dd>
+                        {% if vm.warning_details %}
+                          <ul class="inventory-note-list">
+                            {% for note in vm.warning_details %}
+                              <li>
+                                <strong>{{ note.title }}</strong>
+                                <span><b>Detected value:</b> {{ note.detected_value }}</span>
+                                <span><b>Issue:</b> {{ note.reason }}</span>
+                                <span><b>Follow-up:</b> {{ note.recommendation }}</span>
+                              </li>
+                            {% endfor %}
+                          </ul>
+                        {% else %}
+                          None
+                        {% endif %}
+                      </dd>
+                    </div>
                   </dl>
                   <label class="inventory-field inventory-row-details__placement" for="inventory-placement-{{ vm.row_index }}">
                     <span>Suggested placement for {{ vm.name }}</span>

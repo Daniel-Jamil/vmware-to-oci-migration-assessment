@@ -118,12 +118,6 @@
       flex-wrap: wrap;
       margin-left: auto;
     }
-    .export-status { border: 1px solid var(--line); background: var(--surface-soft); color: var(--muted); padding: .45rem .6rem; margin: -.25rem 0 .75rem; font-size: var(--font-sm); font-weight: 700; }
-    .export-status[hidden] { display: none; }
-    .export-status.is-working { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-2); }
-    .export-status.is-success { border-color: #86efac; background: #f0fdf4; color: var(--good); }
-    .export-status.is-error { border-color: #fecaca; background: #fef2f2; color: var(--danger); }
-    .export-status button { margin-left: .6rem; padding: .26rem .5rem; font-size: var(--font-sm); }
     a {
       color: var(--accent);
       text-decoration: none;
@@ -830,6 +824,7 @@
     <h1 id="step4-main-title">{{ initial_titles.get(active_scenario, 'Migration to OCI Native') }}</h1>
 
     {% if active_scenario == 'price' %}
+      {% include "_workload_profile.html" %}
       {% include "_results_comparison.html" %}
       {% include "_export_center.html" %}
     {% else %}
@@ -856,12 +851,8 @@
           </div>
         </div>
       {% endif %}
-      <div class="action-group">
-        <input type="hidden" id="active_scenario" name="active_scenario" value="{{ active_scenario }}" form="step4-form" />
-        <button type="submit" form="step4-form" name="action" value="export_excel">Export to Excel</button>
-      </div>
+      <input type="hidden" id="active_scenario" name="active_scenario" value="{{ active_scenario }}" form="step4-form" />
     </div>
-    <div id="export-status" class="export-status" role="status" aria-live="polite" hidden></div>
 
     <div id="shape-strategy-modal" class="modal-backdrop" aria-hidden="true">
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="shape-strategy-title" tabindex="-1">
@@ -1426,9 +1417,6 @@
       const pageHeading = document.getElementById('scenario-page-heading');
       const activeScenarioInput = document.getElementById('active_scenario');
       const step4Form = document.getElementById('step4-form');
-      const exportStatus = document.getElementById('export-status');
-      const lastExportFile = document.querySelector('[data-last-export-file]');
-      const openLastExportUrl = {{ url_for('open_last_export')|tojson }};
       document.querySelectorAll('[data-autohide-flash="true"]').forEach((flash, index) => {
         window.setTimeout(() => {
           flash.classList.add('is-hiding');
@@ -1514,100 +1502,6 @@
         sourceControls.forEach(syncSettingControl);
       }
 
-      function setExportStatus(message, state, options) {
-        if (!exportStatus) return;
-        exportStatus.hidden = false;
-        exportStatus.textContent = message;
-        exportStatus.classList.remove('is-working', 'is-success', 'is-error');
-        if (state) exportStatus.classList.add(`is-${state}`);
-        if (options && options.openFile) {
-          const openButton = document.createElement('button');
-          openButton.type = 'button';
-          openButton.textContent = 'Open file';
-          openButton.addEventListener('click', async () => {
-            openButton.disabled = true;
-            openButton.textContent = 'Opening...';
-            try {
-              const response = await fetch(openLastExportUrl, {
-                method: 'POST',
-                credentials: 'same-origin',
-              });
-              const payload = await response.json().catch(() => ({}));
-              if (!response.ok || !payload.ok) {
-                throw new Error(payload.message || `Open failed with HTTP ${response.status}`);
-              }
-              openButton.textContent = 'Opened';
-            } catch (error) {
-              setExportStatus(`Could not open Excel file: ${error.message || error}`, 'error');
-            } finally {
-              window.setTimeout(() => {
-                openButton.disabled = false;
-                if (openButton.textContent === 'Opened') openButton.textContent = 'Open file';
-              }, 1800);
-            }
-          });
-          exportStatus.appendChild(openButton);
-        }
-      }
-
-      function filenameFromContentDisposition(headerValue) {
-        const header = String(headerValue || '');
-        const utfMatch = header.match(/filename\*=UTF-8''([^;]+)/i);
-        if (utfMatch) return decodeURIComponent(utfMatch[1].replace(/"/g, ''));
-        const plainMatch = header.match(/filename="?([^";]+)"?/i);
-        return plainMatch ? plainMatch[1] : 'migration_price_comparison.xlsx';
-      }
-
-      async function exportWorkbook(submitter) {
-        if (!step4Form) return;
-        setExportStatus('Creating Excel report...', 'working');
-        if (submitter) submitter.disabled = true;
-        try {
-          const formData = new FormData(step4Form);
-          if (submitter && submitter.name) {
-            formData.set(submitter.name, submitter.value || 'export_excel');
-          } else {
-            formData.set('action', 'export_excel');
-          }
-
-          const exportUrl = step4Form.getAttribute('action') || window.location.pathname || '/step4';
-          const response = await fetch(exportUrl, {
-            method: step4Form.method || 'POST',
-            body: formData,
-            credentials: 'same-origin',
-          });
-
-          if (!response.ok) {
-            throw new Error(`Export failed with HTTP ${response.status}`);
-          }
-
-          const contentType = response.headers.get('Content-Type') || '';
-          if (!contentType.includes('spreadsheetml') && !contentType.includes('octet-stream')) {
-            throw new Error('The server did not return an Excel workbook.');
-          }
-
-          const filename = filenameFromContentDisposition(response.headers.get('Content-Disposition'));
-          const blob = await response.blob();
-          const downloadUrl = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = downloadUrl;
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-          window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 1000);
-
-          if (lastExportFile) {
-            lastExportFile.textContent = `downloads/exports/${filename}`;
-          }
-          setExportStatus(`Excel export created: ${filename}`, 'success', { openFile: true });
-        } catch (error) {
-          setExportStatus(`Excel export failed: ${error.message || error}`, 'error');
-        } finally {
-          if (submitter) submitter.disabled = false;
-        }
-      }
-
       if (step4Form && activeScenarioInput) {
         step4Form.addEventListener('submit', (event) => {
           syncActiveScenarioSettings();
@@ -1616,10 +1510,7 @@
           activeScenarioInput.value = hashMatch?.[1] || activeTab?.dataset.scenarioTab || activeScenarioInput.value || 'native';
 
           const submitter = event.submitter;
-          if (submitter && submitter.name === 'action' && submitter.value === 'export_excel') {
-            event.preventDefault();
-            exportWorkbook(submitter);
-          } else if (submitter && submitter.name === 'action' && submitter.value === 'save') {
+          if (submitter && submitter.name === 'action' && submitter.value === 'save') {
             submitter.dataset.originalText = submitter.textContent || 'Save Settings';
             submitter.textContent = 'Saving...';
             window.setTimeout(() => {

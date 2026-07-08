@@ -24,7 +24,7 @@
   <section class="scenario-cost-summary" aria-labelledby="ocvs-cost-title">
     <div class="scenario-section-heading">
       <div>
-        <p class="native-section-label">Infrastructure and Licensing</p>
+        <p class="native-section-label">Infrastructure and optional licensing</p>
         <h3 id="ocvs-cost-title">Monthly cost status</h3>
       </div>
       <span class="scenario-status scenario-status--{{ ocvs_display.status_tone }}">{{ ocvs_display.status_label }}</span>
@@ -38,13 +38,13 @@
       <div>
         <dt>VCF subtotal</dt>
         <dd>
-          {% if ocvs_display.vcf_price_required %}
-            Unit price required
+          {% if ocvs_display.vcf_optional %}
+            {{ ocvs_display.vcf_label }}
           {% else %}
             {{ pricing_symbol }}{{ "{:,.0f}".format(ocvs_display.vcf_subtotal) }}
           {% endif %}
         </dd>
-        <small>{{ "{:,}".format(vmware_license_summary.ocvs.physical_cores) }} physical cores</small>
+        <small>{{ "{:,}".format(vmware_license_summary.ocvs.physical_cores) }} physical cores. {{ ocvs_display.vcf_note }}</small>
       </div>
       <div class="scenario-cost-grid__total">
         <dt>{{ ocvs_display.total_label }}</dt>

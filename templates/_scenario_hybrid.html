@@ -24,19 +24,102 @@
     </dl>
   </section>
 
-  <section class="hybrid-shared-notice" aria-labelledby="hybrid-shared-title">
-    <div>
-      <p class="native-section-label">Shared OCVS assumptions</p>
-      <h3 id="hybrid-shared-title">OCVS controls are owned by the OCVS scenario</h3>
-      <p>Hybrid subset sizing currently uses {{ hybrid_display.shared_source }} for all OCVS-priced rows.</p>
+  <section class="ocvs-assumptions hybrid-ocvs-assumptions" aria-labelledby="hybrid-ocvs-assumptions-title">
+    <div class="scenario-section-heading">
+      <div>
+        <p class="native-section-label">Hybrid OCVS assumptions</p>
+        <h3 id="hybrid-ocvs-assumptions-title">OCVS subset assumptions</h3>
+        <p>Hybrid starts with the OCVS scenario values, then keeps separate values after saving this tab.</p>
+      </div>
+      <span>{{ hybrid_display.assumptions_label }}</span>
     </div>
-    <a class="scenario-secondary-action" href="{{ url_for('step4', tab='ocvs') }}" data-dirty-navigation>Open OCVS assumptions</a>
+    <div class="ocvs-assumption-groups">
+      <fieldset class="scenario-field-group">
+        <legend>Profile &amp; Term</legend>
+        <label class="native-field" for="hybrid_ocvs_profile">
+          <span>OCVS node profile</span>
+          <select id="hybrid_ocvs_profile" name="hybrid_ocvs_profile" form="step4-form">
+            <option value="best_fit" {% if hybrid_ocvs_profile_choice == 'best_fit' %}selected{% endif %}>Cost optimized</option>
+            {% for profile in ocvs_profiles %}
+              <option value="{{ profile.shape }}" {% if hybrid_ocvs_profile_choice == profile.shape %}selected{% endif %}>{{ profile.label }} - {{ profile.shape }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="native-field" for="hybrid_ocvs_commitment_term">
+          <span>Commitment term</span>
+          <select id="hybrid_ocvs_commitment_term" name="hybrid_ocvs_commitment_term" form="step4-form">
+            {% for option in ocvs_commitment_options %}
+              <option value="{{ option.value }}" {% if hybrid_ocvs_commitment_term == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset class="scenario-field-group scenario-field-group--wide">
+        <legend>Capacity Policy</legend>
+        <div class="scenario-field-grid">
+          <label class="native-field" for="hybrid_ocvs_vcpu_per_ocpu">
+            <span>vCPU per OCPU</span>
+            <input id="hybrid_ocvs_vcpu_per_ocpu" name="hybrid_ocvs_vcpu_per_ocpu" form="step4-form" type="number" min="1" max="16" step="0.1" value="{{ '%.1f'|format(hybrid_ocvs_policy.vcpu_per_ocpu) }}" />
+          </label>
+          <label class="native-field" for="hybrid_ocvs_cpu_headroom_pct">
+            <span>CPU headroom %</span>
+            <input id="hybrid_ocvs_cpu_headroom_pct" name="hybrid_ocvs_cpu_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(hybrid_ocvs_policy.cpu_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="hybrid_ocvs_memory_headroom_pct">
+            <span>RAM headroom %</span>
+            <input id="hybrid_ocvs_memory_headroom_pct" name="hybrid_ocvs_memory_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(hybrid_ocvs_policy.memory_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="hybrid_ocvs_storage_headroom_pct">
+            <span>Storage headroom %</span>
+            <input id="hybrid_ocvs_storage_headroom_pct" name="hybrid_ocvs_storage_headroom_pct" form="step4-form" type="number" min="0" max="90" step="1" value="{{ '%.0f'|format(hybrid_ocvs_policy.storage_headroom_pct) }}" />
+          </label>
+          <label class="native-field" for="hybrid_ocvs_dense_vsan_usable_pct">
+            <span>Dense vSAN usable %</span>
+            <input id="hybrid_ocvs_dense_vsan_usable_pct" name="hybrid_ocvs_dense_vsan_usable_pct" form="step4-form" type="number" min="10" max="95" step="1" value="{{ '%.0f'|format(hybrid_ocvs_policy.dense_vsan_usable_pct) }}" />
+          </label>
+          <label class="native-field" for="hybrid_ocvs_standard_storage_vpu">
+            <span>Standard storage VPU/GB</span>
+            <input id="hybrid_ocvs_standard_storage_vpu" name="hybrid_ocvs_standard_storage_vpu" form="step4-form" type="number" min="10" max="120" step="10" value="{{ hybrid_ocvs_policy.standard_storage_vpu }}" />
+          </label>
+        </div>
+      </fieldset>
+
+      <fieldset class="scenario-field-group">
+        <legend>Resilience</legend>
+        <label class="native-field" for="hybrid_ocvs_dr_nodes">
+          <span>Additional spare nodes</span>
+          <select id="hybrid_ocvs_dr_nodes" name="hybrid_ocvs_dr_nodes" form="step4-form">
+            {% for count in [0, 1, 2] %}
+              <option value="{{ count }}" {% if hybrid_ocvs_dr_nodes == count %}selected{% endif %}>{{ count }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset class="scenario-field-group">
+        <legend>VCF Licensing</legend>
+        <label class="native-field" for="hybrid_vmware_license_price_per_core_yearly">
+          <span>List price per physical core/year</span>
+          <input
+            id="hybrid_vmware_license_price_per_core_yearly"
+            name="hybrid_vmware_license_price_per_core_yearly"
+            form="step4-form"
+            type="number"
+            min="0"
+            max="1000000"
+            step="0.01"
+            value="{{ '%.2f'|format(hybrid_vmware_license_price_per_core_yearly) }}"
+          />
+        </label>
+      </fieldset>
+    </div>
   </section>
 
   <section class="hybrid-summary" aria-labelledby="hybrid-summary-title">
     <div class="scenario-section-heading">
       <div>
-        <p class="native-section-label">Infrastructure and Licensing</p>
+        <p class="native-section-label">Infrastructure and optional licensing</p>
         <h3 id="hybrid-summary-title">Hybrid monthly cost status</h3>
       </div>
       <span class="scenario-status scenario-status--{{ hybrid_display.status_tone }}">{{ hybrid_display.status_label }}</span>
@@ -46,8 +129,8 @@
       <div><dt>OCVS infrastructure</dt><dd>{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.ocvs_infrastructure_subtotal) }}</dd><small>{{ hybrid_display.ocvs_priced_count }} VM(s), including Review</small></div>
       <div>
         <dt>VCF subtotal</dt>
-        <dd>{% if hybrid_display.vcf_price_required %}Unit price required{% else %}{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.vcf_subtotal) }}{% endif %}</dd>
-        <small>{{ "{:,}".format(vmware_license_summary.hybrid.physical_cores) }} physical cores</small>
+        <dd>{% if hybrid_display.vcf_optional %}{{ hybrid_display.vcf_label }}{% else %}{{ pricing_symbol }}{{ "{:,.0f}".format(hybrid_display.vcf_subtotal) }}{% endif %}</dd>
+        <small>{{ "{:,}".format(vmware_license_summary.hybrid.physical_cores) }} physical cores. {{ hybrid_display.vcf_note }}</small>
       </div>
       <div class="scenario-cost-grid__total">
         <dt>{{ hybrid_display.total_label }}</dt>

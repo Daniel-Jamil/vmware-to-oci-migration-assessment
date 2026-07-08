@@ -1,0 +1,96 @@
+<section class="workload-profile" aria-labelledby="workload-profile-title" data-workload-profile>
+  <header class="workload-profile__heading">
+    <div>
+      <p class="results-eyebrow">Workload analytics</p>
+      <h2 id="workload-profile-title">Workload profile</h2>
+      <p>Review the selected estate baseline before comparing migration paths and export readiness.</p>
+    </div>
+    <div class="workload-profile__summary" aria-label="Selected workload totals">
+      <span><strong>{{ "{:,}".format(workload_summary.vm_count) }}</strong> VMs</span>
+      <span><strong>{{ "{:,}".format(workload_summary.total_vcpus) }}</strong> vCPU</span>
+      <span><strong>{{ "{:,}".format(workload_summary.total_memory_gb) }}</strong> GB RAM</span>
+      <span><strong>{{ "{:,}".format(workload_summary.total_storage_gb) }}</strong> GB storage</span>
+    </div>
+  </header>
+
+  <dl class="workload-profile__kpis">
+    <div><dt>Powered on</dt><dd>{{ "{:,}".format(workload_summary.powered_on_count) }}</dd></div>
+    <div><dt>Powered off</dt><dd>{{ "{:,}".format(workload_summary.powered_off_count) }}</dd></div>
+    <div><dt>OCI Native supported</dt><dd>{{ "{:,}".format(workload_summary.oci_supported_count) }}</dd></div>
+    <div><dt>OCVS review</dt><dd>{{ "{:,}".format(workload_summary.oci_not_supported_count) }}</dd></div>
+  </dl>
+
+  <div class="workload-profile__grid">
+    <article class="workload-profile__panel workload-profile__panel--wide" data-workload-profile-os>
+      <h3>Operating system mix</h3>
+      <div class="workload-profile__bar-list">
+        {% for os_row in workload_summary.top_os_rows %}
+          <div class="workload-profile__bar-row">
+            <div class="workload-profile__bar-head">
+              <strong title="{{ os_row.os_name }}">{{ os_row.os_name }}</strong>
+              <span>{{ "{:,}".format(os_row.count) }} VM(s) | {{ "%.1f"|format(os_row.pct) }}%</span>
+            </div>
+            <div class="workload-profile__bar-track" aria-hidden="true">
+              <div class="workload-profile__bar-fill" style="width: {{ "%.1f"|format(os_row.pct) }}%;"></div>
+            </div>
+          </div>
+        {% else %}
+          <p class="workload-profile__note">No selected VMs are available for operating system analysis.</p>
+        {% endfor %}
+        {% if workload_summary.other_os_count %}
+          <div class="workload-profile__bar-row">
+            <div class="workload-profile__bar-head">
+              <strong>Other operating systems</strong>
+              <span>{{ "{:,}".format(workload_summary.other_os_count) }} VM(s) | {{ "%.1f"|format(workload_summary.other_os_pct) }}%</span>
+            </div>
+            <div class="workload-profile__bar-track" aria-hidden="true">
+              <div class="workload-profile__bar-fill workload-profile__bar-fill--other" style="width: {{ "%.1f"|format(workload_summary.other_os_pct) }}%;"></div>
+            </div>
+          </div>
+        {% endif %}
+      </div>
+    </article>
+
+    <article class="workload-profile__panel">
+      <h3>Power state</h3>
+      <div class="workload-profile__stack" aria-label="Power state distribution">
+        <span class="workload-profile__stack-segment workload-profile__stack-segment--on" style="width: {{ "%.1f"|format(workload_summary.powered_on_pct) }}%;"></span>
+        <span class="workload-profile__stack-segment workload-profile__stack-segment--off" style="width: {{ "%.1f"|format(workload_summary.powered_off_pct) }}%;"></span>
+        <span class="workload-profile__stack-segment workload-profile__stack-segment--unknown" style="width: {{ "%.1f"|format(workload_summary.unknown_power_pct) }}%;"></span>
+      </div>
+      <dl class="workload-profile__legend">
+        <div><dt><span class="workload-profile__dot workload-profile__dot--on"></span>Powered on</dt><dd>{{ "{:,}".format(workload_summary.powered_on_count) }} | {{ "%.1f"|format(workload_summary.powered_on_pct) }}%</dd></div>
+        <div><dt><span class="workload-profile__dot workload-profile__dot--off"></span>Powered off</dt><dd>{{ "{:,}".format(workload_summary.powered_off_count) }} | {{ "%.1f"|format(workload_summary.powered_off_pct) }}%</dd></div>
+        <div><dt><span class="workload-profile__dot workload-profile__dot--unknown"></span>Unknown</dt><dd>{{ "{:,}".format(workload_summary.unknown_power_count) }} | {{ "%.1f"|format(workload_summary.unknown_power_pct) }}%</dd></div>
+      </dl>
+    </article>
+
+    <article class="workload-profile__panel">
+      <h3>OCI Native readiness</h3>
+      <div class="workload-profile__stack" aria-label="OCI Native readiness distribution">
+        <span class="workload-profile__stack-segment workload-profile__stack-segment--supported" style="width: {{ "%.1f"|format(workload_summary.oci_supported_pct) }}%;"></span>
+        <span class="workload-profile__stack-segment workload-profile__stack-segment--unsupported" style="width: {{ "%.1f"|format(workload_summary.oci_not_supported_pct) }}%;"></span>
+      </div>
+      <dl class="workload-profile__legend">
+        <div><dt><span class="workload-profile__dot workload-profile__dot--supported"></span>OCI Native supported</dt><dd>{{ "{:,}".format(workload_summary.oci_supported_count) }} | {{ "%.1f"|format(workload_summary.oci_supported_pct) }}%</dd></div>
+        <div><dt><span class="workload-profile__dot workload-profile__dot--unsupported"></span>OCVS review</dt><dd>{{ "{:,}".format(workload_summary.oci_not_supported_count) }} | {{ "%.1f"|format(workload_summary.oci_not_supported_pct) }}%</dd></div>
+      </dl>
+      <dl class="workload-profile__averages" aria-label="Per VM averages">
+        <div><dt>Avg vCPU / VM</dt><dd>{{ "%.1f"|format(workload_summary.avg_vcpu_per_vm) }}</dd></div>
+        <div><dt>Avg RAM / VM</dt><dd>{{ "%.1f"|format(workload_summary.avg_memory_gb_per_vm) }} GB</dd></div>
+        <div><dt>Avg storage / VM</dt><dd>{{ "%.0f"|format(workload_summary.avg_storage_gb_per_vm) }} GB</dd></div>
+      </dl>
+    </article>
+  </div>
+
+  {% if workload_summary.unknown_power_count or not workload_summary.support_source_available %}
+    <p class="workload-profile__note">
+      {% if workload_summary.unknown_power_count %}
+        {{ "{:,}".format(workload_summary.unknown_power_count) }} VM(s) have unknown power state.
+      {% endif %}
+      {% if not workload_summary.support_source_available %}
+        OCI Native support source is not loaded; validate supported and review splits before final sign-off.
+      {% endif %}
+    </p>
+  {% endif %}
+</section>

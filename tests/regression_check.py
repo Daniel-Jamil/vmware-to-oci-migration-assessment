@@ -72,6 +72,8 @@ class WorkspaceMarkupParser(HTMLParser):
         self.assessment_panel: dict[str, str | None] | None = None
         self.assessment_import: dict[str, object] | None = None
         self.assessment_export: dict[str, object] | None = None
+        self.assessment_save: dict[str, object] | None = None
+        self.assessment_open: dict[str, object] | None = None
         self._in_stage_select = False
         self._in_stage_footer = False
 
@@ -100,6 +102,10 @@ class WorkspaceMarkupParser(HTMLParser):
             self.assessment_import = {"tag": tag, "attrs": attributes}
         if "data-assessment-export" in attributes:
             self.assessment_export = {"tag": tag, "attrs": attributes}
+        if "data-assessment-save" in attributes:
+            self.assessment_save = {"tag": tag, "attrs": attributes}
+        if "data-assessment-open" in attributes:
+            self.assessment_open = {"tag": tag, "attrs": attributes}
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "select" and self._in_stage_select:
@@ -682,23 +688,32 @@ def validate_current_readiness_routes() -> None:
                 str(readiness),
             )
             check(
-                "zero VCF price excludes OCVS scenarios from ranking",
+                "zero VCF price does not replace host-pricing readiness",
                 all(
                     readiness.get("scenarios", {}).get(scenario_id, {}).get("pricing_state")
                     == "incomplete"
                     and readiness.get("scenarios", {}).get(scenario_id, {}).get("rankable")
                     is False
                     for scenario_id in ("ocvs", "hybrid")
+                )
+                and any(
+                    item.get("title") == "OCVS host pricing incomplete"
+                    for item in readiness.get("advisory_items", [])
+                )
+                and not any(
+                    item.get("title") == "VCF license price not set"
+                    for item in readiness.get("advisory_items", [])
                 ),
                 str(readiness.get("scenarios")),
             )
             check(
                 "fit warnings reach readiness payload and shell",
-                any(
+                not any(
                     item.get("title") == "VCF license price not set"
                     for item in readiness.get("advisory_items", [])
                 )
-                and b"OCVS and Hybrid costs exclude VCF license cost" in response.data,
+                and b"OCVS and Hybrid costs exclude VCF license cost" not in response.data
+                and b"VCF license coverage" in response.data,
                 str(readiness.get("advisory_items")),
             )
 
@@ -798,13 +813,13 @@ def validate_current_readiness_routes() -> None:
                                 "Workbook Status",
                                 "Draft",
                                 "Assessment Readiness",
-                                "Draft review required",
+                                "Draft results available",
                                 "Native Remediation Status",
                                 "Required",
                                 "Native Affected VM Count",
                                 "OCVS Pricing Completeness",
                                 "Hybrid Pricing Completeness",
-                                "Incomplete",
+                                "Complete",
                             )
                         )
                         and any(
@@ -818,12 +833,10 @@ def validate_current_readiness_routes() -> None:
                         all(
                             token in executive_text
                             for token in (
-                                "Assessor Recommendation",
-                                "Recommendation Rationale",
+                                "Specialist Recommendation",
+                                "Internal Notes",
                                 "Unresolved Blockers",
                                 "Unresolved Advisories",
-                                "VCF license price not set",
-                                "OCVS and Hybrid costs exclude VCF license cost",
                                 "Affected VMs",
                                 "vm-legacy-01",
                             )
@@ -833,7 +846,7 @@ def validate_current_readiness_routes() -> None:
                     check(
                         "draft workbook decision uses safe assessor choice and readiness price signal",
                         any(
-                            row[:2] == ["Assessor Decision", "No recommendation yet"]
+                            row[:2] == ["Specialist Decision", "Undecided"]
                             for row in decision_rows
                         )
                         and any(
@@ -914,7 +927,7 @@ def validate_current_readiness_routes() -> None:
                                 "Workbook Status",
                                 "Assessment Readiness",
                                 "Customer ready",
-                                "Assessor Recommendation",
+                                "Specialist Recommendation",
                                 "OCI Native",
                                 "Remediate the affected legacy guest before Native migration.",
                                 "OCVS Pricing Completeness",
@@ -931,7 +944,7 @@ def validate_current_readiness_routes() -> None:
                     check(
                         "customer-ready workbook decision uses assessor Native instead of heuristic Hybrid",
                         any(
-                            row[:2] == ["Assessor Decision", "OCI Native"]
+                            row[:2] == ["Specialist Decision", "OCI Native"]
                             for row in customer_decision_rows
                         )
                         and not any(
@@ -943,7 +956,7 @@ def validate_current_readiness_routes() -> None:
                             for row in customer_decision_rows
                         )
                         and any(
-                            row[:2] == ["Assessor Decision", "OCI Native"]
+                            row[:2] == ["Specialist Decision", "OCI Native"]
                             for row in customer_price_rows
                         )
                         and all(
@@ -956,7 +969,7 @@ def validate_current_readiness_routes() -> None:
                         str(customer_decision_rows),
                     )
                     check(
-                        "assessor decision metadata does not change workbook calculations",
+                        "specialist decision metadata does not change workbook calculations",
                         baseline_numeric_cells == draft_numeric_cells
                         and baseline_formulas == draft_formulas
                         and baseline_calc_signature == draft_calc_signature,
@@ -1083,7 +1096,7 @@ def validate_current_readiness_routes() -> None:
                 and malformed_metadata.get("readiness_label") == "Incomplete"
                 and malformed_metadata.get("customer_ready_export") is False
                 and malformed_metadata.get("recommendation")
-                == "No recommendation yet",
+                == "Undecided",
                 str(malformed_metadata),
             )
 
@@ -2294,25 +2307,32 @@ def validate_workspace_shell_behavior() -> None:
         and len(empty_primary_controls) == 1
         and empty_primary_controls[0]["tag"] != "a"
         and empty_primary_controls[0]["attrs"].get("aria-disabled") == "true"
-        and empty_shell.assessment_export is not None
-        and empty_shell.assessment_export["tag"] == "button"
-        and empty_shell.assessment_export["attrs"].get("aria-disabled") is None,
+        and empty_shell.assessment_trigger is None
+        and empty_shell.assessment_panel is None,
         f"stages={empty_stage_signature}, options={empty_shell.mobile_options}, footer={empty_shell.footer_controls}",
     )
     check(
-        "assessment actions use disclosure semantics",
-        empty_shell.assessment_trigger is not None
-        and empty_shell.assessment_trigger.get("aria-expanded") == "false"
-        and empty_shell.assessment_trigger.get("aria-controls") == "assessment-menu-panel"
-        and "aria-haspopup" not in empty_shell.assessment_trigger
-        and empty_shell.assessment_panel is not None
-        and empty_shell.assessment_panel.get("role") == "region"
+        "workspace header omits noisy assessment dropdown",
+        b"data-assessment-menu" not in empty_response.data
+        and b"data-assessment-menu-trigger" not in empty_response.data
+        and b"assessment-menu-panel" not in empty_response.data
         and "menu" not in empty_shell.roles
         and "menuitem" not in empty_shell.roles
-        and empty_shell.assessment_import is not None
-        and empty_shell.assessment_import["tag"] == "button"
-        and empty_shell.assessment_import["attrs"].get("aria-disabled") is None,
+        and empty_shell.assessment_import is None
+        and empty_shell.assessment_export is None,
         f"trigger={empty_shell.assessment_trigger}, panel={empty_shell.assessment_panel}, roles={empty_shell.roles}",
+    )
+    check(
+        "global header no longer exposes portable JSON actions",
+        b"data-assessment-save" not in empty_response.data
+        and b"data-assessment-open" not in empty_response.data
+        and b">Export assessment JSON</button>" not in empty_response.data
+        and b">Import assessment JSON</button>" not in empty_response.data
+        and b">Save</button>" not in empty_response.data
+        and b">Open</button>" not in empty_response.data
+        and b"Export current assessment" not in empty_response.data
+        and b'href="/#saved-assessments">Save' not in empty_response.data
+        and b'href="/#saved-assessments">Open' not in empty_response.data,
     )
 
     inventory_rows, _ = app_module.load_vms_from_vinfo(str(CSV_INVENTORY))
@@ -2368,8 +2388,8 @@ def validate_workspace_shell_behavior() -> None:
         "configured Setup safely links to Inventory Review",
         len(setup_primary_links) == 1
         and setup_primary_links[0]["attrs"].get("href") == "/step3"
-        and configured_shells[0].assessment_export is not None
-        and configured_shells[0].assessment_export["tag"] == "button",
+        and configured_shells[0].assessment_export is None
+        and configured_shells[0].assessment_import is None,
         str(configured_shells[0].footer_controls),
     )
     for stage_name, shell in zip(["Inventory Review", "Scenario Configuration"], configured_shells[1:]):
@@ -2382,12 +2402,22 @@ def validate_workspace_shell_behavior() -> None:
             ),
             str(shell.footer_controls),
         )
+    inventory_html = configured_responses[1].data.decode("utf-8", errors="replace")
+    scenario_html = configured_responses[2].data.decode("utf-8", errors="replace")
     check(
-        "form-driven stages retain their inner save controls",
-        b'id="continue_step4_form"' in configured_responses[1].data
-        and b"Save & Continue" in configured_responses[1].data
-        and b'id="step4-form"' in configured_responses[2].data
-        and b"Save Settings" in configured_responses[2].data,
+        "form-driven stages retain one shared footer save control",
+        'id="continue_step4_form"' in inventory_html
+        and inventory_html.count('form="continue_step4_form"') == 1
+        and inventory_html.count('inventory-button inventory-button--primary') == 0
+        and "Save &amp; Continue" in inventory_html
+        and 'id="step4-form"' in scenario_html
+        and re.search(
+            r'(?s)<footer[^>]*class="workspace-stage-actions"[^>]*>.*?'
+            r'<button[^>]*form="step4-form"[^>]*name="continue_to_results"[^>]*'
+            r'value="1"[^>]*>.*?Save &amp; Continue.*?</button>',
+            scenario_html,
+        )
+        is not None,
     )
 
 
@@ -2397,6 +2427,10 @@ def validate_workspace_source_contracts() -> None:
     results_css = (ROOT / "static" / "css" / "results.css").read_text(encoding="utf-8")
     workspace_js = (ROOT / "static" / "js" / "workspace.js").read_text(encoding="utf-8")
     redwood_theme = (ROOT / "templates" / "_redwood_theme.html").read_text(encoding="utf-8")
+    base_template = (ROOT / "templates" / "base.html").read_text(encoding="utf-8")
+    readiness_template = (ROOT / "templates" / "_readiness_panel.html").read_text(encoding="utf-8")
+    results_template = (ROOT / "templates" / "_results_comparison.html").read_text(encoding="utf-8")
+    workload_profile_template = (ROOT / "templates" / "_workload_profile.html").read_text(encoding="utf-8")
 
     secondary_button_exclusions = [
         r"button:not\(\.remove\):not\(\.move-btn\):not\(\.btn-secondary\):not\(\.scenario-tab\)\s*\{",
@@ -2414,6 +2448,86 @@ def validate_workspace_source_contracts() -> None:
             and "rgb(47 107 69 / 28%)" not in stylesheet
             for stylesheet in (scenario_css, results_css)
         ),
+    )
+
+    check(
+        "advisory-only readiness review uses an informational tone",
+        "readiness-panel--info" in readiness_template
+        and "readiness-panel--attention" in readiness_template
+        and "Readiness notes" in readiness_template
+        and ".readiness-panel--info" in workspace_css
+        and "#f3faf8" in workspace_css,
+    )
+    check(
+        "Results readiness notes use compact disclosure treatment",
+        "readiness_panel_variant" in base_template
+        and "workspace_stage == 'results'" in base_template
+        and "readiness-panel--compact" in readiness_template
+        and "<details" in readiness_template
+        and "<summary" in readiness_template
+        and ".readiness-panel--compact" in workspace_css,
+    )
+
+    check(
+        "scenario tabs restore Native OCVS Hybrid color identity",
+        all(
+            token in scenario_css
+            for token in (
+                "--scenario-native",
+                "--scenario-ocvs",
+                "--scenario-hybrid",
+                '[data-scenario-tab="native"]',
+                '[data-scenario-tab="ocvs"]',
+                '[data-scenario-tab="hybrid"]',
+                ".scenario-tab::before",
+            )
+        ),
+    )
+
+    check(
+        "Results cards expose modeled rank medals",
+        "result-rank-medal" in results_template
+        and "scenario.price_rank" in results_template
+        and "result-rank-medal--gold" in results_css
+        and "result-rank-medal--silver" in results_css
+        and "result-rank-medal--bronze" in results_css
+        and re.search(r"\.result-scenario__path\s*\{[^}]*white-space:\s*nowrap;", results_css, re.S)
+        is not None
+        and re.search(r"\.result-rank-medal\s*\{[^}]*white-space:\s*nowrap;", results_css, re.S)
+        is not None,
+    )
+    check(
+        "Results migration path cards use aligned colored headers",
+        all(
+            token in results_css
+            for token in (
+                "--result-path-color",
+                "--result-path-soft",
+                "--result-path-line",
+                ".result-scenario--native",
+                ".result-scenario--ocvs",
+                ".result-scenario--hybrid",
+            )
+        )
+        and re.search(
+            r"\.result-scenario__heading\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto;",
+            results_css,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r"\.result-rank-medal\s*\{[^}]*min-width:\s*112px;",
+            results_css,
+            re.S,
+        )
+        is not None,
+    )
+    check(
+        "Results workload profile uses existing summary data and CSS bars",
+        "workload_summary.top_os_rows" in workload_profile_template
+        and "workload-profile__bar-fill" in workload_profile_template
+        and ".workload-profile" in results_css
+        and ".workload-profile__bar-fill" in results_css,
     )
 
     scenario_rule_patterns = [
@@ -2446,6 +2560,18 @@ def validate_workspace_source_contracts() -> None:
         and 'event.key === "Escape"' in workspace_js
         and "closeMenu(true)" in workspace_js
         and "!menu.contains(event.target)" in workspace_js,
+    )
+    check(
+        "assessment JSON save and import share native picker defaults",
+        "showSaveFilePicker" in workspace_js
+        and "createWritable" in workspace_js
+        and "data-assessment-save-form" in workspace_js
+        and "data-assessment-open" in workspace_js
+        and "showOpenFilePicker" in workspace_js
+        and "ASSESSMENT_FILE_PICKER_ID" in workspace_js
+        and "ASSESSMENT_FILE_START_DIRECTORY" in workspace_js
+        and workspace_js.count("id: ASSESSMENT_FILE_PICKER_ID") >= 2
+        and workspace_js.count("startIn: ASSESSMENT_FILE_START_DIRECTORY") >= 2,
     )
 
 
@@ -2581,14 +2707,15 @@ def validate_task12_accessibility_and_responsive_contracts() -> None:
     hybrid_html = responses["Hybrid"].data.decode("utf-8", errors="replace")
     results_html = responses["Results"].data.decode("utf-8", errors="replace")
     check(
-        "Task 12 flash dirty selection and Undo messages are live regions",
+        "Task 12 flash dirty selection messages are live regions without floating Undo",
         all(
             parser.elements_by_id.get("workspace-status", {}).get("role") == "status"
             and parser.elements_by_id.get("workspace-status", {}).get("aria-live") == "polite"
             for parser in parsed.values()
         )
         and re.search(r'data-selection-status(?=[^>]*role="status")(?=[^>]*aria-live="polite")', inventory_html)
-        and re.search(r'id="inventory-undo"(?=[^>]*role="status")(?=[^>]*aria-live="polite")', inventory_html)
+        and 'id="inventory-undo"' not in inventory_html
+        and "data-undo" not in inventory_html
         and len(re.findall(r'data-scenario-dirty-live(?=[^>]*role="status")(?=[^>]*aria-live="polite")', native_html)) == 3,
     )
     check(
@@ -2621,14 +2748,15 @@ def validate_task12_accessibility_and_responsive_contracts() -> None:
     inventory_js = (ROOT / "static" / "js" / "inventory-review.js").read_text(encoding="utf-8")
     scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
     check(
-        "Task 12 sticky mobile actions reserve matching main-content padding",
-        re.search(r"--workspace-mobile-action-reserve:\s*[0-9]+px", workspace_css)
+        "Task 12 fixed stage actions reserve matching main-content padding",
+        re.search(r"--workspace-mobile-action-reserve:\s*[1-9][0-9]+px", workspace_css)
         and re.search(r"#main-workspace\s*\{[^}]*padding-bottom:\s*var\(--workspace-mobile-action-reserve\)", workspace_css, re.S)
-        and re.search(r"\.workspace-stage-actions\s*\{[^}]*min-height:\s*var\(--workspace-mobile-action-reserve\)", workspace_css, re.S),
+        and re.search(r"\.workspace-stage-actions\s*\{[^}]*position:\s*fixed;[^}]*bottom:\s*0;[^}]*min-height:\s*var\(--workspace-mobile-action-reserve\)", workspace_css, re.S),
     )
     check(
-        "Task 12 mobile stage actions stay in document flow without covering controls",
-        re.search(r"\.workspace-stage-actions\s*\{[^}]*position:\s*static;", workspace_css, re.S),
+        "Task 12 fixed stage actions stay aligned to the workspace shell",
+        re.search(r"\.workspace-stage-actions\s*\{[^}]*left:\s*calc\(var\(--workspace-rail-width\)[^;]+;", workspace_css, re.S)
+        and re.search(r"@media \(max-width:\s*920px\).*?\.workspace-stage-actions\s*\{[^}]*left:\s*14px;[^}]*right:\s*14px;", workspace_css, re.S),
     )
     check(
         "Task 12 inventory sort updates header aria-sort semantics",
@@ -2636,10 +2764,11 @@ def validate_task12_accessibility_and_responsive_contracts() -> None:
         and 'control.header.setAttribute("aria-sort", "none")' in inventory_js,
     )
     check(
-        "Task 12 Inventory bulk Undo returns focus to its initiating toolbar control",
-        "undoReturnFocus" in inventory_js
-        and "returnTarget.focus" in inventory_js
-        and "undoButton.focus" not in inventory_js,
+        "Task 12 Inventory bulk actions do not render or wire floating Undo",
+        "undoReturnFocus" not in inventory_js
+        and "undoButton" not in inventory_js
+        and "undoSnapshot" not in inventory_js
+        and "data-undo" not in inventory_js,
     )
     workspace_js = (ROOT / "static" / "js" / "workspace.js").read_text(encoding="utf-8")
     dialog_disclosure_contracts = {
@@ -2693,12 +2822,22 @@ def validate_price_list_dropdown_policy() -> None:
 
 def validate_stage1_setup_redesign() -> None:
     price_file = find_price_file()
+    inventory_rows, inventory_source = app_module.load_vms_from_vinfo(str(INVENTORY_REVIEW_INVENTORY))
+    inventory_info = app_module.build_source_file_info(str(INVENTORY_REVIEW_INVENTORY))
+    inventory_summary = app_module.build_inventory_import_summary(inventory_rows, inventory_source)
 
     with app_module.app.test_client() as client:
         with client.session_transaction() as sess:
             sess["_app_instance_id"] = app_module.APP_INSTANCE_ID
             sess["selected_pricelist_file"] = price_file
             sess["selected_currency"] = "EUR"
+            sess["selected_rvtools_file"] = str(INVENTORY_REVIEW_INVENTORY)
+            sess["rvtools_file_info"] = {
+                "file_path": str(INVENTORY_REVIEW_INVENTORY),
+                "file_name": INVENTORY_REVIEW_INVENTORY.name,
+                "size_kb": inventory_info.get("size_kb", ""),
+            }
+            sess["rvtools_import_summary"] = inventory_summary
 
         response = client.get("/")
         html = response.data.decode("utf-8")
@@ -2720,25 +2859,25 @@ def validate_stage1_setup_redesign() -> None:
 
         assessment_html = assessment_section.group(0) if assessment_section else ""
         check(
-            "Stage 1 Assessment Identity controls are separate",
+            "Stage 1 Assessment Identity asks only for customer project details",
             response.status_code == 200
             and "Assessment Identity" in assessment_html
-            and 'id="assessment_name"' in assessment_html
             and 'id="customer_name"' in assessment_html
             and 'id="assessment_notes"' in assessment_html
-            and "Assessment name" in assessment_html
             and "Customer / project name" in assessment_html
             and ">Notes<" in assessment_html,
         )
         identity_form = re.search(
-            r'<form[^>]*>(?:(?!</form>).)*id="assessment_name".*?</form>',
+            r'<form[^>]*>(?:(?!</form>).)*id="customer_name".*?</form>',
             assessment_html,
             re.S,
         )
         identity_form_html = identity_form.group(0) if identity_form else ""
         check(
-            "Assessment Identity form is the direct save authority",
-            'name="assessment_name"' in identity_form_html
+            "Assessment Identity form saves without a visible assessment name",
+            'name="assessment_name"' not in identity_form_html
+            and 'id="assessment_name"' not in identity_form_html
+            and "Assessment name" not in identity_form_html
             and 'name="customer_name"' in identity_form_html
             and 'name="assessment_notes"' in identity_form_html
             and re.search(
@@ -2780,13 +2919,51 @@ def validate_stage1_setup_redesign() -> None:
 
         inventory_html = inventory_section.group(0) if inventory_section else ""
         check(
-            "Stage 1 inventory mode is a two-option radio control",
+            "Stage 1 inventory source prioritizes RVTools upload and keeps manual entry as a fallback",
             "Inventory Source" in inventory_html
-            and "<fieldset" in inventory_html
-            and "<legend" in inventory_html
+            and "Upload an RVTools export or reuse a previously uploaded file." in inventory_html
+            and "Upload RVTools file" in inventory_html
+            and "Use saved inventory" in inventory_html
+            and "No RVTools file? Create manual summary" in inventory_html
+            and "Manual Workload Summary" in inventory_html
+            and "Upload or catalog" not in inventory_html
+            and "Inventory mode" not in inventory_html
             and len(re.findall(r'name="inventory_mode"', inventory_html)) == 2
             and 'value="upload"' in inventory_html
-            and 'value="manual"' in inventory_html,
+            and 'value="manual"' in inventory_html
+            and inventory_html.index("Upload RVTools file") < inventory_html.index("Use saved inventory")
+            and re.search(r'<details[^>]+class="manual-inventory-fallback"[^>]*>', inventory_html)
+            and not re.search(r'<details[^>]+class="manual-inventory-fallback"[^>]*\sopen(?:\s|=|>)', inventory_html),
+            inventory_html,
+        )
+        inventory_upload_grid = re.search(
+            r'<div class="inventory-upload-grid">(?P<body>.*?)</div>\s*</div>\s*</div>',
+            inventory_html,
+            re.S,
+        )
+        upload_grid_html = inventory_upload_grid.group("body") if inventory_upload_grid else ""
+        index_template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        check(
+            "Stage 1 inventory upload controls share aligned field layout",
+            upload_grid_html.count("inventory-upload-card") == 2
+            and "grid-template-rows: auto auto minmax(40px, 1fr) auto;" in index_template
+            and ".inventory-upload-card .setup-actions" in index_template
+            and "margin-top: auto;" in index_template,
+            upload_grid_html,
+        )
+        check(
+            "Stage 1 warning review remains informational without edit actions",
+            "Inventory quality checks" in inventory_html
+            and "Warning Review" not in inventory_html
+            and "warning-review__action" not in html
+            and "<th>Recommendation</th>" not in inventory_html
+            and "<th>Action</th>" not in inventory_html
+            and "?warning=missing-storage" not in html
+            and "Edit storage" not in html
+            and "Set OCVS" not in html
+            and "Review storage inputs" in html
+            and "Review Native treatment" in html,
+            inventory_html,
         )
 
         details_pattern = r'<details(?=[^>]*data-source-details)[^>]*>.*?</details>'
@@ -3005,16 +3182,17 @@ def validate_stage1_setup_redesign() -> None:
     check(
         "Stage 1 mode script preserves inactive values and manages panel state",
         'input[name="inventory_mode"]' in setup_js_text
+        and "[data-manual-inventory-fallback]" in setup_js_text
+        and "setInventoryMode" in setup_js_text
         and ".hidden =" in setup_js_text
         and 'setAttribute("aria-hidden"' in setup_js_text
         and "errorSummary.focus(" in setup_js_text
-        and ".value =" not in setup_js_text,
+        and re.search(r"\.value\s*=[^=]", setup_js_text) is None,
     )
 
 
 def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
     price_file = find_price_file()
-    assessment_name = "Direct Identity Assessment"
     customer_name = "Direct Identity Customer"
     assessment_notes = "Saved from the visible identity form in one request."
 
@@ -3028,7 +3206,7 @@ def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
         )
         assessment_html = assessment_section.group(0) if assessment_section else ""
         identity_form = re.search(
-            r'<form[^>]*>(?:(?!</form>).)*id="assessment_name".*?</form>',
+            r'<form[^>]*>(?:(?!</form>).)*id="customer_name".*?</form>',
             assessment_html,
             re.S,
         )
@@ -3044,7 +3222,6 @@ def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
             "/",
             data={
                 "action": submitted_action,
-                "assessment_name": assessment_name,
                 "customer_name": customer_name,
                 "assessment_notes": assessment_notes,
             },
@@ -3062,13 +3239,18 @@ def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
             if saved_snapshot_path.is_file()
             else {}
         )
+        generated_name = saved_session_identity["name"]
+        generated_name_matches = re.fullmatch(
+            rf"{re.escape(customer_name)} - \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}",
+            generated_name,
+        )
         check(
-            "identity Save Assessment button persists all visible values in one POST",
+            "identity Save Assessment button persists visible values and auto-generates the assessment name",
             response.status_code == 200
             and submitted_action == "save_assessment"
-            and saved_session_identity
-            == {"name": assessment_name, "customer": customer_name, "notes": assessment_notes}
-            and saved_snapshot.get("name") == assessment_name
+            and generated_name_matches
+            and saved_session_identity == {"name": generated_name, "customer": customer_name, "notes": assessment_notes}
+            and saved_snapshot.get("name") == generated_name
             and saved_snapshot.get("customer_name") == customer_name
             and saved_snapshot.get("notes") == assessment_notes,
             f"action={submitted_action}, session={saved_session_identity}, snapshot={saved_snapshot}",
@@ -3098,7 +3280,6 @@ def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
             "/",
             data={
                 "action": "save_assessment",
-                "assessment_name": assessment_name,
                 "customer_name": customer_name,
                 "assessment_notes": assessment_notes,
             },
@@ -3135,16 +3316,26 @@ def validate_stage1_identity_save_and_loaded_manual_mode() -> None:
             re.S,
         )
         manual_panel_tag = manual_panel.group(0) if manual_panel else ""
+        upload_panel = re.search(
+            r'<div(?=[^>]*data-inventory-mode-panel="upload")[^>]*>',
+            loaded_html,
+            re.S,
+        )
+        upload_panel_tag = upload_panel.group(0) if upload_panel else ""
         with client.session_transaction() as sess:
             loaded_manual_path = str(sess.get("selected_rvtools_file", ""))
         check(
-            "loading saved manual assessment recomputes visible inventory mode",
+            "loading saved manual assessment keeps replacement inventory controls visible",
             response.status_code == 200
             and loaded_manual_path == saved_manual_path
             and manual_radio is not None
             and 'aria-hidden="false"' in manual_panel_tag
-            and re.search(r"\shidden(?:\s|>)", manual_panel_tag) is None,
-            f"loaded={loaded_manual_path}, panel={manual_panel_tag}",
+            and re.search(r"\shidden(?:\s|>)", manual_panel_tag) is None
+            and 'aria-hidden="false"' in upload_panel_tag
+            and re.search(r"\shidden(?:\s|>)", upload_panel_tag) is None
+            and "Upload RVTools File" in loaded_html
+            and "Use Saved Inventory" in loaded_html,
+            f"loaded={loaded_manual_path}, manual_panel={manual_panel_tag}, upload_panel={upload_panel_tag}",
         )
 
         client.post(
@@ -3259,7 +3450,7 @@ def validate_guided_inventory_review() -> None:
         all(expected_issue_fields.issubset(issue) for issue in issues)
         and issues_by_id.get("unsupported-native", {}).get("severity") == "advisory"
         and issues_by_id.get("unknown-os", {}).get("severity") == "advisory"
-        and issues_by_id.get("missing-storage", {}).get("severity") == "critical",
+        and issues_by_id.get("missing-storage", {}).get("severity") == "advisory",
         str(issues),
     )
     unknown_only_rows, _ = app_module.load_vms_from_vinfo(str(UNKNOWN_ONLY_INVENTORY))
@@ -3332,12 +3523,12 @@ def validate_guided_inventory_review() -> None:
         )
         check(
             "inventory review keeps current advisory acknowledgments only",
-            state.get("acknowledged_warning_ids") == ["unsupported-native", "unknown-os"],
+            state.get("acknowledged_warning_ids") == ["unsupported-native", "missing-storage", "unknown-os"],
             str(state.get("acknowledged_warning_ids")),
         )
         check(
-            "inventory review never acknowledges critical warnings",
-            "missing-storage" not in state.get("acknowledged_warning_ids", []),
+            "missing values are handled as acknowledgeable information warnings",
+            "missing-storage" in state.get("acknowledged_warning_ids", []),
             str(state.get("acknowledged_warning_ids")),
         )
 
@@ -3359,7 +3550,8 @@ def validate_guided_inventory_review() -> None:
             and re.search(r'<th[^>]+aria-sort="none"[^>]*>\s*<button[^>]+data-sort=', html)
             and not re.search(r'<button[^>]+data-sort=[^>]+aria-sort=', html)
             and 'data-warning-filter="unsupported-native"' in html
-            and 'id="inventory-undo"' in html
+            and 'id="inventory-undo"' not in html
+            and "data-undo" not in html
             and re.search(r'data-selection-status[^>]+role="status"[^>]+aria-live="polite"', html),
         )
         check(
@@ -3378,14 +3570,52 @@ def validate_guided_inventory_review() -> None:
             and len(re.findall(r'id="inventory-placement-[0-9]+"', html)) == len(rows)
             and all(f'id="{vm_name}"' not in html for vm_name in vm_names),
         )
+        hidden_detail_rows = re.findall(
+            r'<tr[^>]*class="inventory-details-row"[^>]*data-inventory-detail="[^"]+"[^>]*hidden',
+            html,
+        )
         check(
-            "warning filtering exposes affected VM treatment details",
-            "review-unsupported" in html
+            "Stage 2 starts row details collapsed without mobile row duplication",
+            len(hidden_detail_rows) == len(rows)
+            and "Inventory quality notes" in html
+            and "Warning inbox" not in html,
+            f"hidden={len(hidden_detail_rows)}, rows={len(rows)}",
+        )
+        check(
+            "inventory quality notes are merged into the table review flow",
+            "0 blocking" not in html
+            and "0 critical" not in html
+            and (
+                f"{sum(1 for issue in issues if issue.get('severity') == 'advisory')} advisory notes"
+                in html
+            )
+            and "All VMs" in html
+            and "Follow-up" in html
+            and "Use the note filters with the VM inventory table below" in html
+            and "Review in table" not in html
+            and "View affected VMs" not in html
+            and "additional affected VM" not in html
+            and "Affected VMs and detected values" not in html,
+        )
+        check(
+            "warning filtering and note badges keep affected VM values in the inventory table",
+            "warning-item__affected-list" not in html
+            and 'data-warning-filter="unsupported-native"' in html
+            and 'data-warning-item="unsupported-native"' in html
+            and 'data-note-details-target="inventory-details-' in html
+            and "inventory-warning-button" in html
+            and "inventory-note-list" in html
             and "Detected value" in html
-            and "Reason" in html
-            and "Recommended treatment" in html
-            and "Action" in html
-            and "Affected VMs" in html,
+            and "Native migration requires a documented remediation treatment" in html
+            and "warning-item__treatment" not in html
+            and "Recommended treatment" not in html
+            and "Action:" not in html
+        )
+        check(
+            "warning inbox is informational without remediation controls",
+            "I reviewed the affected VMs and treatment." not in html
+            and "Correct in Setup or source inventory" not in html
+            and "warning-item__remediation" not in html,
         )
 
         preserved_state = json.loads(
@@ -3471,7 +3701,7 @@ def validate_guided_inventory_review() -> None:
         f"status={response.status_code}",
     )
 
-    client, critical_state_id = inventory_client(INVENTORY_REVIEW_INVENTORY)
+    client, warning_state_id = inventory_client(INVENTORY_REVIEW_INVENTORY)
     response = client.post(
         "/step3",
         data=MultiDict(
@@ -3480,22 +3710,20 @@ def validate_guided_inventory_review() -> None:
                 ("continue_to_scenarios", "1"),
                 ("included_vm_names", "review-supported"),
                 ("placement:review-supported", "native"),
-                ("acknowledged_warning_ids", "unsupported-native"),
-                ("acknowledged_warning_ids", "unknown-os"),
             ]
         ),
     )
     with app_module.app.test_request_context("/"):
-        app_module.session["state_id"] = critical_state_id
-        critical_blocked_state = app_module.load_app_state()
+        app_module.session["state_id"] = warning_state_id
+        warning_continue_state = app_module.load_app_state()
     check(
-        "inventory review persists valid state while critical issues block Continue",
-        response.status_code == 200
-        and b"Resolve critical inventory issues" in response.data
-        and critical_blocked_state.get("selected_vm_names") == ["review-supported"]
-        and critical_blocked_state.get("step4_hybrid_placements") == {"review-supported": "native"}
-        and critical_blocked_state.get("acknowledged_warning_ids") == ["unsupported-native", "unknown-os"],
-        f"status={response.status_code}, state={critical_blocked_state}",
+        "inventory review warnings persist while Continue remains available",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step4?tab=native")
+        and warning_continue_state.get("selected_vm_names") == ["review-supported"]
+        and warning_continue_state.get("step4_hybrid_placements") == {"review-supported": "native"}
+        and warning_continue_state.get("acknowledged_warning_ids") == [],
+        f"status={response.status_code}, location={response.headers.get('Location')}, state={warning_continue_state}",
     )
 
     client, _ = inventory_client(CSV_INVENTORY)
@@ -3511,9 +3739,10 @@ def validate_guided_inventory_review() -> None:
         ),
     )
     check(
-        "inventory review continue requires advisory acknowledgments",
-        response.status_code == 200 and b"Acknowledge advisory warnings" in response.data,
-        f"status={response.status_code}",
+        "inventory review continue allows unacknowledged advisory warnings",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step4?tab=native"),
+        f"status={response.status_code}, location={response.headers.get('Location')}",
     )
 
     client, _ = inventory_client(CSV_INVENTORY)
@@ -3556,16 +3785,50 @@ def validate_guided_inventory_review() -> None:
     )
 
     inventory_js = (ROOT / "static" / "js" / "inventory-review.js").read_text(encoding="utf-8")
+    inventory_css = (ROOT / "static" / "css" / "inventory-review.css").read_text(encoding="utf-8")
+    mobile_hidden_columns_match = re.search(
+        r"@media \(max-width: 767px\).*?#inventory-table \.inventory-col-power(?P<block>.*?)\{\s*display:\s*none;",
+        inventory_css,
+        re.S,
+    )
+    mobile_hidden_columns = mobile_hidden_columns_match.group("block") if mobile_hidden_columns_match else ""
     check(
-        "inventory controller uses bounded cached interactions",
+        "inventory controller uses bounded cached interactions without floating undo state",
         "const rowRecords" in inventory_js
+        and "function visibleRecords" in inventory_js
         and "clearTimeout(searchTimer)" in inventory_js
         and "setTimeout" in inventory_js
-        and "changedRecords" in inventory_js
+        and "function runBulk" in inventory_js
         and "placementsByIndex" in inventory_js
-        and "Object.prototype.hasOwnProperty.call(saved" in inventory_js
         and "snapshotState" not in inventory_js
+        and "undoSnapshot" not in inventory_js
+        and "undoButton" not in inventory_js
         and '.closest("th")' in inventory_js,
+    )
+    check(
+        "inventory row details remain reachable on mobile without rendering every detail row",
+        "function syncDetailVisibility(record)" in inventory_js
+        and "function setDetailsOpen(record, open)" in inventory_js
+        and "noteButton" in inventory_js
+        and "[data-note-details-target]" in inventory_js
+        and "record.detailRow.hidden = !rowVisible || !detailsOpen" in inventory_js
+        and ".inventory-col-details" not in mobile_hidden_columns,
+        mobile_hidden_columns,
+    )
+    check(
+        "inventory quality note context is compact and table-integrated",
+        re.search(
+            r"\.warning-inbox__summary\s*\{[^}]*display:\s*grid;",
+            inventory_css,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r"\.warning-context\s*\{[^}]*display:\s*grid;",
+            inventory_css,
+            re.S,
+        )
+        is not None,
     )
 
 
@@ -3661,13 +3924,13 @@ def validate_inventory_review_transactions_and_step4_boundary() -> None:
     )
     state_after_not_ready = read_state(state_id)
     check(
-        "inventory review persists valid state while advisories block Continue",
-        response.status_code == 200
-        and b"Acknowledge advisory warnings" in response.data
+        "inventory review persists valid state while advisories remain nonblocking",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step4?tab=native")
         and state_after_not_ready.get("selected_vm_names") == ["vm-db-01"]
         and state_after_not_ready.get("step4_hybrid_placements") == {"vm-db-01": "native"}
         and state_after_not_ready.get("acknowledged_warning_ids") == [],
-        str(state_after_not_ready),
+        f"status={response.status_code}, location={response.headers.get('Location')}, state={state_after_not_ready}",
     )
     state_before_save_failure = state_after_not_ready
 
@@ -3716,13 +3979,13 @@ def validate_inventory_review_transactions_and_step4_boundary() -> None:
     )
     legacy_state = read_state(legacy_state_id)
     check(
-        "legacy inventory action cannot bypass review readiness",
-        response.status_code == 200
-        and b"Acknowledge advisory warnings" in response.data
+        "legacy inventory action saves valid state and returns to the current review boundary",
+        response.status_code in {302, 303}
+        and response.headers.get("Location", "").endswith("/step3")
         and legacy_state != legacy_prior
         and legacy_state.get("selected_vm_names") == ["vm-app-01"]
         and legacy_state.get("step4_hybrid_placements") == {"vm-app-01": "native"},
-        f"status={response.status_code}, state={legacy_state}",
+        f"status={response.status_code}, location={response.headers.get('Location')}, state={legacy_state}",
     )
 
     boundary_client, boundary_state_id = new_client()
@@ -3882,6 +4145,21 @@ def validate_large_inventory_review_containment() -> None:
         is not None
         and "#inventory-table tbody tr[data-inventory-row] .inventory-col-name" in inventory_css,
     )
+    check(
+        "desktop inventory bulk placement aligns Apply with the select control",
+        re.search(
+            r"\.inventory-command-group--placement\s*\{[^}]*align-items:\s*flex-end;",
+            inventory_css,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r"\.inventory-command-group--placement\s+\.inventory-button\s*\{[^}]*align-self:\s*flex-end;",
+            inventory_css,
+            re.S,
+        )
+        is not None,
+    )
 
 
 def validate_task7_native_scenario_workspace() -> None:
@@ -4035,6 +4313,19 @@ def validate_task7_native_scenario_workspace() -> None:
         "Native desktop and mobile rendering share one submitted control tree",
         all(count == 50 for count in submitted_control_counts.values()),
         str(submitted_control_counts),
+    )
+    native_pagination = re.search(
+        r'<nav\b[^>]*class="[^"]*native-pagination[^"]*"[^>]*>(.*?)</nav>',
+        html,
+        re.S,
+    )
+    native_pagination_html = native_pagination.group(1) if native_pagination else ""
+    check(
+        "Native pagination separates page status from a bounded page list",
+        native_pagination is not None
+        and 'class="native-pagination__status"' in native_pagination_html
+        and 'class="native-pagination__list"' in native_pagination_html,
+        native_pagination_html[:800],
     )
     mobile_nav = re.search(
         r'<div\b[^>]*data-native-mobile-nav[^>]*>(.*?)</div>',
@@ -4390,18 +4681,8 @@ def validate_task7_native_scenario_workspace() -> None:
             re.S,
         )
         is not None
-        and re.search(
-            r'data-result-scenario="ocvs"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
-            price_html,
-            re.S,
-        )
-        is not None
-        and re.search(
-            r'data-result-scenario="hybrid"[^>]*data-readiness-state="incomplete".*?result-status--blocked"[^>]*>.*?Incomplete',
-            price_html,
-            re.S,
-        )
-        is not None
+        and 'data-result-scenario="ocvs"' in price_html
+        and 'data-result-scenario="hybrid"' in price_html
         and all(
             label in price_html
             for label in (
@@ -4413,48 +4694,83 @@ def validate_task7_native_scenario_workspace() -> None:
                 "Assumptions and sizing",
                 "Benefits",
                 "Trade-offs",
-                "Remediation requirements",
             )
         ),
     )
     check(
-        "Task 9 incomplete scenarios remain visible but cannot receive the low-price label",
-        price_html.count("Incomplete pricing") >= 2
-        and price_html.count("Partial modeled amount") >= 2
-        and price_html.count("Lowest complete modeled price") == 1
-        and re.search(r"data-result-scenario=\"native\".*?Lowest complete modeled price", price_html, re.S)
-        is not None
-        and re.search(r"data-result-scenario=\"ocvs\".*?Incomplete pricing", price_html, re.S)
-        is not None
-        and re.search(r"data-result-scenario=\"hybrid\".*?Incomplete pricing", price_html, re.S)
-        is not None,
+        "Task 9 Results removes remediation requirements and VCF blocker copy",
+        "Remediation requirements" not in price_html
+        and "VCF license price not set" not in price_html
+        and "Lowest complete modeled price" not in price_html
+        and (
+            price_html.count("Complete pricing")
+            + price_html.count("Incomplete pricing")
+        ) >= 3
+        and (
+            price_html.count("Complete modeled amount")
+            + price_html.count("Partial modeled amount")
+        ) >= 3,
     )
     check(
-        "Task 9 Results has no automatic choice or medal language",
+        "Task 9 Results has no automatic choice language",
         re.search(
-            r"\b(medal|winner|best|recommended)\b",
+            r"\b(winner|best)\b",
             visible_text_outside_details(price_response.data),
             re.I,
         )
         is None
-        and "Rank 1" not in price_html
         and "automatic recommendation" not in price_html.lower(),
     )
     check(
-        "Task 9 recommendation and draft export controls are explicit and accessible",
+        "Task 9 Results displays modeled rank medals",
+        price_html.count("result-rank-medal") >= 3
+        and "Rank 1" in price_html
+        and "Rank 2" in price_html
+        and "Rank 3" in price_html
+        and "result-rank-medal--gold" in price_html
+        and "result-rank-medal--silver" in price_html
+        and "result-rank-medal--bronze" in price_html,
+    )
+    check(
+        "Task 9 Results compacts informational readiness notes",
+        "readiness-panel--compact" in price_html
+        and "<details" in price_html
+        and "<summary" in price_html
+        and "View informational notes" in price_html,
+    )
+    check(
+        "Task 9 Results restores workload profile analytics",
+        'data-workload-profile' in price_html
+        and "Operating system mix" in price_html
+        and "Power state" in price_html
+        and "OCI Native readiness" in price_html
+        and "Avg vCPU / VM" in price_html,
+    )
+    check(
+        "Task 9 recommendation and export controls distinguish draft status from Excel action",
         'name="recommendation"' in price_html
         and all(f'value="{value}"' in price_html for value in ("native", "ocvs", "hybrid", ""))
-        and "No recommendation yet" in price_html
+        and "Migration specialist recommendation" in price_html
+        and "Save the recommended path for the report. This choice does not recalculate costs or change the ranking." in price_html
+        and "Record the preferred path for internal review. This does not change modeled pricing." not in price_html
+        and "Recommended path" in price_html
+        and "Undecided" in price_html
+        and "Internal notes" in price_html
+        and "Optional notes explaining the recommendation." in price_html
+        and "Save decision" in price_html
+        and "Assessor recommendation" not in price_html
+        and "Required for customer-ready Native treatment" not in price_html
         and 'name="recommendation_rationale"' in price_html
         and 'maxlength="4000"' in price_html
         and 'aria-live="polite"' in price_html
         and 'value="save_assessment"' in price_html
         and 'value="export_excel"' in price_html
         and re.search(
-            r'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+            r'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
             price_html,
         )
         is not None
+        and "Export Draft" not in price_html
         and "export_json" not in price_html
         and "Portable JSON" not in price_html,
     )
@@ -4539,7 +4855,7 @@ def validate_task7_native_scenario_workspace() -> None:
     )
     malformed_type_results: list[tuple[str, bool]] = []
     for field_name, expected_error in (
-        ("recommendation", "Assessor recommendation must be text."),
+        ("recommendation", "Specialist recommendation must be text."),
         ("recommendation_rationale", "Recommendation rationale must be text."),
     ):
         for value_label, malformed_value in malformed_recommendation_values:
@@ -4775,6 +5091,21 @@ def validate_task7_native_scenario_workspace() -> None:
             re.S,
         ) is not None,
     )
+    check(
+        "Native pagination keeps long page sets bounded and aligned",
+        ".native-pagination__status" in scenarios_css
+        and ".native-pagination__list" in scenarios_css
+        and re.search(
+            r"\.native-pagination__list\s*\{[^}]*flex-wrap:\s*wrap;",
+            scenarios_css,
+            re.S,
+        ) is not None
+        and re.search(
+            r"\.native-pagination__list\s*\{[^}]*max-width:\s*100%;",
+            scenarios_css,
+            re.S,
+        ) is not None,
+    )
 
 
 def validate_task8_ocvs_hybrid_configuration() -> None:
@@ -4856,15 +5187,15 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         and f"{selected_discount:.0f}% selected-shape discount" in zero_vcf_html,
     )
     check(
-        "Zero VCF price preserves infrastructure subtotal but blocks ranking",
-        'data-ocvs-readiness-state="incomplete"' in zero_vcf_html
-        and 'data-ocvs-rankable="false"' in zero_vcf_html
-        and 'data-hybrid-rankable="false"' in zero_vcf_html
+        "Zero VCF price preserves infrastructure subtotal and stays rankable",
+        'data-ocvs-readiness-state="ready"' in zero_vcf_html
+        and 'data-ocvs-rankable="true"' in zero_vcf_html
+        and 'data-hybrid-rankable="true"' in zero_vcf_html
         and re.search(r'data-ocvs-infrastructure-subtotal="[1-9][0-9.]*"', zero_vcf_html) is not None
         and "Infrastructure subtotal" in zero_vcf_html
-        and "Unit price required" in zero_vcf_html
-        and "Partial monthly total" in zero_vcf_html
-        and "Pricing incomplete" in zero_vcf_html,
+        and "Optional add-on" in zero_vcf_html
+        and "Base monthly total" in zero_vcf_html
+        and "Pricing incomplete" not in zero_vcf_html,
     )
 
     hybrid_response = client.get("/step4?tab=hybrid")
@@ -4878,14 +5209,20 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         and f'data-hybrid-ocvs-priced-count="{expected_plan["ocvs_priced_count"]}"' in hybrid_html
         and f'data-hybrid-manual-override-count="{expected_plan["manual_override_count"]}"' in hybrid_html
         and "OCVS Subset Sizing" in hybrid_html
-        and "Shared OCVS assumptions" in hybrid_html
-        and 'href="/step4?tab=ocvs"' in hybrid_html,
+        and "Hybrid OCVS assumptions" in hybrid_html
+        and "Inherited from OCVS scenario" in hybrid_html
+        and 'name="hybrid_ocvs_profile"' in hybrid_html
+        and 'name="hybrid_vmware_license_price_per_core_yearly"' in hybrid_html,
     )
     check(
-        "Hybrid owns one keyed placement control per selected VM and no shared VCF input",
+        "Hybrid owns keyed placement controls and separate OCVS assumption inputs",
         len(re.findall(r'<select\b[^>]*data-hybrid-placement-select', hybrid_html, re.S)) == len(selected_names)
         and all(hybrid_html.count(f'name="hybrid_placement:{name}"') == 1 for name in selected_names)
-        and hybrid_html.count('name="vmware_license_price_per_core_yearly"') == 1,
+        and hybrid_html.count('name="vmware_license_price_per_core_yearly"') == 1
+        and hybrid_html.count('name="hybrid_vmware_license_price_per_core_yearly"') == 1
+        and hybrid_html.count('name="hybrid_ocvs_commitment_term"') == 1
+        and hybrid_html.count('name="hybrid_ocvs_vcpu_per_ocpu"') == 1
+        and hybrid_html.count('name="hybrid_ocvs_standard_storage_vpu"') == 1,
     )
 
     with app_module.app.test_request_context("/"):
@@ -4989,16 +5326,74 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         and "Unit price required" not in positive_hybrid_html,
     )
     check(
-        "VCF pricing remains single-owned by OCVS and is consumed by Hybrid",
+        "Hybrid defaults inherit OCVS pricing until customized",
         positive_vcf_html.count('name="vmware_license_price_per_core_yearly"') == 1
+        and positive_vcf_html.count('name="hybrid_vmware_license_price_per_core_yearly"') == 1
         and positive_hybrid_html.count('name="vmware_license_price_per_core_yearly"') == 1
+        and positive_hybrid_html.count('name="hybrid_vmware_license_price_per_core_yearly"') == 1
         and re.search(
-            r'name="vmware_license_price_per_core_yearly"[^>]*value="360\.00"',
+            r'name="hybrid_vmware_license_price_per_core_yearly"[^>]*value="360\.00"',
             positive_hybrid_html,
             re.S,
         )
         is not None
         and 'data-hybrid-rankable="true"' in positive_hybrid_html,
+    )
+
+    def hybrid_save_form(vcf_price: str, *, commitment_term: str = "payg") -> MultiDict:
+        form = MultiDict(
+            [
+                ("action", "save"),
+                ("active_scenario", "hybrid"),
+                ("hybrid_ocvs_profile", "BM.Standard.E4.128"),
+                ("hybrid_ocvs_commitment_term", commitment_term),
+                ("hybrid_ocvs_vcpu_per_ocpu", str(ocvs_policy["vcpu_per_ocpu"])),
+                ("hybrid_ocvs_cpu_headroom_pct", str(ocvs_policy["cpu_headroom_pct"])),
+                ("hybrid_ocvs_memory_headroom_pct", str(ocvs_policy["memory_headroom_pct"])),
+                ("hybrid_ocvs_storage_headroom_pct", str(ocvs_policy["storage_headroom_pct"])),
+                ("hybrid_ocvs_dense_vsan_usable_pct", str(ocvs_policy["dense_vsan_usable_pct"])),
+                ("hybrid_ocvs_standard_storage_vpu", str(ocvs_policy["standard_storage_vpu"])),
+                ("hybrid_ocvs_dr_nodes", "0"),
+                ("hybrid_vmware_license_price_per_core_yearly", vcf_price),
+            ]
+        )
+        for name in selected_names:
+            form.add(f"hybrid_placement:{name}", placements[name])
+        return form
+
+    hybrid_custom_post = client.post(
+        "/step4",
+        data=hybrid_save_form("120.00", commitment_term="payg"),
+        follow_redirects=False,
+    )
+    hybrid_custom_response = client.get(hybrid_custom_post.headers.get("Location", ""))
+    hybrid_custom_html = hybrid_custom_response.data.decode("utf-8", errors="replace")
+    with app_module.app.test_request_context("/"):
+        app_module.session["state_id"] = state_id
+        customized_state = app_module.load_app_state()
+    check(
+        "Hybrid OCVS assumptions persist separately after customization",
+        hybrid_custom_post.status_code in {302, 303}
+        and hybrid_custom_post.headers.get("Location", "").endswith("/step4?tab=hybrid")
+        and customized_state.get("step4_ocvs_commitment_term") == "3_year"
+        and customized_state.get("step4_vmware_license_price_per_core_yearly") == 360.0
+        and customized_state.get("step4_hybrid_ocvs_customized") is True
+        and customized_state.get("step4_hybrid_ocvs_commitment_term") == "payg"
+        and customized_state.get("step4_hybrid_vmware_license_price_per_core_yearly") == 120.0
+        and "Customized for Hybrid" in hybrid_custom_html
+        and re.search(
+            r'name="hybrid_vmware_license_price_per_core_yearly"[^>]*value="120\.00"',
+            hybrid_custom_html,
+            re.S,
+        )
+        is not None
+        and re.search(
+            r'name="vmware_license_price_per_core_yearly"[^>]*value="360\.00"',
+            hybrid_custom_html,
+            re.S,
+        )
+        is not None,
+        f"status={hybrid_custom_post.status_code}, location={hybrid_custom_post.headers.get('Location')}",
     )
 
     scenario_js = (ROOT / "static" / "js" / "scenario-editor.js").read_text(encoding="utf-8")
@@ -5014,6 +5409,7 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
     rendered_scalar_fields = (
         "action",
         "active_scenario",
+        "continue_to_results",
         "native_page",
         "native_page_size",
         "native_search",
@@ -5182,10 +5578,11 @@ def validate_task8_ocvs_hybrid_configuration() -> None:
         and normalized_corrupt_state.get("step4_vmware_license_price_per_core_yearly") == 0.0
         and normalized_policy == app_module.OCVS_DEFAULT_SIZING_POLICY
         and 'value="0.00"' in corrupt_html
-        and "Unit price required" in corrupt_html
-        and 'data-ocvs-readiness-state="incomplete"' in corrupt_html
-        and 'data-ocvs-rankable="false"' in corrupt_html
-        and 'data-hybrid-rankable="false"' in corrupt_html
+        and "Optional add-on" in corrupt_html
+        and "Unit price required" not in corrupt_html
+        and 'data-ocvs-readiness-state="ready"' in corrupt_html
+        and 'data-ocvs-rankable="true"' in corrupt_html
+        and 'data-hybrid-rankable="true"' in corrupt_html
     )
     state_path.write_bytes(baseline_state_bytes)
     snapshot_path.write_bytes(baseline_snapshot_bytes)
@@ -5286,11 +5683,11 @@ def validate_manual_sizing_input() -> None:
         )
         check(
             "manual warning review lists affected vm",
-            b"Warning Review" in response.data
+            b"Inventory quality checks" in response.data
             and b"Unsupported for OCI Native" in response.data
             and b"manual-vm-006" in response.data
             and b"Solaris 11.4" in response.data
-            and b"Set OCVS" in response.data,
+            and b"Review Native treatment" in response.data,
         )
 
         with client.session_transaction() as sess:
@@ -5526,11 +5923,15 @@ def validate_saved_assessments() -> None:
     with app_module.app.test_client() as client:
         response = client.get("/")
         check(
-            "empty saved assessment list still shows load controls",
+            "empty saved assessment list uses concise load controls",
             response.status_code == 200
-            and b"Load Previous Assessment" in response.data
+            and b"Saved Assessments" in response.data
+            and b"Saved assessment" in response.data
             and b"No saved assessments yet" in response.data
-            and b'name="assessment_id"' in response.data,
+            and b'name="assessment_id"' in response.data
+            and b"Load Previous Assessment" not in response.data
+            and b"Reopen or remove a locally saved workspace." not in response.data
+            and b"Previously saved" not in response.data,
         )
 
         client.post(
@@ -5693,6 +6094,144 @@ def validate_saved_assessments() -> None:
             all(assessment.get("id") != saved_assessment_id for assessment in app_module.list_saved_assessments()),
             str(app_module.list_saved_assessments()),
         )
+        app_module.save_preferences({})
+
+
+def validate_start_fresh_assessment() -> None:
+    price_file = find_price_file()
+    _price_lookup, expected_currency, _source_file = app_module.load_price_lookup(price_file)
+    expected_currency = str(expected_currency or "").upper().strip()
+
+    with app_module.app.test_client() as client:
+        response = client.get("/")
+        response_html = response.data.decode("utf-8", errors="ignore")
+        header_html_match = re.search(r'<header class="workspace-header">.*?</header>', response_html, re.S)
+        header_html = header_html_match.group(0) if header_html_match else ""
+        saved_assessments_match = re.search(
+            r'<div id="saved-assessments".*?</div>\s*</section>',
+            response_html,
+            re.S,
+        )
+        saved_assessments_html = saved_assessments_match.group(0) if saved_assessments_match else ""
+        check(
+            "start fresh action renders in guided header",
+            response.status_code == 200
+            and 'data-start-fresh-assessment' in header_html
+            and 'value="start_fresh_assessment"' in header_html
+            and "Start Fresh Assessment" in header_html
+            and "workspace-action--primary" in header_html
+            and "setup-button--danger" not in header_html
+            and 'value="start_fresh_assessment"' not in saved_assessments_html,
+        )
+
+        client.post(
+            "/",
+            data={"action": "select_pricelist", "price_list_file": price_file},
+        )
+        response = client.post(
+            "/",
+            data={
+                "action": "create_manual_inventory",
+                "inventory_mode": "manual",
+                "manual_vm_count": "2",
+                "manual_total_vcpus": "8",
+                "manual_total_memory_gb": "32",
+                "manual_total_storage_gb": "400",
+                "manual_supported_vm_count": "2",
+                "manual_unsupported_vm_count": "0",
+            },
+        )
+        with client.session_transaction() as sess:
+            source_inventory_file = str(sess.get("selected_rvtools_file", ""))
+        source_state = app_module.load_app_state()
+        check(
+            "start fresh source inventory created",
+            response.status_code == 200
+            and "/manual/" in source_inventory_file.replace("\\", "/")
+            and source_state.get("selected_vm_names") == ["manual-vm-001", "manual-vm-002"],
+            f"file={source_inventory_file}, state={source_state}",
+        )
+
+        response = client.post(
+            "/",
+            data={
+                "action": "save_assessment",
+                "customer_name": "Reset Source Customer",
+                "assessment_notes": "This saved assessment should stay available.",
+            },
+        )
+        check("start fresh source assessment saved", response.status_code == 200 and b"Assessment saved." in response.data)
+
+        saved_assessments = app_module.list_saved_assessments()
+        saved_assessment = next(
+            assessment
+            for assessment in saved_assessments
+            if assessment.get("customer_name") == "Reset Source Customer"
+        )
+        saved_assessment_id = str(saved_assessment["id"])
+
+        state = app_module.load_app_state()
+        state["selected_vm_names"] = ["manual-vm-001", "manual-vm-002"]
+        state["step4_ocvs_commitment_term"] = "3_year"
+        state["step4_iaas_discount_pct"] = 22.0
+        state["step4_hybrid_placements"] = {"manual-vm-001": "native"}
+        state["acknowledged_warning_ids"] = ["unsupported-native"]
+        state["assessor_recommendation"] = "hybrid"
+        state["assessor_recommendation_rationale"] = "Use mixed placement."
+        app_module.save_app_state(state)
+        app_module.save_step4_snapshot({"active_scenario": "hybrid", "rows": ["manual-vm-001"]})
+        with client.session_transaction() as sess:
+            sess["last_export_file"] = "downloads/exports/reset_source.xlsx"
+            sess["rvtools_rejected_info"] = {"file_name": "bad.xlsx"}
+
+        response = client.post("/", data={"action": "start_fresh_assessment"})
+        response_html = response.data.decode("utf-8", errors="ignore")
+        check(
+            "start fresh clears guided workspace",
+            response.status_code == 200
+            and "Started a fresh assessment" in response_html
+            and "Start Fresh Assessment" in response_html,
+        )
+
+        with client.session_transaction() as sess:
+            selected_price_file = str(sess.get("selected_pricelist_file", ""))
+            selected_currency = str(sess.get("selected_currency", ""))
+            cleared_customer = str(sess.get("customer_name", ""))
+            cleared_inventory = str(sess.get("selected_rvtools_file", ""))
+            cleared_assessment_name = str(sess.get("active_assessment_name", ""))
+            cleared_assessment_notes = str(sess.get("active_assessment_notes", ""))
+            cleared_last_export = str(sess.get("last_export_file", ""))
+            rejected_info = sess.get("rvtools_rejected_info")
+
+        reset_state = app_module.load_app_state()
+        check("start fresh preserves price list", selected_price_file == price_file, selected_price_file)
+        check("start fresh preserves currency", selected_currency == expected_currency, selected_currency)
+        check(
+            "start fresh clears active session",
+            not cleared_customer
+            and not cleared_inventory
+            and not cleared_assessment_name
+            and not cleared_assessment_notes
+            and not cleared_last_export
+            and rejected_info is None,
+        )
+        check(
+            "start fresh resets guided app state",
+            reset_state.get("selected_vm_names") == []
+            and reset_state.get("step4_ocvs_commitment_term") == "payg"
+            and reset_state.get("step4_iaas_discount_pct") == 0.0
+            and reset_state.get("step4_hybrid_placements") == {}
+            and reset_state.get("acknowledged_warning_ids") == []
+            and reset_state.get("assessor_recommendation") == ""
+            and reset_state.get("assessor_recommendation_rationale") == "",
+            str(reset_state),
+        )
+        check("start fresh clears guided step4 snapshot", app_module.load_step4_snapshot() == {})
+        check(
+            "start fresh keeps saved assessment",
+            any(assessment.get("id") == saved_assessment_id for assessment in app_module.list_saved_assessments()),
+        )
+        app_module.delete_saved_assessment(saved_assessment_id)
         app_module.save_preferences({})
 
 
@@ -5887,16 +6426,13 @@ def validate_portable_assessments() -> None:
         shell = parse_workspace_markup(shell_response.data)
         results_response = client.get("/step4?tab=price")
         check(
-            "Task 10 global and Results portability controls are enabled",
+            "Task 10 Results portability controls remain enabled without global header menu",
             shell_response.status_code == 200
-            and shell.assessment_export is not None
-            and shell.assessment_export["tag"] == "button"
-            and shell.assessment_export["attrs"].get("aria-disabled") is None
-            and shell.assessment_import is not None
-            and shell.assessment_import["tag"] == "button"
-            and shell.assessment_import["attrs"].get("aria-disabled") is None
-            and b'name="assessment_file"' in shell_response.data
-            and b'action="/assessment/import"' in shell_response.data
+            and shell.assessment_export is None
+            and shell.assessment_import is None
+            and b"data-assessment-menu" not in shell_response.data
+            and b'name="assessment_file"' not in shell_response.data
+            and b'action="/assessment/import"' not in shell_response.data
             and results_response.status_code == 200
             and b'value="export_assessment"' in results_response.data
             and b'name="assessment_file"' in results_response.data
@@ -6072,10 +6608,10 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
             if is_results_route:
                 check(
                     f"{route} controls render",
-                    b"Save recommendation" in response.data
+                    b"Save decision" in response.data
                     and b"Save assessment" in response.data
                     and re.search(
-                        rb'<button type="submit" class="results-button">\s*Export Draft\s*</button>',
+                        rb'<button type="submit" class="results-button">\s*Export Excel\s*</button>',
                         response.data,
                     )
                     is not None,
@@ -6088,13 +6624,14 @@ def run_workflow_and_export() -> tuple[Path, dict[str, object]]:
                 check(
                     f"{route} controls render",
                     b"Save Settings" in response.data
-                    and b"Export to Excel" in response.data,
+                    and b"Export to Excel" not in response.data
+                    and b"Export Excel" not in response.data,
                 )
                 check(
-                    f"{route} export status UI renders",
-                    b'id="export-status"' in response.data
-                    and b"Excel export created:" in response.data
-                    and b"Open file" in response.data,
+                    f"{route} has no scenario export status UI",
+                    b'id="export-status"' not in response.data
+                    and b"Excel export created:" not in response.data
+                    and b"Open file" not in response.data,
                 )
             check(f"{route} has no JSON export", b"Export to JSON" not in response.data and b"Export to Json" not in response.data)
             response_text = response.data.decode("utf-8", errors="ignore")
@@ -6353,7 +6890,7 @@ def validate_workbook(workbook_path: Path) -> None:
             ),
         )
         check(
-            "executive summary includes draft readiness and assessor recommendation",
+            "executive summary includes draft readiness and specialist recommendation",
             all(
                 token in sheet_data["Executive Summary"][0]
                 for token in (
@@ -6361,10 +6898,10 @@ def validate_workbook(workbook_path: Path) -> None:
                     "Workbook Status",
                     "Draft",
                     "Assessment Readiness",
-                    "Incomplete",
-                    "Assessor Recommendation",
+                    "Draft results available",
+                    "Specialist Recommendation",
                     "Hybrid",
-                    "Recommendation Rationale",
+                    "Internal Notes",
                     "=1+1; preserve this assessor rationale as literal text.",
                 )
             ),
@@ -6372,7 +6909,7 @@ def validate_workbook(workbook_path: Path) -> None:
         )
         executive_xml = zf.read(sheet_map["Executive Summary"]).decode("utf-8")
         check(
-            "assessor recommendation text stays literal in workbook XML",
+            "specialist recommendation text stays literal in workbook XML",
             "<t>=1+1; preserve this assessor rationale as literal text.</t>"
             in executive_xml
             and "<f>=1+1; preserve this assessor rationale as literal text.</f>"
@@ -6402,7 +6939,7 @@ def validate_workbook(workbook_path: Path) -> None:
             decision_rows = executive_rows[decision_start + 1 : decision_end]
         check(
             "executive decision readout uses assessor choice and readiness-derived price label",
-            any(row[:2] == ["Assessor Decision", "Hybrid"] for row in decision_rows)
+            any(row[:2] == ["Specialist Decision", "Hybrid"] for row in decision_rows)
             and any(
                 row and row[0] == "Lowest complete modeled price"
                 for row in decision_rows
@@ -6649,6 +7186,7 @@ def main() -> None:
     validate_manual_sizing_input()
     validate_app_state_review_inputs()
     validate_saved_assessments()
+    validate_start_fresh_assessment()
     validate_portable_assessments()
     validate_step3_duplicate_removal()
     validate_guided_inventory_review()

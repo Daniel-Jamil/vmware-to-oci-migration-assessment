@@ -987,7 +987,7 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             response = fixture["client"].get("/")
 
         self.assertEqual(200, response.status_code)
-        self.assertIn(b'action="/assessment/import"', response.data)
+        self.assertNotIn(b'action="/assessment/import"', response.data)
         with app_module.app.test_request_context("/step4?tab=price"):
             template = app_module.app.jinja_env.get_template("_export_center.html")
             export_center = template.render(
@@ -2343,13 +2343,18 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             imported_root = fixture["downloads"] / "imported_assessments"
             self.assertFalse(imported_root.exists() and any(imported_root.iterdir()))
 
-    def test_global_and_results_portability_controls_are_enabled(self) -> None:
+    def test_results_portability_controls_are_enabled_without_header_menu(self) -> None:
         with isolated_portability_client() as fixture:
             response = fixture["client"].get("/")
             html = response.data.decode("utf-8")
             self.assertEqual(200, response.status_code)
-            self.assertIn('value="export_assessment"', html)
-            self.assertIn('name="assessment_file"', html)
+            self.assertNotIn("data-assessment-menu", html)
+            self.assertNotIn('value="export_assessment"', html)
+            self.assertNotIn('name="assessment_file"', html)
+            self.assertNotIn("Export assessment JSON", html)
+            self.assertNotIn("Import assessment JSON", html)
+            self.assertNotIn(">Save</button>", html)
+            self.assertNotIn(">Open</button>", html)
             self.assertNotIn("Portable assessment import is not available yet", html)
             self.assertNotRegex(
                 html,
@@ -2368,6 +2373,10 @@ class PortableAssessmentRouteTests(unittest.TestCase):
             )
         self.assertIn('value="export_assessment"', html)
         self.assertIn('name="assessment_file"', html)
+        self.assertIn("Export assessment JSON", html)
+        self.assertIn("Import assessment JSON", html)
+        self.assertIn("data-assessment-save-form", html)
+        self.assertIn("data-assessment-open-form", html)
 
 
 if __name__ == "__main__":

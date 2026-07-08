@@ -21,7 +21,7 @@ from typing import Any
 from uuid import uuid4
 from xml.sax.saxutils import escape as xml_escape
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 import time
 
@@ -67,6 +67,41 @@ def _env_bool(*names: str, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return str(raw_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_internal_return_path(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    target = value.strip()
+    if (
+        not target
+        or not target.startswith("/")
+        or target.startswith("//")
+        or any(char in target for char in "\r\n\t")
+    ):
+        return ""
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc or not parts.path.startswith("/"):
+        return ""
+    return target
+
+
+def _safe_internal_referrer_path(value: Any, host_url: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    target = value.strip()
+    if not target or any(char in target for char in "\r\n\t"):
+        return ""
+    parts = urlsplit(target)
+    if not parts.scheme and not parts.netloc:
+        return _safe_internal_return_path(target)
+    host_parts = urlsplit(host_url)
+    if parts.scheme not in {"http", "https"} or parts.netloc != host_parts.netloc:
+        return ""
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    return _safe_internal_return_path(path)
 
 
 app = Flask(__name__)
@@ -174,6 +209,7 @@ RESULT_RECOMMENDATION_FIELDS = {
 STEP4_SINGLE_VALUE_FIELDS = {
     "action",
     "active_scenario",
+    "continue_to_results",
     "native_page",
     "native_page_size",
     "native_search",
@@ -194,6 +230,16 @@ STEP4_SINGLE_VALUE_FIELDS = {
     "ocvs_standard_storage_vpu",
     "ocvs_dr_nodes",
     "vmware_license_price_per_core_yearly",
+    "hybrid_ocvs_profile",
+    "hybrid_ocvs_commitment_term",
+    "hybrid_ocvs_vcpu_per_ocpu",
+    "hybrid_ocvs_cpu_headroom_pct",
+    "hybrid_ocvs_memory_headroom_pct",
+    "hybrid_ocvs_storage_headroom_pct",
+    "hybrid_ocvs_dense_vsan_usable_pct",
+    "hybrid_ocvs_standard_storage_vpu",
+    "hybrid_ocvs_dr_nodes",
+    "hybrid_vmware_license_price_per_core_yearly",
 }
 
 HOURS_PER_MONTH = 730.0
@@ -390,6 +436,12 @@ def _default_app_state() -> dict[str, Any]:
         "step4_ocvs_commitment_term": "payg",
         "step4_vmware_license_price_per_core_yearly": 0.0,
         "step4_ocvs_dr_nodes": 0,
+        "step4_hybrid_ocvs_customized": False,
+        "step4_hybrid_ocvs_profile": "best_fit",
+        "step4_hybrid_ocvs_policy": dict(OCVS_DEFAULT_SIZING_POLICY),
+        "step4_hybrid_ocvs_commitment_term": "payg",
+        "step4_hybrid_vmware_license_price_per_core_yearly": 0.0,
+        "step4_hybrid_ocvs_dr_nodes": 0,
         "step4_last_updated_at": "",
     }
 
@@ -468,6 +520,54 @@ def normalize_ocvs_policy(value: Any) -> dict[str, Any]:
         "storage_headroom_pct": _bounded_float(raw.get("storage_headroom_pct"), float(default["storage_headroom_pct"]), 0.0, 90.0),
         "dense_vsan_usable_pct": _bounded_float(raw.get("dense_vsan_usable_pct"), float(default["dense_vsan_usable_pct"]), 10.0, 95.0),
         "standard_storage_vpu": _bounded_int(raw.get("standard_storage_vpu"), int(default["standard_storage_vpu"]), 10, 120),
+    }
+
+
+def effective_hybrid_ocvs_assumptions(
+    app_state: dict[str, Any],
+    *,
+    ocvs_profile_choice: str,
+    ocvs_policy: dict[str, Any],
+    ocvs_commitment_term: str,
+    vmware_license_price_per_core_yearly: float,
+    ocvs_dr_nodes: int,
+) -> dict[str, Any]:
+    customized = app_state.get("step4_hybrid_ocvs_customized") is True
+    if not customized:
+        return {
+            "customized": False,
+            "profile_choice": normalize_ocvs_profile(ocvs_profile_choice),
+            "policy": normalize_ocvs_policy(ocvs_policy),
+            "commitment_term": normalize_ocvs_commitment_term(ocvs_commitment_term),
+            "vmware_license_price_per_core_yearly": _bounded_float(
+                vmware_license_price_per_core_yearly,
+                0.0,
+                0.0,
+                1_000_000.0,
+            ),
+            "dr_nodes": normalize_ocvs_dr_nodes(ocvs_dr_nodes),
+        }
+
+    return {
+        "customized": True,
+        "profile_choice": normalize_ocvs_profile(
+            app_state.get("step4_hybrid_ocvs_profile", ocvs_profile_choice)
+        ),
+        "policy": normalize_ocvs_policy(
+            app_state.get("step4_hybrid_ocvs_policy", ocvs_policy)
+        ),
+        "commitment_term": normalize_ocvs_commitment_term(
+            app_state.get("step4_hybrid_ocvs_commitment_term", ocvs_commitment_term)
+        ),
+        "vmware_license_price_per_core_yearly": _bounded_float(
+            app_state.get("step4_hybrid_vmware_license_price_per_core_yearly"),
+            vmware_license_price_per_core_yearly,
+            0.0,
+            1_000_000.0,
+        ),
+        "dr_nodes": normalize_ocvs_dr_nodes(
+            app_state.get("step4_hybrid_ocvs_dr_nodes", ocvs_dr_nodes)
+        ),
     }
 
 
@@ -763,6 +863,33 @@ def normalize_app_state(value: Any) -> dict[str, Any]:
         1_000_000.0,
     )
     default["step4_ocvs_dr_nodes"] = normalize_ocvs_dr_nodes(default.get("step4_ocvs_dr_nodes", 0))
+    default["step4_hybrid_ocvs_customized"] = (
+        default.get("step4_hybrid_ocvs_customized") is True
+    )
+    default["step4_hybrid_ocvs_profile"] = normalize_ocvs_profile(
+        default.get("step4_hybrid_ocvs_profile", default.get("step4_ocvs_profile", "best_fit"))
+    )
+    default["step4_hybrid_ocvs_policy"] = normalize_ocvs_policy(
+        default.get("step4_hybrid_ocvs_policy", default.get("step4_ocvs_policy", {}))
+    )
+    default["step4_hybrid_ocvs_commitment_term"] = normalize_ocvs_commitment_term(
+        default.get(
+            "step4_hybrid_ocvs_commitment_term",
+            default.get("step4_ocvs_commitment_term", "payg"),
+        )
+    )
+    default["step4_hybrid_vmware_license_price_per_core_yearly"] = _bounded_float(
+        default.get(
+            "step4_hybrid_vmware_license_price_per_core_yearly",
+            default.get("step4_vmware_license_price_per_core_yearly", 0.0),
+        ),
+        default.get("step4_vmware_license_price_per_core_yearly", 0.0),
+        0.0,
+        1_000_000.0,
+    )
+    default["step4_hybrid_ocvs_dr_nodes"] = normalize_ocvs_dr_nodes(
+        default.get("step4_hybrid_ocvs_dr_nodes", default.get("step4_ocvs_dr_nodes", 0))
+    )
     default.pop("step4_vmware_license_discount_pct", None)
     return default
 
@@ -834,9 +961,10 @@ def _saved_assessment_file_path(assessment_id: Any) -> Path | None:
 
 def _assessment_default_name() -> str:
     customer_name = normalize_customer_name(session.get("customer_name", ""))
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if customer_name:
-        return f"{customer_name} assessment"
-    return f"Assessment {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        return f"{customer_name} - {timestamp}"
+    return f"Assessment - {timestamp}"
 
 
 def _format_assessment_timestamp(value: Any) -> str:
@@ -1098,6 +1226,27 @@ def delete_saved_assessment(assessment_id: Any) -> dict[str, Any]:
     if session.get("active_assessment_id") == file_path.stem:
         session.pop("active_assessment_id", None)
     return {"ok": True, "message": "Assessment deleted.", "name": assessment_name}
+
+
+def reset_active_assessment_state() -> None:
+    """Clear the active workspace while keeping the selected OCI pricing context."""
+    keys_to_clear = (
+        "customer_name",
+        "selected_rvtools_file",
+        "rvtools_file_info",
+        "rvtools_import_summary",
+        "rvtools_rejected_info",
+        "active_assessment_id",
+        "active_assessment_name",
+        "active_assessment_notes",
+        "last_export_file",
+        "selected_vm_names",
+        "step4_os_shapes",
+    )
+    for key in keys_to_clear:
+        session.pop(key, None)
+    save_app_state(_default_app_state())
+    clear_step4_snapshot()
 
 
 def build_current_portable_assessment(
@@ -2840,6 +2989,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
                 "count": len(rows),
                 "default_action": default_action,
                 "vm_names": [row["vm_name"] for row in rows],
+                "vm_rows_by_name": {row["vm_name"]: row for row in rows},
                 "vm_rows": rows[:50],
                 "hidden_count": max(0, len(rows) - 50),
             }
@@ -2853,7 +3003,7 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
                 str(row.get("raw_os") or "Unknown / Empty"),
                 "Native migration requires a documented remediation treatment",
                 "Keep the VM in scope on OCVS or remediate the guest OS before Native migration.",
-                "Set OCVS",
+                "Review Native treatment",
             )
             for row in vm_rows
             if not _is_unknown_os(row.get("raw_os"))
@@ -2866,15 +3016,15 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
             "advisory",
             unsupported_rows,
             "Review Native treatment",
-        )
+    )
 
     missing_storage_rows = [
         _inventory_review_row(
             row,
             "Empty / 0 storage",
             "Missing storage value",
-            "Update the inventory source or manual sizing summary so storage pricing is based on real workload data.",
-            "Edit storage",
+            "Review the affected VM before relying on storage sizing results.",
+            "Review storage inputs",
         )
         for row in vm_rows
         if _is_empty_or_zero(row.get("provisioned_mib"))
@@ -2882,8 +3032,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
     add_issue(
         "missing-storage",
         "Missing storage values",
-        "Storage is required for reliable Native and OCVS sizing. Correct the source values before continuing.",
-        "critical",
+        "Some VMs have empty or zero storage values. Sizing can continue, but storage estimates should be confirmed.",
+        "advisory",
         missing_storage_rows,
         "Review storage inputs",
     )
@@ -2893,8 +3043,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
             row,
             "Empty / 0 vCPU",
             "Missing vCPU value",
-            "Update the inventory CPU/vCPU field before relying on shape sizing.",
-            "Edit vCPU",
+            "Review the affected VM before relying on compute shape sizing.",
+            "Review vCPU inputs",
         )
         for row in vm_rows
         if _is_empty_or_zero(row.get("cpus"))
@@ -2902,8 +3052,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
     add_issue(
         "missing-cpu",
         "Missing vCPU values",
-        "VM rows with missing vCPU values can distort OCI Native and OCVS sizing.",
-        "critical",
+        "Some VMs have empty or zero vCPU values. Sizing can continue, but compute estimates should be confirmed.",
+        "advisory",
         missing_cpu_rows,
         "Review CPU inputs",
     )
@@ -2913,8 +3063,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
             row,
             "Empty / 0 RAM",
             "Missing RAM value",
-            "Update the inventory memory field before relying on shape sizing.",
-            "Edit RAM",
+            "Review the affected VM before relying on memory sizing.",
+            "Review RAM inputs",
         )
         for row in vm_rows
         if _is_empty_or_zero(row.get("memory_mb"))
@@ -2922,8 +3072,8 @@ def build_inventory_review_issues(vm_rows: list[dict[str, Any]]) -> list[dict[st
     add_issue(
         "missing-memory",
         "Missing RAM values",
-        "VM rows with missing RAM values can distort OCI Native and OCVS sizing.",
-        "critical",
+        "Some VMs have empty or zero RAM values. Sizing can continue, but memory estimates should be confirmed.",
+        "advisory",
         missing_memory_rows,
         "Review RAM inputs",
     )
@@ -3092,15 +3242,6 @@ def inventory_review_readiness_errors(
     issues = inventory_issues if inventory_issues is not None else build_inventory_review_issues(all_vms)
     if any(issue.get("severity") == "critical" for issue in issues):
         errors.append("Resolve critical inventory issues in Setup or the source inventory before continuing.")
-    advisory_ids = {
-        str(issue.get("id"))
-        for issue in issues
-        if issue.get("severity") == "advisory"
-    }
-    acknowledged_value = state.get("acknowledged_warning_ids")
-    acknowledged_ids = set(acknowledged_value) if isinstance(acknowledged_value, list) else set()
-    if advisory_ids - acknowledged_ids:
-        errors.append("Acknowledge advisory warnings before continuing to scenarios.")
 
     return errors
 
@@ -3509,12 +3650,31 @@ def parse_step4_scalar_submission(form: Any) -> tuple[dict[str, Any], list[str]]
         else:
             parsed["ocvs_profile"] = profile
 
+    if "hybrid_ocvs_profile" in form:
+        profile = str(form.get("hybrid_ocvs_profile", "")).strip()
+        valid_profiles = {"best_fit"} | {
+            str(item.get("shape") or "").strip()
+            for item in OCVS_HOST_PROFILES
+            if str(item.get("shape") or "").strip()
+        }
+        if profile not in valid_profiles:
+            errors.append("Choose a valid Hybrid OCVS node profile.")
+        else:
+            parsed["hybrid_ocvs_profile"] = profile
+
     if "ocvs_commitment_term" in form:
         commitment_term = str(form.get("ocvs_commitment_term", "")).strip()
         if commitment_term not in OCVS_COMMITMENT_TERMS:
             errors.append("Choose a valid OCVS commitment term.")
         else:
             parsed["ocvs_commitment_term"] = commitment_term
+
+    if "hybrid_ocvs_commitment_term" in form:
+        commitment_term = str(form.get("hybrid_ocvs_commitment_term", "")).strip()
+        if commitment_term not in OCVS_COMMITMENT_TERMS:
+            errors.append("Choose a valid Hybrid OCVS commitment term.")
+        else:
+            parsed["hybrid_ocvs_commitment_term"] = commitment_term
 
     numeric_rules = {
         "iaas_discount_pct": ("IaaS discount", 0.0, 100.0, False, None),
@@ -3539,6 +3699,32 @@ def parse_step4_scalar_submission(form: Any) -> tuple[dict[str, Any], list[str]]
         ),
         "ocvs_dr_nodes": (
             "additional spare nodes",
+            float(min(VALID_OCVS_DR_NODE_COUNTS)),
+            float(max(VALID_OCVS_DR_NODE_COUNTS)),
+            True,
+            set(VALID_OCVS_DR_NODE_COUNTS),
+        ),
+        "hybrid_vmware_license_price_per_core_yearly": (
+            "Hybrid VCF list price per physical core/year",
+            0.0,
+            1_000_000.0,
+            False,
+            None,
+        ),
+        "hybrid_ocvs_vcpu_per_ocpu": ("Hybrid vCPU per OCPU", 1.0, 16.0, False, None),
+        "hybrid_ocvs_cpu_headroom_pct": ("Hybrid CPU headroom", 0.0, 90.0, True, None),
+        "hybrid_ocvs_memory_headroom_pct": ("Hybrid RAM headroom", 0.0, 90.0, True, None),
+        "hybrid_ocvs_storage_headroom_pct": ("Hybrid storage headroom", 0.0, 90.0, True, None),
+        "hybrid_ocvs_dense_vsan_usable_pct": ("Hybrid dense vSAN usable", 10.0, 95.0, True, None),
+        "hybrid_ocvs_standard_storage_vpu": (
+            "Hybrid standard storage VPU/GB",
+            10.0,
+            120.0,
+            True,
+            set(VPU_OPTIONS),
+        ),
+        "hybrid_ocvs_dr_nodes": (
+            "Hybrid additional spare nodes",
             float(min(VALID_OCVS_DR_NODE_COUNTS)),
             float(max(VALID_OCVS_DR_NODE_COUNTS)),
             True,
@@ -3602,14 +3788,14 @@ def parse_recommendation_submission(form: Any) -> tuple[dict[str, str], list[str
     recommendation_value = _single_string_form_value(
         form,
         "recommendation",
-        cardinality_error="Submit exactly one assessor recommendation.",
-        type_error="Assessor recommendation must be text.",
+        cardinality_error="Submit exactly one specialist recommendation.",
+        type_error="Specialist recommendation must be text.",
         errors=errors,
     )
     if recommendation_value is not None:
         recommendation = recommendation_value.strip()
         if recommendation not in RESULT_RECOMMENDATION_VALUES:
-            errors.append("Choose a valid assessor recommendation.")
+            errors.append("Choose a valid specialist recommendation.")
         else:
             parsed["recommendation"] = recommendation
 
@@ -4227,17 +4413,11 @@ def build_current_readiness_context(
         if not isinstance(selected, dict):
             return False
         host_count = _readiness_nonnegative_count(selected.get("host_count"))
-        physical_cores = _readiness_nonnegative_count(
-            license_item.get("physical_cores")
-        )
         return bool(
             price_source_available
             and host_count is not None
             and host_count > 0
             and selected.get("pricing_available") is True
-            and physical_cores is not None
-            and physical_cores > 0
-            and vcf_price_per_core_yearly > 0.0
         )
 
     full_selected_rows = [row_by_name[name] for name in selected_names]
@@ -4589,6 +4769,10 @@ def build_workspace_context(
             "workspace_continue_presentation": continue_presentation,
             "workspace_continue_is_safe_link": continue_is_safe_link,
             "workspace_continue_unavailable_message": continue_unavailable_message,
+            "workspace_continue_form_id": str(values.get("workspace_continue_form_id", "")),
+            "workspace_continue_submit_name": str(values.get("workspace_continue_submit_name", "")),
+            "workspace_continue_submit_value": str(values.get("workspace_continue_submit_value", "")),
+            "workspace_continue_label": str(values.get("workspace_continue_label", "Continue")),
             "workspace_can_export": prerequisite_availability["results"],
         }
     )
@@ -5089,17 +5273,7 @@ def build_fit_warnings(
 
     vmware_full = vmware_license_summary.get("ocvs", {})
     vmware_hybrid = vmware_license_summary.get("hybrid", {})
-    vmware_cores = max(
-        int(vmware_full.get("physical_cores", 0) or 0),
-        int(vmware_hybrid.get("physical_cores", 0) or 0),
-    )
-    if vmware_cores > 0 and not bool(vmware_license_summary.get("is_priced", False)):
-        add(
-            "warning",
-            "VCF license price not set",
-            "OCVS and Hybrid costs exclude VCF license cost until a list price per physical core is entered.",
-        )
-    elif bool(vmware_license_summary.get("is_priced", False)):
+    if bool(vmware_license_summary.get("is_priced", False)):
         add(
             "info",
             "VCF license cost included",
@@ -5439,17 +5613,21 @@ def build_vmware_license_summary(
     ocvs_price: dict[str, Any],
     hybrid_ocvs_price: dict[str, Any],
     price_per_core_yearly: float,
+    hybrid_price_per_core_yearly: Any = None,
 ) -> dict[str, Any]:
     price_per_core_yearly = max(0.0, float(price_per_core_yearly or 0.0))
+    if hybrid_price_per_core_yearly is None:
+        hybrid_price_per_core_yearly = price_per_core_yearly
+    hybrid_price_per_core_yearly = max(0.0, float(hybrid_price_per_core_yearly or 0.0))
 
-    def build_item(label: str, summary: dict[str, Any]) -> dict[str, Any]:
+    def build_item(label: str, summary: dict[str, Any], item_price_per_core_yearly: float) -> dict[str, Any]:
         selected = summary.get("selected", {})
         host_count = int(selected.get("host_count", 0) or 0)
         base_host_count = int(selected.get("base_host_count", host_count) or 0)
         dr_node_count = int(selected.get("dr_node_count", 0) or 0)
         cores_per_host = int(selected.get("ocpus_per_host", 0) or 0)
         physical_cores = host_count * cores_per_host
-        yearly_cost = physical_cores * price_per_core_yearly
+        yearly_cost = physical_cores * item_price_per_core_yearly
         monthly_cost = yearly_cost / 12.0
         return {
             "label": label,
@@ -5458,16 +5636,19 @@ def build_vmware_license_summary(
             "dr_node_count": dr_node_count,
             "cores_per_host": cores_per_host,
             "physical_cores": physical_cores,
-            "price_per_core_yearly": price_per_core_yearly,
+            "price_per_core_yearly": item_price_per_core_yearly,
+            "is_priced": item_price_per_core_yearly > 0.0,
             "yearly_cost": yearly_cost,
             "monthly_cost": monthly_cost,
         }
 
-    ocvs = build_item("OCVS", ocvs_price)
-    hybrid = build_item("Hybrid OCVS subset", hybrid_ocvs_price)
+    ocvs = build_item("OCVS", ocvs_price, price_per_core_yearly)
+    hybrid = build_item("Hybrid OCVS subset", hybrid_ocvs_price, hybrid_price_per_core_yearly)
     return {
         "price_per_core_yearly": price_per_core_yearly,
+        "hybrid_price_per_core_yearly": hybrid_price_per_core_yearly,
         "is_priced": price_per_core_yearly > 0.0,
+        "all_priced": price_per_core_yearly > 0.0 and hybrid_price_per_core_yearly > 0.0,
         "ocvs": ocvs,
         "hybrid": hybrid,
         "rows": [ocvs, hybrid],
@@ -5674,8 +5855,33 @@ def build_price_analysis_from_rows(
     vmware_license_price_per_core_yearly: float,
     ocvs_dr_nodes: int,
     ocvs_commitment_term: str = "payg",
+    hybrid_ocvs_policy: dict[str, Any] | None = None,
+    hybrid_ocvs_profile_choice: str | None = None,
+    hybrid_vmware_license_price_per_core_yearly: float | None = None,
+    hybrid_ocvs_dr_nodes: int | None = None,
+    hybrid_ocvs_commitment_term: str | None = None,
     hybrid_placement_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    hybrid_ocvs_policy = normalize_ocvs_policy(hybrid_ocvs_policy or ocvs_policy)
+    hybrid_ocvs_profile_choice = normalize_ocvs_profile(
+        hybrid_ocvs_profile_choice or ocvs_profile_choice
+    )
+    hybrid_vmware_license_price_per_core_yearly = _bounded_float(
+        (
+            vmware_license_price_per_core_yearly
+            if hybrid_vmware_license_price_per_core_yearly is None
+            else hybrid_vmware_license_price_per_core_yearly
+        ),
+        vmware_license_price_per_core_yearly,
+        0.0,
+        1_000_000.0,
+    )
+    hybrid_ocvs_dr_nodes = normalize_ocvs_dr_nodes(
+        ocvs_dr_nodes if hybrid_ocvs_dr_nodes is None else hybrid_ocvs_dr_nodes
+    )
+    hybrid_ocvs_commitment_term = normalize_ocvs_commitment_term(
+        hybrid_ocvs_commitment_term or ocvs_commitment_term
+    )
     overall = summarize_native_price(vm_rows)
     ocvs_price = build_ocvs_price_summary(
         vm_rows=vm_rows,
@@ -5714,17 +5920,18 @@ def build_price_analysis_from_rows(
         block_storage_unit_price=block_storage_unit_price,
         block_perf_unit_price=block_perf_unit_price,
         iaas_discount_pct=iaas_discount_pct,
-        policy=ocvs_policy,
-        selected_profile=ocvs_profile_choice,
-        dr_node_count=ocvs_dr_nodes,
-        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
-        ocvs_commitment_term=ocvs_commitment_term,
+        policy=hybrid_ocvs_policy,
+        selected_profile=hybrid_ocvs_profile_choice,
+        dr_node_count=hybrid_ocvs_dr_nodes,
+        vmware_license_price_per_core_yearly=hybrid_vmware_license_price_per_core_yearly,
+        ocvs_commitment_term=hybrid_ocvs_commitment_term,
     )
     hybrid_ocvs_selected = hybrid_ocvs_price["selected"]
     vmware_license_summary = build_vmware_license_summary(
         ocvs_price=ocvs_price,
         hybrid_ocvs_price=hybrid_ocvs_price,
         price_per_core_yearly=vmware_license_price_per_core_yearly,
+        hybrid_price_per_core_yearly=hybrid_vmware_license_price_per_core_yearly,
     )
 
     baseline_monthly = float(overall["total_monthly_cost"])
@@ -5739,16 +5946,11 @@ def build_price_analysis_from_rows(
     ocvs_host_count = int(ocvs_selected.get("host_count", 0) or 0)
     hybrid_ocvs_host_count = int(hybrid_ocvs_selected.get("host_count", 0) or 0)
     native_viable = bool(not vm_rows or baseline_monthly > 0.0)
-    vcf_is_priced = bool(vmware_license_summary.get("is_priced", False))
-    ocvs_physical_cores = int(vmware_license_summary["ocvs"].get("physical_cores", 0) or 0)
-    hybrid_physical_cores = int(vmware_license_summary["hybrid"].get("physical_cores", 0) or 0)
     ocvs_viable = bool(
         (ocvs_host_count == 0 or bool(ocvs_selected.get("pricing_available", False)))
-        and (ocvs_physical_cores == 0 or vcf_is_priced)
     )
     hybrid_viable = bool(
         (hybrid_ocvs_host_count == 0 or bool(hybrid_ocvs_selected.get("pricing_available", False)))
-        and (hybrid_physical_cores == 0 or vcf_is_priced)
     )
 
     scenario_rows = [
@@ -5962,6 +6164,30 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         1_000_000.0,
     )
     ocvs_dr_nodes = normalize_ocvs_dr_nodes(app_state.get("step4_ocvs_dr_nodes", 0))
+    hybrid_ocvs_assumptions = effective_hybrid_ocvs_assumptions(
+        app_state,
+        ocvs_profile_choice=ocvs_profile_choice,
+        ocvs_policy=ocvs_policy,
+        ocvs_commitment_term=ocvs_commitment_term,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+    )
+    hybrid_ocvs_customized = bool(hybrid_ocvs_assumptions["customized"])
+    hybrid_ocvs_profile_choice = str(hybrid_ocvs_assumptions["profile_choice"])
+    hybrid_ocvs_policy = dict(hybrid_ocvs_assumptions["policy"])
+    hybrid_ocvs_commitment_term = str(hybrid_ocvs_assumptions["commitment_term"])
+    hybrid_vmware_license_price_per_core_yearly = float(
+        hybrid_ocvs_assumptions["vmware_license_price_per_core_yearly"]
+    )
+    hybrid_ocvs_dr_nodes = int(hybrid_ocvs_assumptions["dr_nodes"])
+    hybrid_ocvs_assumptions = effective_hybrid_ocvs_assumptions(
+        app_state,
+        ocvs_profile_choice=ocvs_profile_choice,
+        ocvs_policy=ocvs_policy,
+        ocvs_commitment_term=ocvs_commitment_term,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+    )
     step4_last_updated_at = str(app_state.get("step4_last_updated_at", "") or "")
     snapshot = load_step4_snapshot()
     if (
@@ -6002,6 +6228,13 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
         ocvs_dr_nodes=ocvs_dr_nodes,
         ocvs_commitment_term=ocvs_commitment_term,
+        hybrid_ocvs_policy=hybrid_ocvs_assumptions["policy"],
+        hybrid_ocvs_profile_choice=hybrid_ocvs_assumptions["profile_choice"],
+        hybrid_vmware_license_price_per_core_yearly=hybrid_ocvs_assumptions[
+            "vmware_license_price_per_core_yearly"
+        ],
+        hybrid_ocvs_dr_nodes=hybrid_ocvs_assumptions["dr_nodes"],
+        hybrid_ocvs_commitment_term=hybrid_ocvs_assumptions["commitment_term"],
         hybrid_placement_selection=hybrid_placement_selection,
     )
     migration_waves = build_migration_waves(
@@ -6022,6 +6255,7 @@ def build_current_price_page_context() -> tuple[dict[str, Any] | None, str]:
         "ocvs_commitment_term": ocvs_commitment_term,
         "ocvs_dr_nodes": ocvs_dr_nodes,
         "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
+        "hybrid_ocvs_assumptions": hybrid_ocvs_assumptions,
         "step4_last_updated_at": step4_last_updated_at,
         "step4_last_updated_display": _format_display_timestamp(step4_last_updated_at),
         "migration_waves": migration_waves,
@@ -6035,6 +6269,7 @@ def build_scenario_configuration_display(
     analysis: dict[str, Any],
     readiness: dict[str, Any],
     ocvs_commitment_term: str,
+    hybrid_ocvs_customized: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     readiness_scenarios = readiness.get("scenarios", {})
     if not isinstance(readiness_scenarios, dict):
@@ -6075,6 +6310,9 @@ def build_scenario_configuration_display(
     ocvs_status = readiness_display("ocvs")
     ocvs_infrastructure_subtotal = float(ocvs_selected.get("total_monthly_cost", 0.0) or 0.0)
     ocvs_vcf_subtotal = float(vmware_summary["ocvs"].get("monthly_cost", 0.0) or 0.0)
+    ocvs_vcf_is_priced = bool(vmware_summary["ocvs"].get("is_priced", False))
+    ocvs_has_vcf_scope = int(vmware_summary["ocvs"].get("physical_cores", 0) or 0) > 0
+    ocvs_vcf_optional = bool(ocvs_has_vcf_scope and not ocvs_vcf_is_priced)
     ocvs_display = {
         **ocvs_status,
         "workload_count": int(analysis.get("overall", {}).get("vm_count", 0) or 0),
@@ -6089,17 +6327,32 @@ def build_scenario_configuration_display(
         "infrastructure_subtotal": ocvs_infrastructure_subtotal,
         "vcf_subtotal": ocvs_vcf_subtotal,
         "monthly_total": ocvs_infrastructure_subtotal + ocvs_vcf_subtotal,
-        "total_label": "Complete monthly total" if ocvs_status["rankable"] else "Partial monthly total",
-        "vcf_price_required": bool(
-            int(vmware_summary["ocvs"].get("physical_cores", 0) or 0) > 0
-            and not bool(vmware_summary.get("is_priced", False))
+        "total_label": (
+            "Base monthly total"
+            if ocvs_vcf_optional
+            else "Complete monthly total"
+            if ocvs_status["rankable"]
+            else "Partial monthly total"
         ),
+        "vcf_label": "Optional add-on" if ocvs_vcf_optional else f"{ocvs_vcf_subtotal:,.0f}",
+        "vcf_note": (
+            "Enter a per-core price only when VMware/Broadcom licensing should be included."
+            if ocvs_vcf_optional
+            else "Included in the modeled monthly total"
+            if ocvs_vcf_is_priced and ocvs_has_vcf_scope
+            else "No VCF license scope in this scenario"
+        ),
+        "vcf_optional": ocvs_vcf_optional,
+        "vcf_price_required": False,
     }
 
     hybrid_status = readiness_display("hybrid")
     hybrid_native_subtotal = float(supported_native.get("total_monthly_cost", 0.0) or 0.0)
     hybrid_ocvs_subtotal = float(hybrid_selected.get("total_monthly_cost", 0.0) or 0.0)
     hybrid_vcf_subtotal = float(vmware_summary["hybrid"].get("monthly_cost", 0.0) or 0.0)
+    hybrid_vcf_is_priced = bool(vmware_summary["hybrid"].get("is_priced", False))
+    hybrid_has_vcf_scope = int(vmware_summary["hybrid"].get("physical_cores", 0) or 0) > 0
+    hybrid_vcf_optional = bool(hybrid_has_vcf_scope and not hybrid_vcf_is_priced)
     hybrid_display = {
         **hybrid_status,
         "workload_count": len(placement_plan.get("rows", [])),
@@ -6112,17 +6365,34 @@ def build_scenario_configuration_display(
         "ocvs_infrastructure_subtotal": hybrid_ocvs_subtotal,
         "vcf_subtotal": hybrid_vcf_subtotal,
         "monthly_total": hybrid_native_subtotal + hybrid_ocvs_subtotal + hybrid_vcf_subtotal,
-        "total_label": "Complete monthly total" if hybrid_status["rankable"] else "Partial monthly total",
+        "total_label": (
+            "Base monthly total"
+            if hybrid_vcf_optional
+            else "Complete monthly total"
+            if hybrid_status["rankable"]
+            else "Partial monthly total"
+        ),
         "selected_shape": str(hybrid_selected.get("shape") or ""),
         "commitment_label": str(hybrid_selected.get("commitment_label") or ""),
         "shared_source": (
-            f"{ocvs_selected.get('shape', '')} / "
-            f"{ocvs_selected.get('commitment_label', OCVS_COMMITMENT_LABELS['payg'])}"
+            f"{hybrid_selected.get('shape', '')} / "
+            f"{hybrid_selected.get('commitment_label', OCVS_COMMITMENT_LABELS['payg'])}"
         ),
-        "vcf_price_required": bool(
-            int(vmware_summary["hybrid"].get("physical_cores", 0) or 0) > 0
-            and not bool(vmware_summary.get("is_priced", False))
+        "assumptions_label": (
+            "Customized for Hybrid"
+            if hybrid_ocvs_customized
+            else "Inherited from OCVS scenario"
         ),
+        "vcf_label": "Optional add-on" if hybrid_vcf_optional else f"{hybrid_vcf_subtotal:,.0f}",
+        "vcf_note": (
+            "Enter a per-core price only when VMware/Broadcom licensing should be included."
+            if hybrid_vcf_optional
+            else "Included in the modeled monthly total"
+            if hybrid_vcf_is_priced and hybrid_has_vcf_scope
+            else "No VCF license scope in this scenario"
+        ),
+        "vcf_optional": hybrid_vcf_optional,
+        "vcf_price_required": False,
     }
     return ocvs_display, hybrid_display
 
@@ -6409,23 +6679,44 @@ def build_results_page_context(
             }
         )
 
+    rank_tones = {1: "gold", 2: "silver", 3: "bronze"}
+    ranked_scenarios = sorted(
+        enumerate(scenarios),
+        key=lambda item: (item[1]["monthly_cost"], item[0]),
+    )
+    for rank, (_order, scenario) in enumerate(ranked_scenarios, start=1):
+        scenario["price_rank"] = rank
+        scenario["rank_tone"] = rank_tones.get(rank, "standard")
+        scenario["rank_qualifier"] = "Complete pricing" if scenario["rankable"] else "Partial pricing"
+
     overall_state = str(readiness.get("overall_state") or "incomplete")
+    has_rankable_results = any(scenario["rankable"] for scenario in scenarios)
+    has_blocking_items = bool(readiness.get("blocking_items"))
+    overall_display_state = (
+        "draft_review_required"
+        if (
+            overall_state == "incomplete"
+            and has_rankable_results
+            and not has_blocking_items
+        )
+        else overall_state
+    )
     overall_copy = {
         "customer_ready": (
             "Customer-ready export",
             "The selected path and required treatment notes satisfy the current readiness checks.",
         ),
         "draft_review_required": (
-            "Draft review required",
-            "Scenario modeling is available for assessor review; record a decision before customer-ready use.",
+            "Draft results available",
+            "Scenario modeling is available for assessor review. Complete setup details and record a decision before customer-ready export.",
         ),
         "incomplete": (
-            "Assessment incomplete",
-            "Review outstanding setup, inventory, scenario, or pricing requirements.",
+            "Needs attention",
+            "Complete outstanding setup, inventory, scenario, or pricing items before customer-ready export.",
         ),
     }
     overall_label, overall_detail = overall_copy.get(
-        overall_state,
+        overall_display_state,
         overall_copy["incomplete"],
     )
     recommendation = app_state.get("assessor_recommendation", "")
@@ -6437,6 +6728,7 @@ def build_results_page_context(
 
     return {
         "overall_state": overall_state,
+        "overall_display_state": overall_display_state,
         "overall_label": overall_label,
         "overall_detail": overall_detail,
         "scenarios": scenarios,
@@ -6446,14 +6738,10 @@ def build_results_page_context(
             {"value": "native", "label": "Native"},
             {"value": "ocvs", "label": "OCVS"},
             {"value": "hybrid", "label": "Hybrid"},
-            {"value": "", "label": "No recommendation yet"},
+            {"value": "", "label": "Undecided"},
         ],
         "customer_ready_export": readiness.get("customer_ready_export") is True,
-        "excel_export_label": (
-            "Export Excel"
-            if readiness.get("customer_ready_export") is True
-            else "Export Draft"
-        ),
+        "excel_export_label": "Export Excel",
         "assessment_name": normalize_assessment_name(
             session.get("active_assessment_name", "")
         )
@@ -6775,8 +7063,8 @@ def _workbook_readiness_metadata(
     max_affected_names = 1000
     max_text_length = 4000
     readiness_labels = {
-        "draft_review_required": "Draft review required",
-        "incomplete": "Incomplete",
+        "draft_review_required": "Draft results available",
+        "incomplete": "Draft results available",
         "customer_ready": "Customer ready",
     }
     recommendation_labels = {
@@ -7016,7 +7304,7 @@ def _workbook_readiness_metadata(
         "workbook_status": workbook_status,
         "readiness_label": readiness_label,
         "recommendation": recommendation_labels.get(
-            recommendation, "No recommendation yet"
+            recommendation, "Undecided"
         ),
         "recommendation_rationale": rationale or "Not provided",
         "lowest_complete_scenario_id": lowest_complete_scenario,
@@ -7511,8 +7799,8 @@ def build_migration_price_workbook_xlsx(
             ["Generated At", generated_at, ""],
             ["Workbook Status", readiness_metadata["workbook_status"], ""],
             ["Assessment Readiness", readiness_metadata["readiness_label"], ""],
-            ["Assessor Recommendation", readiness_metadata["recommendation"], ""],
-            ["Recommendation Rationale", readiness_metadata["recommendation_rationale"], ""],
+            ["Specialist Recommendation", readiness_metadata["recommendation"], ""],
+            ["Internal Notes", readiness_metadata["recommendation_rationale"], ""],
             ["Native Remediation Status", readiness_metadata["native_remediation_status"], ""],
             ["Native Affected VM Count", readiness_metadata["native_affected_vm_count"], ""],
             ["Native Affected VMs", readiness_metadata["native_affected_vm_names"], ""],
@@ -7560,9 +7848,9 @@ def build_migration_price_workbook_xlsx(
         row_styles,
         cell_styles,
         [
-            ["Assessor Decision", readiness_metadata["recommendation"], ""],
+            ["Specialist Decision", readiness_metadata["recommendation"], ""],
             [
-                "Decision Rationale",
+                "Decision Notes",
                 readiness_metadata["recommendation_rationale"],
                 "",
             ],
@@ -7579,7 +7867,7 @@ def build_migration_price_workbook_xlsx(
     add_note(
         rows,
         row_styles,
-        "The assessor decision is separate from modeled price ranking. Validate application dependencies, migration waves, commercial terms, and official Oracle pricing before customer sign-off.",
+        "The specialist decision is separate from modeled price ranking. Validate application dependencies, migration waves, commercial terms, and official Oracle pricing before sharing externally.",
     )
     add_section(rows, row_styles, "Migration Path Options")
     add_note(
@@ -7599,7 +7887,7 @@ def build_migration_price_workbook_xlsx(
             ["Estimated OCI infrastructure and licensing run-rate by migration path", "Professional services, project labor, training, downtime, application remediation"],
             ["Monthly, annual, and 3-year price exposure based on active assumptions", "Support uplift, contractual discounts outside the entered assumptions, and commercial quote adjustments"],
             ["Workload placement decisions and technical implications", "Backup retention, DR architecture, operational staffing, and full business case calculations"],
-            ["Assessor decision and modeled migration price context", "Final commercial quotation or binding OCI Cost Estimator import"],
+            ["Specialist decision and modeled migration price context", "Final commercial quotation or binding OCI Cost Estimator import"],
         ],
     )
     executive_sheet = {
@@ -7629,7 +7917,7 @@ def build_migration_price_workbook_xlsx(
             ["Monthly Spread", highest_monthly - lowest_monthly, "Gap between lowest and highest modeled path."],
             ["3-Year Spread", (highest_monthly - lowest_monthly) * 36.0, "Straight 36-month infrastructure and licensing exposure gap."],
             [
-                "Assessor Decision",
+                "Specialist Decision",
                 readiness_metadata["recommendation"],
                 readiness_metadata["recommendation_rationale"],
             ],
@@ -8707,7 +8995,27 @@ def index() -> Any:
                 session.pop("customer_name", None)
                 flash("Customer name cleared.", "customer_success")
 
+        elif action == "start_fresh_assessment":
+            reset_active_assessment_state()
+            selected_rvtools_file = ""
+            rvtools_file_info = None
+            rvtools_import_summary = None
+            rvtools_rejected_info = None
+            customer_name = ""
+            active_assessment_id = ""
+            active_assessment_name = ""
+            active_assessment_notes = ""
+            manual_sizing_values = None
+            inventory_mode = "upload"
+            flash("Started a fresh assessment. The selected OCI price list was kept.", "success")
+
         elif action == "save_assessment":
+            return_to = _safe_internal_return_path(request.form.get("return_to", ""))
+            if not return_to:
+                return_to = _safe_internal_referrer_path(
+                    request.headers.get("Referer", ""),
+                    request.host_url,
+                )
             prior_customer = (
                 "customer_name" in session,
                 session.get("customer_name"),
@@ -8735,6 +9043,8 @@ def index() -> Any:
                 active_assessment_name = normalize_assessment_name(saved_snapshot.get("name"))
                 active_assessment_notes = normalize_assessment_notes(saved_snapshot.get("notes"))
                 flash("Assessment saved.", "success")
+            if return_to:
+                return redirect(return_to, code=303)
 
         elif action == "load_assessment":
             try:
@@ -9228,9 +9538,37 @@ def step3() -> str:
         if warning_id in advisory_issue_ids
     ]
     issues_by_vm: dict[str, list[dict[str, Any]]] = {}
+    warning_details_by_vm: dict[str, list[dict[str, str]]] = {}
     for issue in inventory_issues:
+        rows_by_name = issue.get("vm_rows_by_name", {})
+        if not isinstance(rows_by_name, dict):
+            rows_by_name = {}
         for vm_name in issue.get("vm_names", []):
-            issues_by_vm.setdefault(str(vm_name), []).append(issue)
+            vm_name_key = str(vm_name)
+            issues_by_vm.setdefault(vm_name_key, []).append(issue)
+            note_row = rows_by_name.get(vm_name_key, {})
+            if not isinstance(note_row, dict):
+                note_row = {}
+            warning_details_by_vm.setdefault(vm_name_key, []).append(
+                {
+                    "id": str(issue.get("id", "")),
+                    "title": str(issue.get("title", "Inventory note")),
+                    "severity": str(issue.get("severity", "advisory")),
+                    "detail": str(issue.get("detail", "")),
+                    "detected_value": str(note_row.get("detected_value") or "Not provided"),
+                    "reason": str(
+                        note_row.get("reason")
+                        or note_row.get("issue")
+                        or issue.get("detail")
+                        or "Review required"
+                    ),
+                    "recommendation": str(
+                        note_row.get("recommendation")
+                        or issue.get("default_action")
+                        or "Review this VM before final placement."
+                    ),
+                }
+            )
 
     inventory_rows: list[dict[str, Any]] = []
     supported_count = 0
@@ -9275,6 +9613,7 @@ def step3() -> str:
                 "placement_field_name": placement_field_names[vm_name],
                 "warning_ids": " ".join(str(issue["id"]) for issue in row_issues),
                 "warning_titles": [str(issue["title"]) for issue in row_issues],
+                "warning_details": warning_details_by_vm.get(vm_name, []),
                 "power_key": power_key,
                 "memory_gb": memory_mb / 1024.0,
                 "storage_gb": storage_mib / 1024.0,
@@ -9331,6 +9670,10 @@ def step3() -> str:
             selected_vm_count=len(selected_vm_names),
             critical_issue_count=len(critical_issues),
             advisory_issue_count=len(advisory_issue_ids),
+            workspace_continue_form_id="continue_step4_form",
+            workspace_continue_submit_name="continue_to_scenarios",
+            workspace_continue_submit_value="1",
+            workspace_continue_label="Save & Continue",
         ),
     )
 
@@ -9401,18 +9744,18 @@ def step4() -> str:
         try:
             save_app_state(staged_state)
         except Exception:
-            app.logger.exception("Assessor recommendation persistence failed")
+            app.logger.exception("Specialist decision persistence failed")
             try:
                 _write_json_atomically(_state_file_path(), persisted_app_state)
             except Exception:
-                app.logger.exception("Assessor recommendation rollback failed")
+                app.logger.exception("Specialist decision rollback failed")
             flash(
-                "The assessor recommendation could not be saved. The prior recommendation was kept.",
+                "The decision could not be saved. The prior decision was kept.",
                 "error",
             )
             return redirect(step4_tab_redirect("price")), 303
 
-        flash("Assessor recommendation saved.", "success")
+        flash("Decision saved.", "success")
         return redirect(step4_tab_redirect("price")), 303
 
     submitted_hybrid_placements: dict[str, str] | None = None
@@ -9514,6 +9857,22 @@ def step4() -> str:
         1_000_000.0,
     )
     ocvs_dr_nodes = normalize_ocvs_dr_nodes(app_state.get("step4_ocvs_dr_nodes", 0))
+    hybrid_ocvs_assumptions = effective_hybrid_ocvs_assumptions(
+        app_state,
+        ocvs_profile_choice=ocvs_profile_choice,
+        ocvs_policy=ocvs_policy,
+        ocvs_commitment_term=ocvs_commitment_term,
+        vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+        ocvs_dr_nodes=ocvs_dr_nodes,
+    )
+    hybrid_ocvs_customized = bool(hybrid_ocvs_assumptions["customized"])
+    hybrid_ocvs_profile_choice = str(hybrid_ocvs_assumptions["profile_choice"])
+    hybrid_ocvs_policy = dict(hybrid_ocvs_assumptions["policy"])
+    hybrid_ocvs_commitment_term = str(hybrid_ocvs_assumptions["commitment_term"])
+    hybrid_vmware_license_price_per_core_yearly = float(
+        hybrid_ocvs_assumptions["vmware_license_price_per_core_yearly"]
+    )
+    hybrid_ocvs_dr_nodes = int(hybrid_ocvs_assumptions["dr_nodes"])
 
     # Restore last saved Step 4 sizing/costing settings. Step 3 remains the
     # source of truth for which VMs are selected.
@@ -9539,6 +9898,28 @@ def step4() -> str:
             1_000_000.0,
         )
         restored_ocvs_dr_nodes = normalize_ocvs_dr_nodes(snapshot.get("ocvs_dr_nodes", ocvs_dr_nodes))
+        restored_hybrid_ocvs_customized = snapshot.get("hybrid_ocvs_customized") is True
+        restored_hybrid_ocvs_profile = normalize_ocvs_profile(
+            snapshot.get("hybrid_ocvs_profile", hybrid_ocvs_profile_choice)
+        )
+        restored_hybrid_ocvs_policy = normalize_ocvs_policy(
+            snapshot.get("hybrid_ocvs_policy", hybrid_ocvs_policy)
+        )
+        restored_hybrid_ocvs_commitment_term = normalize_ocvs_commitment_term(
+            snapshot.get("hybrid_ocvs_commitment_term", hybrid_ocvs_commitment_term)
+        )
+        restored_hybrid_vmware_license_price = _bounded_float(
+            snapshot.get(
+                "hybrid_vmware_license_price_per_core_yearly",
+                hybrid_vmware_license_price_per_core_yearly,
+            ),
+            hybrid_vmware_license_price_per_core_yearly,
+            0.0,
+            1_000_000.0,
+        )
+        restored_hybrid_ocvs_dr_nodes = normalize_ocvs_dr_nodes(
+            snapshot.get("hybrid_ocvs_dr_nodes", hybrid_ocvs_dr_nodes)
+        )
 
         for vm_name, cfg in snapshot_settings.items():
             if vm_name not in vm_index or not isinstance(cfg, dict):
@@ -9582,6 +9963,12 @@ def step4() -> str:
         ocvs_commitment_term = restored_ocvs_commitment_term
         vmware_license_price_per_core_yearly = restored_vmware_license_price
         ocvs_dr_nodes = restored_ocvs_dr_nodes
+        hybrid_ocvs_customized = restored_hybrid_ocvs_customized
+        hybrid_ocvs_profile_choice = restored_hybrid_ocvs_profile
+        hybrid_ocvs_policy = restored_hybrid_ocvs_policy
+        hybrid_ocvs_commitment_term = restored_hybrid_ocvs_commitment_term
+        hybrid_vmware_license_price_per_core_yearly = restored_hybrid_vmware_license_price
+        hybrid_ocvs_dr_nodes = restored_hybrid_ocvs_dr_nodes
 
         app_state["step4_vm_shapes"] = vm_shape_selection
         app_state["step4_vm_ocpus"] = vm_ocpu_selection
@@ -9593,6 +9980,12 @@ def step4() -> str:
         app_state["step4_ocvs_commitment_term"] = ocvs_commitment_term
         app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
+        app_state["step4_hybrid_ocvs_customized"] = hybrid_ocvs_customized
+        app_state["step4_hybrid_ocvs_profile"] = hybrid_ocvs_profile_choice
+        app_state["step4_hybrid_ocvs_policy"] = hybrid_ocvs_policy
+        app_state["step4_hybrid_ocvs_commitment_term"] = hybrid_ocvs_commitment_term
+        app_state["step4_hybrid_vmware_license_price_per_core_yearly"] = hybrid_vmware_license_price_per_core_yearly
+        app_state["step4_hybrid_ocvs_dr_nodes"] = hybrid_ocvs_dr_nodes
         if snapshot.get("saved_at") and not app_state.get("step4_last_updated_at"):
             app_state["step4_last_updated_at"] = str(snapshot.get("saved_at"))
         if request.method == "GET":
@@ -9628,6 +10021,7 @@ def step4() -> str:
     if request.method == "POST":
         action = str(submitted_step4_scalars["action"])
         active_scenario = str(submitted_step4_scalars["active_scenario"])
+        continue_to_results = request.form.get("continue_to_results") == "1"
         submitted_native_settings, native_field_errors = parse_native_editor_page_fields(
             request.form,
             native_editor_scope["rows"],
@@ -9679,6 +10073,16 @@ def step4() -> str:
             "ocvs_storage_headroom_pct",
             "ocvs_dense_vsan_usable_pct",
             "ocvs_standard_storage_vpu",
+            "hybrid_ocvs_profile",
+            "hybrid_ocvs_commitment_term",
+            "hybrid_ocvs_dr_nodes",
+            "hybrid_ocvs_vcpu_per_ocpu",
+            "hybrid_ocvs_cpu_headroom_pct",
+            "hybrid_ocvs_memory_headroom_pct",
+            "hybrid_ocvs_storage_headroom_pct",
+            "hybrid_ocvs_dense_vsan_usable_pct",
+            "hybrid_ocvs_standard_storage_vpu",
+            "hybrid_vmware_license_price_per_core_yearly",
         )
         has_scenario_setting = any(
             field_name in request.form
@@ -9771,6 +10175,91 @@ def step4() -> str:
                 vmware_license_price_per_core_yearly,
             )
         )
+        has_hybrid_ocvs_submission = any(
+            field_name in request.form
+            for field_name in (
+                "hybrid_ocvs_profile",
+                "hybrid_ocvs_commitment_term",
+                "hybrid_ocvs_vcpu_per_ocpu",
+                "hybrid_ocvs_cpu_headroom_pct",
+                "hybrid_ocvs_memory_headroom_pct",
+                "hybrid_ocvs_storage_headroom_pct",
+                "hybrid_ocvs_dense_vsan_usable_pct",
+                "hybrid_ocvs_standard_storage_vpu",
+                "hybrid_ocvs_dr_nodes",
+                "hybrid_vmware_license_price_per_core_yearly",
+            )
+        )
+        if active_scenario == "hybrid" and has_hybrid_ocvs_submission:
+            hybrid_ocvs_customized = True
+            hybrid_ocvs_profile_choice = str(
+                submitted_step4_scalars.get(
+                    "hybrid_ocvs_profile",
+                    hybrid_ocvs_profile_choice,
+                )
+            )
+            hybrid_ocvs_commitment_term = str(
+                submitted_step4_scalars.get(
+                    "hybrid_ocvs_commitment_term",
+                    hybrid_ocvs_commitment_term,
+                )
+            )
+            hybrid_ocvs_dr_nodes = int(
+                submitted_step4_scalars.get(
+                    "hybrid_ocvs_dr_nodes",
+                    hybrid_ocvs_dr_nodes,
+                )
+            )
+            hybrid_ocvs_policy = {
+                "vcpu_per_ocpu": float(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_vcpu_per_ocpu",
+                        hybrid_ocvs_policy["vcpu_per_ocpu"],
+                    )
+                ),
+                "cpu_headroom_pct": float(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_cpu_headroom_pct",
+                        hybrid_ocvs_policy["cpu_headroom_pct"],
+                    )
+                ),
+                "memory_headroom_pct": float(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_memory_headroom_pct",
+                        hybrid_ocvs_policy["memory_headroom_pct"],
+                    )
+                ),
+                "storage_headroom_pct": float(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_storage_headroom_pct",
+                        hybrid_ocvs_policy["storage_headroom_pct"],
+                    )
+                ),
+                "dense_vsan_usable_pct": float(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_dense_vsan_usable_pct",
+                        hybrid_ocvs_policy["dense_vsan_usable_pct"],
+                    )
+                ),
+                "standard_storage_vpu": int(
+                    submitted_step4_scalars.get(
+                        "hybrid_ocvs_standard_storage_vpu",
+                        hybrid_ocvs_policy["standard_storage_vpu"],
+                    )
+                ),
+            }
+            hybrid_vmware_license_price_per_core_yearly = float(
+                submitted_step4_scalars.get(
+                    "hybrid_vmware_license_price_per_core_yearly",
+                    hybrid_vmware_license_price_per_core_yearly,
+                )
+            )
+        if not hybrid_ocvs_customized:
+            hybrid_ocvs_profile_choice = ocvs_profile_choice
+            hybrid_ocvs_policy = dict(ocvs_policy)
+            hybrid_ocvs_commitment_term = ocvs_commitment_term
+            hybrid_vmware_license_price_per_core_yearly = vmware_license_price_per_core_yearly
+            hybrid_ocvs_dr_nodes = ocvs_dr_nodes
 
         updated_shapes = dict(vm_shape_selection)
         updated_ocpus = dict(vm_ocpu_selection)
@@ -9856,6 +10345,12 @@ def step4() -> str:
         app_state["step4_ocvs_commitment_term"] = ocvs_commitment_term
         app_state["step4_vmware_license_price_per_core_yearly"] = vmware_license_price_per_core_yearly
         app_state["step4_ocvs_dr_nodes"] = ocvs_dr_nodes
+        app_state["step4_hybrid_ocvs_customized"] = hybrid_ocvs_customized
+        app_state["step4_hybrid_ocvs_profile"] = hybrid_ocvs_profile_choice
+        app_state["step4_hybrid_ocvs_policy"] = hybrid_ocvs_policy
+        app_state["step4_hybrid_ocvs_commitment_term"] = hybrid_ocvs_commitment_term
+        app_state["step4_hybrid_vmware_license_price_per_core_yearly"] = hybrid_vmware_license_price_per_core_yearly
+        app_state["step4_hybrid_ocvs_dr_nodes"] = hybrid_ocvs_dr_nodes
         step4_last_updated_at = datetime.now().isoformat(timespec="seconds")
         app_state["step4_last_updated_at"] = step4_last_updated_at
         staged_step4_snapshot: dict[str, Any] | None = None
@@ -9916,6 +10411,12 @@ def step4() -> str:
                 "ocvs_commitment_term": ocvs_commitment_term,
                 "ocvs_dr_nodes": ocvs_dr_nodes,
                 "vmware_license_price_per_core_yearly": vmware_license_price_per_core_yearly,
+                "hybrid_ocvs_customized": hybrid_ocvs_customized,
+                "hybrid_ocvs_profile": hybrid_ocvs_profile_choice,
+                "hybrid_ocvs_policy": hybrid_ocvs_policy,
+                "hybrid_ocvs_commitment_term": hybrid_ocvs_commitment_term,
+                "hybrid_ocvs_dr_nodes": hybrid_ocvs_dr_nodes,
+                "hybrid_vmware_license_price_per_core_yearly": hybrid_vmware_license_price_per_core_yearly,
                 "vm_settings": all_vm_settings,
             }
 
@@ -9955,6 +10456,8 @@ def step4() -> str:
             export_format = "excel"
         elif action == "save":
             flash("Migration path settings saved.", "success")
+            if continue_to_results:
+                return redirect(step4_tab_redirect("price"))
             return redirect(step4_tab_redirect(active_scenario, **request.form))
 
     cost_context = {
@@ -10002,6 +10505,11 @@ def step4() -> str:
         vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
         ocvs_dr_nodes=ocvs_dr_nodes,
         ocvs_commitment_term=ocvs_commitment_term,
+        hybrid_ocvs_policy=hybrid_ocvs_policy,
+        hybrid_ocvs_profile_choice=hybrid_ocvs_profile_choice,
+        hybrid_vmware_license_price_per_core_yearly=hybrid_vmware_license_price_per_core_yearly,
+        hybrid_ocvs_dr_nodes=hybrid_ocvs_dr_nodes,
+        hybrid_ocvs_commitment_term=hybrid_ocvs_commitment_term,
         hybrid_placement_selection=hybrid_placement_selection,
     )
     overall = analysis["overall"]
@@ -10141,6 +10649,7 @@ def step4() -> str:
         analysis,
         readiness,
         ocvs_commitment_term,
+        hybrid_ocvs_customized,
     )
     results = build_results_page_context(readiness, scenario_views, app_state)
 
@@ -10182,6 +10691,12 @@ def step4() -> str:
             ocvs_policy=ocvs_policy,
             ocvs_dr_nodes=ocvs_dr_nodes,
             vmware_license_price_per_core_yearly=vmware_license_price_per_core_yearly,
+            hybrid_ocvs_customized=hybrid_ocvs_customized,
+            hybrid_ocvs_profile_choice=hybrid_ocvs_profile_choice,
+            hybrid_ocvs_commitment_term=hybrid_ocvs_commitment_term,
+            hybrid_ocvs_policy=hybrid_ocvs_policy,
+            hybrid_ocvs_dr_nodes=hybrid_ocvs_dr_nodes,
+            hybrid_vmware_license_price_per_core_yearly=hybrid_vmware_license_price_per_core_yearly,
             scenario_comparison=scenario_comparison,
             executive_summary=executive_summary,
             fit_warnings=fit_warnings,
@@ -10199,6 +10714,10 @@ def step4() -> str:
             customer_name=customer_name,
             active_scenario=active_scenario,
             results=results,
+            workspace_continue_form_id="step4-form" if active_scenario != "price" else "",
+            workspace_continue_submit_name="continue_to_results",
+            workspace_continue_submit_value="1",
+            workspace_continue_label="Save & Continue",
         ),
     )
 

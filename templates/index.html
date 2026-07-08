@@ -125,6 +125,17 @@
       color: var(--workspace-error);
       font-weight: 700;
     }
+    .setup-sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+      padding: 0;
+    }
     .setup-actions {
       display: flex;
       flex-wrap: wrap;
@@ -270,48 +281,89 @@
       word-break: break-word;
     }
     .inventory-mode {
-      min-width: 0;
-      margin: 0 0 16px;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      overflow: hidden;
       padding: 0;
       border: 0;
     }
-    .inventory-mode legend { margin-bottom: 8px; }
-    .inventory-mode__options {
-      width: min(100%, 430px);
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      padding: 3px;
-      border: 1px solid var(--workspace-line-strong);
-      border-radius: 7px;
-      background: #f0f2f3;
-    }
-    .inventory-mode__option {
-      min-width: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      min-height: 38px;
-      padding: 7px 10px;
-      border-radius: 5px;
-      cursor: pointer;
-      font-size: 14px;
-      font-weight: 800;
-    }
-    .inventory-mode__option:has(input:checked) {
-      background: #ffffff;
-      box-shadow: 0 1px 3px rgba(31, 31, 31, .16);
-      color: var(--workspace-primary-hover);
+    .inventory-mode__input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
     }
     .inventory-panel[hidden] { display: none; }
     .inventory-panel {
       display: grid;
       gap: 16px;
     }
+    .inventory-replace-note {
+      margin: 0;
+      padding: 10px 12px;
+      border: 1px solid var(--workspace-line);
+      border-radius: 6px;
+      background: var(--workspace-primary-soft);
+      color: var(--workspace-primary-hover);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.4;
+    }
     .inventory-upload-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 24px;
+      align-items: stretch;
+    }
+    .inventory-upload-card {
+      grid-template-rows: auto auto minmax(40px, 1fr) auto;
+      height: 100%;
+    }
+    .inventory-upload-help {
+      display: grid;
+      gap: 4px;
+      align-content: start;
+    }
+    .inventory-upload-card .setup-actions {
+      margin-top: auto;
+    }
+    .inventory-upload-primary label {
+      font-size: 15px;
+    }
+    .manual-inventory-fallback {
+      margin-top: 4px;
+      border: 1px dashed var(--workspace-line-strong);
+      border-radius: 6px;
+      background: #f7f8f8;
+      color: var(--workspace-muted);
+    }
+    .manual-inventory-fallback[open] {
+      border-style: solid;
+      background: #ffffff;
+      color: var(--workspace-text);
+    }
+    .manual-inventory-fallback summary {
+      min-height: 42px;
+      padding: 12px;
+      cursor: pointer;
+      font-weight: 800;
+    }
+    .manual-inventory-fallback__body {
+      display: grid;
+      gap: 14px;
+      padding: 0 12px 14px;
+    }
+    .manual-inventory-fallback__body > p {
+      margin: 0;
+      color: var(--workspace-muted);
+      line-height: 1.45;
+    }
+    .manual-inventory-fallback h3 {
+      margin: 0;
+      font-size: 15px;
     }
     .manual-grid {
       display: grid;
@@ -356,10 +408,16 @@
       color: var(--workspace-muted);
       font-size: 13px;
     }
+    .warning-review__detail span {
+      display: block;
+      margin-top: 4px;
+      color: var(--workspace-text);
+      font-weight: 800;
+    }
     .warning-review__table-wrap { overflow-x: auto; }
     .warning-review table {
       width: 100%;
-      min-width: 680px;
+      min-width: 420px;
       border-collapse: collapse;
       font-size: 12px;
     }
@@ -429,8 +487,8 @@
   {% set field_labels = {
     "currency_code": "Currency",
     "price_list_file": "Existing price list",
-    "rvtools_file": "Inventory catalog",
-    "rvtools_upload": "Inventory file",
+    "rvtools_file": "Saved inventory",
+    "rvtools_upload": "RVTools file",
     "manual_vm_count": "VM count",
     "manual_total_vcpus": "Total vCPU",
     "manual_total_memory_gb": "Total RAM GB",
@@ -458,21 +516,10 @@
     <section id="assessment-identity" class="setup-section" aria-labelledby="assessment-identity-title">
       <div class="setup-section__header">
         <h2 id="assessment-identity-title">Assessment Identity</h2>
-        <p>Keep the assessment title distinct from the customer or project it covers.</p>
+        <p>Set the customer or project context. Saved assessment names are generated automatically with the date.</p>
       </div>
       <form method="post" class="setup-form setup-form--identity">
-        <div class="setup-field">
-          <label for="assessment_name">Assessment name</label>
-          <input
-            id="assessment_name"
-            name="assessment_name"
-            type="text"
-            maxlength="120"
-            value="{{ active_assessment_name or '' }}"
-            placeholder="Migration assessment"
-          />
-        </div>
-        <div class="setup-field">
+        <div class="setup-field setup-field--full">
           <label for="customer_name">Customer / project name</label>
           <input
             id="customer_name"
@@ -499,12 +546,10 @@
 
       <div id="saved-assessments" class="saved-assessments" aria-labelledby="saved-assessments-title">
         <h3 id="saved-assessments-title">Saved Assessments</h3>
-        <p class="saved-assessments__intro">Reopen or remove a locally saved workspace.</p>
         <div class="saved-assessments__layout">
           <form method="post">
-            <h4>Load Previous Assessment</h4>
             <div class="setup-field">
-              <label for="assessment_id">Previously saved</label>
+              <label for="assessment_id">Saved assessment</label>
               <select id="assessment_id" name="assessment_id" {% if saved_assessments %}required{% else %}disabled{% endif %}>
                 {% if saved_assessments %}
                   {% for assessment in saved_assessments %}
@@ -630,55 +675,36 @@
     <section id="inventory-source" class="setup-section" aria-labelledby="inventory-source-title">
       <div class="setup-section__header">
         <h2 id="inventory-source-title">Inventory Source</h2>
-        <p>Upload VM-level inventory or enter an aggregate workload summary. Switching modes keeps values already entered.</p>
+        <p>Upload an RVTools export or reuse a previously uploaded file.</p>
       </div>
 
       <form method="post" enctype="multipart/form-data" class="setup-form" id="inventory-source-form">
-        <fieldset class="inventory-mode">
-          <legend>Inventory mode</legend>
-          <div class="inventory-mode__options">
-            <label class="inventory-mode__option" for="inventory-mode-upload">
-              <input id="inventory-mode-upload" name="inventory_mode" type="radio" value="upload" {% if inventory_mode == "upload" %}checked{% endif %} />
-              Upload or catalog
-            </label>
-            <label class="inventory-mode__option" for="inventory-mode-manual">
-              <input id="inventory-mode-manual" name="inventory_mode" type="radio" value="manual" {% if inventory_mode == "manual" %}checked{% endif %} />
-              Manual summary
-            </label>
-          </div>
+        <fieldset class="inventory-mode" aria-label="Inventory source option">
+          <legend class="setup-sr-only">Inventory source option</legend>
+          <input
+            class="inventory-mode__input"
+            id="inventory-mode-upload"
+            name="inventory_mode"
+            type="radio"
+            value="upload"
+            aria-label="Use RVTools upload or saved inventory"
+            {% if inventory_mode == "upload" %}checked{% endif %}
+          />
         </fieldset>
 
         <div
           class="inventory-panel"
           data-inventory-mode-panel="upload"
-          aria-hidden="{{ 'false' if inventory_mode == 'upload' else 'true' }}"
-          {% if inventory_mode != "upload" %}hidden{% endif %}
+          aria-hidden="false"
         >
+          {% if selected_rvtools_file %}
+            <p class="inventory-replace-note">
+              Upload or choose a saved inventory to replace the active source. The current inventory is kept if the replacement is not accepted.
+            </p>
+          {% endif %}
           <div class="inventory-upload-grid">
-            <div class="setup-field">
-              <label for="rvtools_file">Existing inventory catalog</label>
-              <select
-                id="rvtools_file"
-                name="rvtools_file"
-                aria-describedby="rvtools_file-hint{% if field_errors.get('rvtools_file') %} rvtools_file-error{% endif %}"
-                {% if field_errors.get('rvtools_file') %}aria-invalid="true"{% endif %}
-              >
-                <option value="">Select a catalog file</option>
-                {% for choice in rvtools_file_choices %}
-                  <option value="{{ choice.token }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.label }}</option>
-                {% endfor %}
-              </select>
-              <p class="setup-field__hint" id="rvtools_file-hint">Choose a previously stored .xlsx, .xlsm, or .csv inventory.</p>
-              {% if field_errors.get("rvtools_file") %}
-                <p class="setup-field__error" id="rvtools_file-error">{{ field_errors.rvtools_file }}</p>
-              {% endif %}
-              <div class="setup-actions">
-                <button type="submit" name="action" value="select_rvtools_file" class="setup-button setup-button--secondary btn-secondary">Use Catalog File</button>
-              </div>
-            </div>
-
-            <div class="setup-field">
-              <label for="rvtools_upload">Upload inventory file</label>
+            <div class="setup-field inventory-upload-card inventory-upload-primary">
+              <label for="rvtools_upload">Upload RVTools file</label>
               <input
                 id="rvtools_upload"
                 name="rvtools_upload"
@@ -687,24 +713,67 @@
                 aria-describedby="rvtools_upload-hint{% if field_errors.get('rvtools_upload') %} rvtools_upload-error{% endif %}"
                 {% if field_errors.get('rvtools_upload') %}aria-invalid="true"{% endif %}
               />
-              <p class="setup-field__hint" id="rvtools_upload-hint">RVTools, VMwareInventory, and equivalent VM-level exports are supported.</p>
-              {% if field_errors.get("rvtools_upload") %}
-                <p class="setup-field__error" id="rvtools_upload-error">{{ field_errors.rvtools_upload }}</p>
-              {% endif %}
+              <div class="inventory-upload-help">
+                <p class="setup-field__hint" id="rvtools_upload-hint">Use an RVTools .xlsx, .xlsm, or .csv export.</p>
+                {% if field_errors.get("rvtools_upload") %}
+                  <p class="setup-field__error" id="rvtools_upload-error">{{ field_errors.rvtools_upload }}</p>
+                {% endif %}
+              </div>
               <div class="setup-actions">
-                <button type="submit" name="action" value="upload_rvtools_file" class="setup-button">Upload and Use</button>
+                <button type="submit" name="action" value="upload_rvtools_file" class="setup-button">Upload RVTools File</button>
+              </div>
+            </div>
+
+            <div class="setup-field inventory-upload-card inventory-upload-secondary">
+              <label for="rvtools_file">Use saved inventory</label>
+              <select
+                id="rvtools_file"
+                name="rvtools_file"
+                aria-describedby="rvtools_file-hint{% if field_errors.get('rvtools_file') %} rvtools_file-error{% endif %}"
+                {% if field_errors.get('rvtools_file') %}aria-invalid="true"{% endif %}
+              >
+                <option value="">Select a saved inventory</option>
+                {% for choice in rvtools_file_choices %}
+                  <option value="{{ choice.token }}" {% if choice.file_path == selected_rvtools_file %}selected{% endif %}>{{ choice.label }}</option>
+                {% endfor %}
+              </select>
+              <div class="inventory-upload-help">
+                <p class="setup-field__hint" id="rvtools_file-hint">Reuse a previously uploaded RVTools export.</p>
+                {% if field_errors.get("rvtools_file") %}
+                  <p class="setup-field__error" id="rvtools_file-error">{{ field_errors.rvtools_file }}</p>
+                {% endif %}
+              </div>
+              <div class="setup-actions">
+                <button type="submit" name="action" value="select_rvtools_file" class="setup-button setup-button--secondary btn-secondary">Use Saved Inventory</button>
               </div>
             </div>
           </div>
         </div>
 
+        <details
+          class="manual-inventory-fallback"
+          data-manual-inventory-fallback
+          {% if inventory_mode == "manual" %}open{% endif %}
+        >
+          <summary>No RVTools file? Create manual summary</summary>
+          <div class="manual-inventory-fallback__body">
+            <p>Use this fallback only when the customer cannot share an RVTools export.</p>
+            <input
+              class="inventory-mode__input"
+              id="inventory-mode-manual"
+              name="inventory_mode"
+              type="radio"
+              value="manual"
+              aria-label="Use manual workload summary"
+              {% if inventory_mode == "manual" %}checked{% endif %}
+            />
         <div
           class="inventory-panel"
           data-inventory-mode-panel="manual"
           aria-hidden="{{ 'false' if inventory_mode == 'manual' else 'true' }}"
           {% if inventory_mode != "manual" %}hidden{% endif %}
         >
-          <h3 style="margin: 0; font-size: 15px;">Manual Workload Summary</h3>
+          <h3>Manual Workload Summary</h3>
           <p class="setup-field__hint" id="manual-summary-hint">Totals are distributed across generated VM rows while preserving the values entered here.</p>
           <div class="manual-grid">
             <div class="setup-field">
@@ -742,6 +811,8 @@
             <button type="submit" name="action" value="create_manual_inventory" class="setup-button">{{ manual_sizing_form.submit_label }}</button>
           </div>
         </div>
+          </div>
+        </details>
       </form>
 
       {% if rvtools_rejected_info %}
@@ -769,23 +840,24 @@
           {% endif %}
 
           {% if inventory_review_issues %}
-            <div class="warning-review" aria-label="Warning Review">
-              <h3>Warning Review</h3>
+            <div class="warning-review" aria-label="Inventory quality checks">
+              <h3>Inventory quality checks</h3>
               {% for issue in inventory_review_issues %}
                 <details id="issue-{{ issue.id }}">
                   <summary>{{ issue.title }} ({{ issue.count }} VM{% if issue.count != 1 %}s{% endif %})</summary>
-                  <p class="warning-review__detail">{{ issue.detail }} {{ issue.default_action }}.</p>
+                  <p class="warning-review__detail">
+                    {{ issue.detail }}
+                    <span>{{ issue.default_action }}</span>
+                  </p>
                   <div class="warning-review__table-wrap">
                     <table>
-                      <thead><tr><th>VM</th><th>Detected value</th><th>Issue</th><th>Recommendation</th><th>Action</th></tr></thead>
+                      <thead><tr><th>VM</th><th>Detected value</th><th>Issue</th></tr></thead>
                       <tbody>
                         {% for row in issue.vm_rows %}
                           <tr>
                             <td><strong>{{ row.vm_name }}</strong></td>
                             <td>{{ row.detected_value }}</td>
                             <td>{{ row.issue }}</td>
-                            <td>{{ row.recommendation }}</td>
-                            <td>{{ row.action }}</td>
                           </tr>
                         {% endfor %}
                       </tbody>

@@ -18,31 +18,30 @@
     data-assessment-menu-panel
     hidden
   >
-    <a href="{{ url_for('index') }}#saved-assessments">Save</a>
-    <a href="{{ url_for('index') }}#saved-assessments">Open</a>
-    <form method="post" action="{{ url_for('index') }}">
+    <form method="post" action="{{ url_for('index') }}" data-assessment-save-form>
       <input type="hidden" name="action" value="export_assessment" />
       <button
         type="submit"
-        class="workspace-action workspace-action--secondary"
+        class="assessment-menu__item"
         data-assessment-export
-      >Export current assessment</button>
+        data-assessment-save
+      >Export assessment JSON</button>
     </form>
-    <form method="post" action="{{ url_for('import_assessment_route') }}" enctype="multipart/form-data">
+    <form method="post" action="{{ url_for('import_assessment_route') }}" enctype="multipart/form-data" data-assessment-open-form>
       <input type="hidden" name="action" value="import_assessment" />
       <input
         type="file"
         name="assessment_file"
         accept=".json,application/json"
         hidden
-        onchange="this.form.submit()"
+        data-assessment-open-file
       />
       <button
         type="button"
-        class="workspace-action workspace-action--secondary"
+        class="assessment-menu__item"
         data-assessment-import
-        onclick="this.form.elements.assessment_file.click()"
-      >Import assessment</button>
+        data-assessment-open
+      >Import assessment JSON</button>
     </form>
   </div>
 </div>

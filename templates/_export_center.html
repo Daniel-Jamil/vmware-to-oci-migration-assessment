@@ -13,35 +13,45 @@
     </span>
   </header>
   <p class="results-export__note">
-    The Excel workbook remains available while pricing is incomplete. Its label reflects the current readiness state.
+    The Excel workbook remains available while readiness is incomplete. The status badge shows whether the workbook is still draft or customer-ready.
   </p>
   <div class="results-export__actions">
     <form method="post" action="{{ url_for('index') }}">
       <input type="hidden" name="action" value="save_assessment" />
       <input type="hidden" name="assessment_name" value="{{ results.assessment_name }}" />
       <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
+      <input type="hidden" name="return_to" value="{{ url_for('step4', tab='price') }}" />
       <button type="submit" class="results-button results-button--secondary">Save assessment</button>
     </form>
-    <form method="post" action="{{ url_for('index') }}">
+    <form method="post" action="{{ url_for('index') }}" data-assessment-save-form>
       <input type="hidden" name="action" value="export_assessment" />
       <input type="hidden" name="assessment_name" value="{{ results.assessment_name }}" />
       <input type="hidden" name="assessment_notes" value="{{ results.assessment_notes }}" />
-      <button type="submit" class="results-button results-button--secondary">Export assessment JSON</button>
+      <button
+        type="submit"
+        class="results-button results-button--secondary"
+        data-assessment-save
+      >Export assessment JSON</button>
     </form>
-    <form method="post" action="{{ url_for('import_assessment_route') }}" enctype="multipart/form-data">
+    <form
+      method="post"
+      action="{{ url_for('import_assessment_route') }}"
+      enctype="multipart/form-data"
+      data-assessment-open-form
+    >
       <input type="hidden" name="action" value="import_assessment" />
       <input
         type="file"
         name="assessment_file"
         accept=".json,application/json"
         hidden
-        onchange="this.form.submit()"
+        data-assessment-open-file
       />
       <button
         type="button"
         class="results-button results-button--secondary"
-        onclick="this.form.elements.assessment_file.click()"
-      >Import assessment</button>
+        data-assessment-open
+      >Import assessment JSON</button>
     </form>
     <form method="post" action="{{ url_for('step4') }}">
       <input type="hidden" name="action" value="export_excel" />

@@ -11,6 +11,18 @@
   --scenario-warning: #8a5d12;
   --scenario-warning-soft: #fff8e8;
   --scenario-critical: #a52a1f;
+  --scenario-native: #2563eb;
+  --scenario-native-strong: #1d4ed8;
+  --scenario-native-soft: #eff6ff;
+  --scenario-native-line: #93c5fd;
+  --scenario-ocvs: #00846f;
+  --scenario-ocvs-strong: #00695f;
+  --scenario-ocvs-soft: #e7fff8;
+  --scenario-ocvs-line: #7dd3c7;
+  --scenario-hybrid: #7c3aed;
+  --scenario-hybrid-strong: #6d28d9;
+  --scenario-hybrid-soft: #f5f3ff;
+  --scenario-hybrid-line: #c4b5fd;
 }
 
 html,
@@ -64,39 +76,80 @@ body {
 .top-tabs {
   display: inline-flex;
   min-height: 42px;
-  gap: 0;
-  padding: 3px;
+  gap: 6px;
+  padding: 4px;
   border: 1px solid var(--scenario-line);
   border-radius: 6px;
-  background: #eceeeb;
+  background: #f7f8f6;
 }
 
 .workspace-body .top-tabs button.scenario-tab {
+  --tab-accent: var(--status-green);
+  --tab-strong: var(--status-green);
+  --tab-soft: var(--status-green-soft);
+  --tab-line: var(--status-green-line);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   min-width: 112px;
   min-height: 34px;
   padding: 7px 14px;
-  border: 0;
+  border: 1px solid var(--tab-line);
+  border-top: 3px solid var(--tab-accent);
   border-radius: 4px;
-  background: transparent;
-  color: var(--scenario-muted);
+  background: #ffffff;
+  color: var(--tab-strong);
   box-shadow: none;
+}
+
+.top-tabs .scenario-tab::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tab-accent);
+}
+
+.top-tabs .scenario-tab[data-scenario-tab="native"] {
+  --tab-accent: var(--scenario-native);
+  --tab-strong: var(--scenario-native-strong);
+  --tab-soft: var(--scenario-native-soft);
+  --tab-line: var(--scenario-native-line);
+}
+
+.top-tabs .scenario-tab[data-scenario-tab="ocvs"] {
+  --tab-accent: var(--scenario-ocvs);
+  --tab-strong: var(--scenario-ocvs-strong);
+  --tab-soft: var(--scenario-ocvs-soft);
+  --tab-line: var(--scenario-ocvs-line);
+}
+
+.top-tabs .scenario-tab[data-scenario-tab="hybrid"] {
+  --tab-accent: var(--scenario-hybrid);
+  --tab-strong: var(--scenario-hybrid-strong);
+  --tab-soft: var(--scenario-hybrid-soft);
+  --tab-line: var(--scenario-hybrid-line);
 }
 
 .workspace-body .top-tabs button.scenario-tab:hover,
 .workspace-body .top-tabs button.scenario-tab:focus-visible {
-  border: 0;
-  background: #e1e4df;
-  color: var(--scenario-ink);
+  border-color: var(--tab-accent);
+  border-top-color: var(--tab-accent);
+  background: var(--tab-soft);
+  color: var(--tab-strong);
 }
 
 .workspace-body .top-tabs button.scenario-tab.is-active,
 .workspace-body .top-tabs button.scenario-tab[aria-selected="true"],
 .workspace-body .top-tabs button.scenario-tab.is-active:hover,
 .workspace-body .top-tabs button.scenario-tab.is-active:focus-visible {
-  border: 1px solid #b6bbb4;
-  background: #ffffff;
-  color: var(--status-green);
-  box-shadow: 0 1px 2px rgb(32 33 31 / 10%);
+  border-color: var(--tab-accent);
+  border-top-color: var(--tab-accent);
+  background: var(--tab-soft);
+  color: var(--tab-strong);
+  box-shadow: inset 0 -2px 0 var(--tab-accent), 0 1px 2px rgb(32 33 31 / 10%);
 }
 
 .top-tabs .scenario-tab:focus-visible,
@@ -493,18 +546,30 @@ body {
 }
 
 .native-pagination {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: start;
+  justify-content: stretch;
+  gap: 10px 12px;
   min-height: 54px;
   padding-top: 12px;
   color: var(--scenario-muted);
 }
 
-.native-pagination > div {
+.native-pagination__status {
+  padding-top: 7px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.native-pagination__list {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  justify-content: flex-start;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .native-pagination a,
@@ -1009,6 +1074,15 @@ body {
   .hybrid-shared-notice {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .native-pagination {
+    grid-template-columns: 1fr;
+  }
+
+  .native-pagination__status {
+    padding-top: 0;
+    white-space: normal;
   }
 
   .scenario-header__summary,

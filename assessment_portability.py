@@ -173,6 +173,12 @@ def _clean_enum(value: Any, field: str, allowed: set[str]) -> str:
     return clean
 
 
+def _clean_bool(value: Any, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise PortableAssessmentError(f"{field} must be a boolean.")
+    return value
+
+
 def _clean_vm_number(value: Any, field: str) -> int | float:
     if isinstance(value, bool):
         raise PortableAssessmentError(f"{field} must be a number.")
@@ -345,6 +351,23 @@ def _clean_app_state(value: Any) -> dict[str, Any]:
             "assessment.app_state.step4_ocvs_commitment_term",
             _COMMITMENT_VALUES,
         )
+    if "step4_hybrid_ocvs_customized" in state:
+        cleaned["step4_hybrid_ocvs_customized"] = _clean_bool(
+            state["step4_hybrid_ocvs_customized"],
+            "assessment.app_state.step4_hybrid_ocvs_customized",
+        )
+    if "step4_hybrid_ocvs_profile" in state:
+        cleaned["step4_hybrid_ocvs_profile"] = _clean_enum(
+            state["step4_hybrid_ocvs_profile"],
+            "assessment.app_state.step4_hybrid_ocvs_profile",
+            _OCVS_PROFILE_VALUES,
+        )
+    if "step4_hybrid_ocvs_commitment_term" in state:
+        cleaned["step4_hybrid_ocvs_commitment_term"] = _clean_enum(
+            state["step4_hybrid_ocvs_commitment_term"],
+            "assessment.app_state.step4_hybrid_ocvs_commitment_term",
+            _COMMITMENT_VALUES,
+        )
     scalar_rules = {
         "step4_iaas_discount_pct": (0.0, 100.0, False, None),
         "step4_vmware_license_price_per_core_yearly": (
@@ -354,6 +377,13 @@ def _clean_app_state(value: Any) -> dict[str, Any]:
             None,
         ),
         "step4_ocvs_dr_nodes": (0.0, 2.0, True, {0, 1, 2}),
+        "step4_hybrid_vmware_license_price_per_core_yearly": (
+            0.0,
+            1_000_000.0,
+            False,
+            None,
+        ),
+        "step4_hybrid_ocvs_dr_nodes": (0.0, 2.0, True, {0, 1, 2}),
     }
     for key, (minimum, maximum, whole, allowed) in scalar_rules.items():
         if key in state:
@@ -369,6 +399,11 @@ def _clean_app_state(value: Any) -> dict[str, Any]:
         cleaned["step4_ocvs_policy"] = _clean_ocvs_policy(
             state["step4_ocvs_policy"],
             "assessment.app_state.step4_ocvs_policy",
+        )
+    if "step4_hybrid_ocvs_policy" in state:
+        cleaned["step4_hybrid_ocvs_policy"] = _clean_ocvs_policy(
+            state["step4_hybrid_ocvs_policy"],
+            "assessment.app_state.step4_hybrid_ocvs_policy",
         )
     if "step4_last_updated_at" in state:
         cleaned["step4_last_updated_at"] = _clean_timestamp(
@@ -441,6 +476,8 @@ def _clean_step4_snapshot(value: Any) -> dict[str, Any]:
     snapshot_enums = {
         "ocvs_profile": _OCVS_PROFILE_VALUES,
         "ocvs_commitment_term": _COMMITMENT_VALUES,
+        "hybrid_ocvs_profile": _OCVS_PROFILE_VALUES,
+        "hybrid_ocvs_commitment_term": _COMMITMENT_VALUES,
     }
     for key, allowed in snapshot_enums.items():
         if key in snapshot:
@@ -458,6 +495,20 @@ def _clean_step4_snapshot(value: Any) -> dict[str, Any]:
             whole=True,
             allowed={0, 1, 2},
         )
+    if "hybrid_ocvs_customized" in snapshot:
+        cleaned["hybrid_ocvs_customized"] = _clean_bool(
+            snapshot["hybrid_ocvs_customized"],
+            "assessment.step4_snapshot.hybrid_ocvs_customized",
+        )
+    if "hybrid_ocvs_dr_nodes" in snapshot:
+        cleaned["hybrid_ocvs_dr_nodes"] = _clean_state_number(
+            snapshot["hybrid_ocvs_dr_nodes"],
+            "assessment.step4_snapshot.hybrid_ocvs_dr_nodes",
+            minimum=0.0,
+            maximum=2.0,
+            whole=True,
+            allowed={0, 1, 2},
+        )
     if "vmware_license_price_per_core_yearly" in snapshot:
         cleaned["vmware_license_price_per_core_yearly"] = _clean_state_number(
             snapshot["vmware_license_price_per_core_yearly"],
@@ -465,10 +516,22 @@ def _clean_step4_snapshot(value: Any) -> dict[str, Any]:
             minimum=0.0,
             maximum=1_000_000.0,
         )
+    if "hybrid_vmware_license_price_per_core_yearly" in snapshot:
+        cleaned["hybrid_vmware_license_price_per_core_yearly"] = _clean_state_number(
+            snapshot["hybrid_vmware_license_price_per_core_yearly"],
+            "assessment.step4_snapshot.hybrid_vmware_license_price_per_core_yearly",
+            minimum=0.0,
+            maximum=1_000_000.0,
+        )
     if "ocvs_policy" in snapshot:
         cleaned["ocvs_policy"] = _clean_ocvs_policy(
             snapshot["ocvs_policy"],
             "assessment.step4_snapshot.ocvs_policy",
+        )
+    if "hybrid_ocvs_policy" in snapshot:
+        cleaned["hybrid_ocvs_policy"] = _clean_ocvs_policy(
+            snapshot["hybrid_ocvs_policy"],
+            "assessment.step4_snapshot.hybrid_ocvs_policy",
         )
     if "vm_settings" in snapshot:
         cleaned["vm_settings"] = _clean_snapshot_vm_settings(

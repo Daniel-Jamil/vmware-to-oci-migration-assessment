@@ -42,6 +42,14 @@
   margin-bottom: 16px;
 }
 
+.inventory-review__heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .inventory-review__eyebrow {
   margin-bottom: 4px;
   color: var(--workspace-muted);
@@ -93,7 +101,7 @@
 
 .inventory-summary dt,
 .inventory-row-details dt,
-.warning-item__treatment dt {
+.warning-context__guidance span {
   color: var(--workspace-muted);
   font-size: 12px;
   font-weight: 700;
@@ -141,6 +149,10 @@
   flex-wrap: wrap;
 }
 
+.warning-inbox__counts:empty {
+  display: none;
+}
+
 .warning-count--critical {
   border: 1px solid #e4aaa5;
   background: var(--workspace-error-soft);
@@ -159,11 +171,16 @@
   border-top: 1px solid var(--workspace-line);
 }
 
+.warning-inbox__helper {
+  margin: 12px 0 0;
+  color: var(--workspace-muted);
+  line-height: 1.45;
+}
+
 .workspace-body .warning-filter,
 .workspace-body .inventory-button,
 .workspace-body .inventory-details-button,
-.workspace-body .inventory-sort,
-.workspace-body .inventory-undo__button {
+.workspace-body .inventory-sort {
   min-height: 36px;
   border: 1px solid var(--workspace-line-strong);
   border-radius: 6px;
@@ -206,75 +223,83 @@
   color: #6f4800 !important;
 }
 
-.warning-inbox__items {
+.warning-inbox__summary {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
-  margin-top: 14px;
+  margin-top: 12px;
 }
 
-.warning-item {
+.warning-context {
+  display: grid;
+  gap: 10px;
   min-width: 0;
-  padding: 13px;
+  padding: 11px 12px;
   border: 1px solid var(--workspace-line);
   border-left: 4px solid var(--workspace-review);
   border-radius: 6px;
   background: var(--workspace-surface-muted);
 }
 
-.warning-item--critical {
+.warning-context--critical {
   border-left-color: var(--workspace-error);
 }
 
-.warning-item[hidden] {
+.warning-context[hidden] {
   display: none;
 }
 
-.warning-item__header {
+.warning-context__header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
 }
 
-.warning-item__header > strong {
+.warning-context__header > strong {
   flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--workspace-line);
+  border-radius: 4px;
+  background: var(--workspace-surface);
+  color: var(--workspace-muted);
   font-size: 12px;
 }
 
-.warning-item__severity {
+.warning-context__severity {
   color: var(--workspace-muted);
   font-size: 11px;
   font-weight: 800;
   text-transform: uppercase;
 }
 
-.warning-item > p {
-  margin: 10px 0;
+.warning-context > p {
+  margin: 0;
   color: var(--workspace-muted);
   line-height: 1.45;
 }
 
-.warning-item__treatment {
+.warning-context__guidance {
   display: grid;
-  gap: 7px;
-  margin: 0 0 10px;
+  gap: 4px;
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--workspace-line);
+  border-radius: 6px;
+  background: var(--workspace-surface);
+  color: var(--workspace-text);
+  line-height: 1.35;
 }
 
-.warning-item__treatment > div {
-  display: grid;
-  grid-template-columns: 140px minmax(0, 1fr);
-  gap: 8px;
+.warning-context__guidance span {
+  text-transform: uppercase;
 }
 
-.warning-item__treatment dd,
 .inventory-row-details dd {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
 }
 
-.warning-item__affected summary,
 .inventory-row-details summary {
   width: fit-content;
   color: var(--workspace-primary-hover);
@@ -282,44 +307,12 @@
   cursor: pointer;
 }
 
-.warning-item__affected ul {
-  max-height: 260px;
-  margin: 10px 0;
-  padding: 0;
-  overflow: auto;
-  list-style: none;
-}
-
-.warning-item__affected li {
-  display: grid;
-  gap: 3px;
-  padding: 9px 0;
-  border-top: 1px solid var(--workspace-line);
-  font-size: 12px;
-}
-
-.warning-item__acknowledgment {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-top: 10px;
-  font-weight: 700;
-}
-
-.warning-item__acknowledgment input,
 .inventory-col-include input {
   width: 18px;
   height: 18px;
   flex: 0 0 18px;
   margin: 0;
   accent-color: var(--workspace-primary);
-}
-
-.warning-item__remediation {
-  display: inline-flex;
-  margin-top: 6px;
-  color: var(--workspace-error);
-  font-weight: 750;
 }
 
 .warning-inbox__clear {
@@ -379,6 +372,7 @@
 }
 
 .inventory-command-group--placement {
+  align-items: flex-end;
   flex-wrap: nowrap;
 }
 
@@ -386,9 +380,13 @@
   min-width: 180px;
 }
 
+.inventory-command-group--placement .inventory-button {
+  align-self: flex-end;
+  min-height: 38px;
+}
+
 .workspace-body .inventory-button,
-.workspace-body .inventory-details-button,
-.workspace-body .inventory-undo__button {
+.workspace-body .inventory-details-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -608,9 +606,26 @@
   color: #6f4800;
 }
 
+.workspace-body .inventory-warning-button {
+  border: 1px solid #e3c278 !important;
+  font: inherit;
+  cursor: pointer;
+}
+
+.workspace-body .inventory-warning-button:hover,
+.workspace-body .inventory-warning-button:focus-visible {
+  background: #fff3d1;
+  color: #5b3b00 !important;
+}
+
 .inventory-status--review {
   background: #edf2f7;
   color: #39495b;
+}
+
+.inventory-details-row[hidden],
+.inventory-details-row:has(.inventory-row-details:not([open])) {
+  display: none;
 }
 
 .inventory-details-row > td {
@@ -643,6 +658,31 @@
   margin: 0;
 }
 
+.inventory-row-details__notes {
+  grid-column: 1 / -1;
+}
+
+.inventory-note-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inventory-note-list li {
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--workspace-line);
+  border-radius: 6px;
+  background: var(--workspace-surface);
+}
+
+.inventory-note-list span {
+  display: block;
+}
+
 .inventory-field-error {
   grid-column: 2;
   margin: -10px 0 0;
@@ -665,36 +705,6 @@
   border-top: 1px solid var(--workspace-line);
 }
 
-.inventory-undo {
-  position: fixed;
-  z-index: 50;
-  right: 20px;
-  bottom: 20px;
-  max-width: min(420px, calc(100vw - 32px));
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px 14px;
-  border: 1px solid #292929;
-  border-radius: 6px;
-  background: #292929;
-  color: #ffffff;
-  box-shadow: 0 8px 24px rgba(31, 31, 31, .2);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.inventory-undo[hidden] {
-  display: none;
-}
-
-.workspace-body .inventory-undo__button {
-  min-height: 32px;
-  border-color: #ffffff !important;
-  background: transparent !important;
-  color: #ffffff !important;
-}
-
 .visually-hidden {
   position: absolute !important;
   width: 1px !important;
@@ -705,12 +715,6 @@
   clip: rect(0, 0, 0, 0) !important;
   white-space: nowrap !important;
   border: 0 !important;
-}
-
-@media (min-width: 768px) {
-  .inventory-details-row:has(.inventory-row-details:not([open])) {
-    display: none;
-  }
 }
 
 @media (max-width: 1100px) {
@@ -726,7 +730,7 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .warning-inbox__items {
+  .warning-inbox__summary {
     grid-template-columns: 1fr;
   }
 }
@@ -742,6 +746,11 @@
 
   .inventory-review__selection-status {
     align-self: flex-start;
+  }
+
+  .inventory-review__heading-actions {
+    align-items: stretch;
+    justify-content: flex-start;
   }
 
   .inventory-summary {
@@ -777,8 +786,7 @@
     width: 100%;
   }
 
-  .warning-item__header,
-  .warning-item__treatment > div {
+  .warning-context__header {
     display: grid;
     grid-template-columns: 1fr;
   }
@@ -800,23 +808,32 @@
   #inventory-table .inventory-col-os,
   #inventory-table .inventory-col-number,
   #inventory-table .inventory-col-placement,
-  #inventory-table .inventory-col-warning,
-  #inventory-table .inventory-col-details {
+  #inventory-table .inventory-col-warning {
     display: none;
   }
 
   .inventory-col-include {
-    width: 12%;
+    width: 44px;
     min-width: 44px !important;
   }
 
   .inventory-col-name {
-    width: 52%;
+    width: 43%;
     min-width: 0 !important;
   }
 
   .inventory-col-support {
-    width: 36%;
+    width: calc(57% - 118px);
+  }
+
+  .inventory-col-details {
+    width: 74px;
+  }
+
+  .workspace-body .inventory-details-button {
+    min-height: 32px;
+    padding: 5px 7px;
+    font-size: 12px;
   }
 
   .inventory-col-name label {
@@ -868,10 +885,4 @@
     grid-template-columns: 1fr;
   }
 
-  .inventory-undo {
-    right: 12px;
-    bottom: 12px;
-    left: 12px;
-    max-width: none;
-  }
 }

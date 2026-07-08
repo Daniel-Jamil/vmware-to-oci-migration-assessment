@@ -14,10 +14,7 @@
   const visibleCount = document.querySelector("[data-visible-count]");
   const selectionStatus = document.querySelector("[data-selection-status]");
   const emptyFilter = document.querySelector("[data-empty-filter]");
-  const undoRegion = document.getElementById("inventory-undo");
-  const undoMessage = undoRegion ? undoRegion.querySelector("[data-undo-message]") : null;
-  const undoButton = undoRegion ? undoRegion.querySelector("[data-undo]") : null;
-  const warningButtons = Array.from(document.querySelectorAll("[data-warning-filter]"));
+  const warningButtons = Array.from(document.querySelectorAll(".warning-filter[data-warning-filter]"));
   const warningItems = Array.from(document.querySelectorAll("[data-warning-item]"));
   const detailRowsByIndex = new Map(
     Array.from(table.querySelectorAll("[data-inventory-detail]")).map((row) => [row.dataset.inventoryDetail, row])
@@ -28,6 +25,7 @@
   const rowRecords = Array.from(table.querySelectorAll("[data-inventory-row]")).map((row) => {
     const rowIndex = row.dataset.inventoryRow;
     const detailsButton = row.querySelector("[data-details-target]");
+    const noteButton = row.querySelector("[data-note-details-target]");
     return {
       row,
       rowIndex,
@@ -36,20 +34,21 @@
       placement: placementsByIndex.get(rowIndex),
       placementLabel: row.querySelector("[data-placement-label]"),
       detailsButton,
-      details: document.getElementById(detailsButton ? detailsButton.dataset.detailsTarget : ""),
+      noteButton,
+      details: document.getElementById(
+        detailsButton ? detailsButton.dataset.detailsTarget : noteButton ? noteButton.dataset.noteDetailsTarget : ""
+      ),
       warningIds: (row.dataset.warningIds || "").split(/\s+/).filter(Boolean),
       searchText: (row.dataset.search || "").toLowerCase(),
     };
   });
-  const recordByIndex = new Map(rowRecords.map((record) => [record.rowIndex, record]));
   const sortControls = Array.from(table.querySelectorAll("[data-sort]")).map((button) => ({
     button,
     header: button.closest("th"),
   }));
   let activeWarning = "all";
-  let undoSnapshot = null;
-  let undoReturnFocus = null;
   let searchTimer = null;
+  const requestedWarning = new URLSearchParams(window.location.search).get("warning") || "";
 
   function isFilterActive() {
     return Boolean(
@@ -78,6 +77,22 @@
     return rowRecords.filter((record) => !record.row.hidden);
   }
 
+  function syncDetailVisibility(record) {
+    if (!record.detailRow) return;
+    const rowVisible = !record.row.hidden;
+    const detailsOpen = Boolean(record.details && record.details.open);
+    record.detailRow.hidden = !rowVisible || !detailsOpen;
+  }
+
+  function setDetailsOpen(record, open) {
+    if (!record.details) return;
+    record.details.open = open;
+    const expanded = String(open);
+    if (record.detailsButton) record.detailsButton.setAttribute("aria-expanded", expanded);
+    if (record.noteButton) record.noteButton.setAttribute("aria-expanded", expanded);
+    syncDetailVisibility(record);
+  }
+
   function syncInclusion(record) {
     if (record.placement && record.inclusion) {
       record.placement.disabled = !record.inclusion.checked;
@@ -95,7 +110,7 @@
     rowRecords.forEach((record) => {
       const visible = rowMatches(record);
       record.row.hidden = !visible;
-      if (record.detailRow) record.detailRow.hidden = !visible;
+      syncDetailVisibility(record);
       if (visible) count += 1;
     });
 
@@ -118,24 +133,10 @@
     if (record.placementLabel) record.placementLabel.textContent = label;
   }
 
-  function showUndo(message, changedRecords) {
-    undoSnapshot = changedRecords.length ? changedRecords : null;
-    if (!undoRegion || !undoMessage) return;
-    undoMessage.textContent = message;
-    undoRegion.hidden = !undoSnapshot;
-    if (undoButton) undoButton.disabled = !undoSnapshot;
-  }
-
-  function runBulk(trigger, message, rowScope, change) {
-    undoReturnFocus = trigger instanceof HTMLElement ? trigger : null;
-    const changedRecords = [];
-    rowScope.forEach((record) => {
-      const changedState = change(record);
-      if (changedState) changedRecords.push({ rowIndex: record.rowIndex, ...changedState });
-    });
+  function runBulk(rowScope, change) {
+    rowScope.forEach(change);
     updateSelectionStatus();
     updateFilters();
-    showUndo(message(changedRecords.length, rowScope.length), changedRecords);
   }
 
   if (searchInput) {
@@ -148,18 +149,30 @@
     if (control) control.addEventListener("change", updateFilters);
   });
 
+  function applyWarningFilter(warningId, options = {}) {
+    activeWarning = warningId || "all";
+    const activeButton = warningButtons.find((button) => button.dataset.warningFilter === activeWarning);
+    warningButtons.forEach((candidate) => {
+      const active = candidate === activeButton;
+      candidate.classList.toggle("is-active", active);
+      candidate.setAttribute("aria-pressed", String(active));
+    });
+    warningItems.forEach((item) => {
+      const itemId = item.dataset.warningItem || "all";
+      item.hidden = activeWarning === "all" ? itemId !== "all" : itemId !== activeWarning;
+    });
+    updateFilters();
+    if (options.scrollToTable && table instanceof HTMLElement) {
+      table.closest(".inventory-list")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    if (options.focus && activeButton instanceof HTMLElement) {
+      activeButton.focus({ preventScroll: true });
+    }
+  }
+
   warningButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      activeWarning = button.dataset.warningFilter || "all";
-      warningButtons.forEach((candidate) => {
-        const active = candidate === button;
-        candidate.classList.toggle("is-active", active);
-        candidate.setAttribute("aria-pressed", String(active));
-      });
-      warningItems.forEach((item) => {
-        item.hidden = activeWarning !== "all" && item.dataset.warningItem !== activeWarning;
-      });
-      updateFilters();
+      applyWarningFilter(button.dataset.warningFilter || "all");
     });
   });
 
@@ -167,15 +180,11 @@
   if (selectAll) {
     selectAll.addEventListener("click", () => {
       runBulk(
-        selectAll,
-        (changed) => `Included ${changed} VMs.`,
         rowRecords,
         (record) => {
-          if (!record.inclusion || record.inclusion.checked) return null;
-          const previous = record.inclusion.checked;
+          if (!record.inclusion || record.inclusion.checked) return;
           record.inclusion.checked = true;
           syncInclusion(record);
-          return { included: previous };
         }
       );
     });
@@ -185,15 +194,11 @@
   if (includeFiltered) {
     includeFiltered.addEventListener("click", () => {
       runBulk(
-        includeFiltered,
-        (changed, scoped) => `Included ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
-          if (!record.inclusion || record.inclusion.checked) return null;
-          const previous = record.inclusion.checked;
+          if (!record.inclusion || record.inclusion.checked) return;
           record.inclusion.checked = true;
           syncInclusion(record);
-          return { included: previous };
         }
       );
     });
@@ -203,15 +208,11 @@
   if (excludeFiltered) {
     excludeFiltered.addEventListener("click", () => {
       runBulk(
-        excludeFiltered,
-        (changed, scoped) => `Excluded ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
-          if (!record.inclusion || !record.inclusion.checked) return null;
-          const previous = record.inclusion.checked;
+          if (!record.inclusion || !record.inclusion.checked) return;
           record.inclusion.checked = false;
           syncInclusion(record);
-          return { included: previous };
         }
       );
     });
@@ -224,48 +225,13 @@
         bulkPlacement.focus();
         return;
       }
-      const selectedLabel = bulkPlacement.options[bulkPlacement.selectedIndex].text;
       runBulk(
-        applyPlacement,
-        (changed, scoped) => `Applied ${selectedLabel} to ${changed} of ${scoped} VMs in the current filter.`,
         visibleRecords(),
         (record) => {
-          if (!record.placement || record.placement.value === bulkPlacement.value) return null;
-          const previous = record.placement.value;
+          if (!record.placement || record.placement.value === bulkPlacement.value) return;
           syncPlacement(record, bulkPlacement.value);
-          return { placement: previous };
         }
       );
-    });
-  }
-
-  if (undoButton) {
-    undoButton.addEventListener("click", () => {
-      if (!undoSnapshot) return;
-      undoSnapshot.forEach((saved) => {
-        const record = recordByIndex.get(saved.rowIndex);
-        if (!record) return;
-        if (Object.prototype.hasOwnProperty.call(saved, "included") && record.inclusion) {
-          record.inclusion.checked = saved.included;
-          syncInclusion(record);
-        }
-        if (Object.prototype.hasOwnProperty.call(saved, "placement")) {
-          syncPlacement(record, saved.placement);
-        }
-      });
-      const returnTarget = undoReturnFocus && document.contains(undoReturnFocus)
-        ? undoReturnFocus
-        : (bulkPlacement || selectAll || searchInput);
-      undoSnapshot = null;
-      undoReturnFocus = null;
-      updateSelectionStatus();
-      updateFilters();
-      if (undoMessage) undoMessage.textContent = "Bulk change undone.";
-      undoButton.disabled = true;
-      if (returnTarget) returnTarget.focus({ preventScroll: true });
-      window.setTimeout(() => {
-        if (!undoSnapshot && undoRegion) undoRegion.hidden = true;
-      }, 1200);
     });
   }
 
@@ -287,11 +253,15 @@
 
     if (record.detailsButton && record.details) {
       record.detailsButton.addEventListener("click", () => {
-        record.details.open = !record.details.open;
-        record.detailsButton.setAttribute("aria-expanded", String(record.details.open));
+        setDetailsOpen(record, !record.details.open);
       });
       record.details.addEventListener("toggle", () => {
-        record.detailsButton.setAttribute("aria-expanded", String(record.details.open));
+        setDetailsOpen(record, record.details.open);
+      });
+    }
+    if (record.noteButton && record.details) {
+      record.noteButton.addEventListener("click", () => {
+        setDetailsOpen(record, !record.details.open);
       });
     }
   });
@@ -326,7 +296,14 @@
   });
 
   updateSelectionStatus();
-  updateFilters();
+  const requestedWarningButton = requestedWarning
+    ? warningButtons.find((button) => button.dataset.warningFilter === requestedWarning)
+    : null;
+  if (requestedWarningButton) {
+    applyWarningFilter(requestedWarningButton.dataset.warningFilter, { focus: true });
+  } else {
+    updateFilters();
+  }
 
   const errorSummary = document.getElementById("inventory-errors");
   if (errorSummary) window.requestAnimationFrame(() => errorSummary.focus());
