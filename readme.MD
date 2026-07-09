@@ -25,6 +25,8 @@ This application was originally based on an internal VMware-to-OCI sizing utilit
 - Compare monthly, annual, and 3-year price signals.
 - Export a presentation-ready Excel assessment workbook.
 
+For a fuller operator guide covering usage, logic, readiness, and troubleshooting, see [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+
 ## Quick Start
 
 Use these steps to run the app locally on macOS or Windows.
@@ -197,7 +199,7 @@ The lowest complete modeled price is shown as a comparison signal; the app does 
 ## Assessment Readiness
 
 - **OCI Native:** Unsupported guest operating systems do not make the scenario ineligible. They create a remediation-required warning. The scenario remains rankable, but a customer-ready Native recommendation requires warning acknowledgment and a written treatment rationale.
-- **OCVS and Hybrid:** When the OCVS workload requires VCF licensing, a valid non-zero VCF price is required for complete pricing. Scenarios with missing required VCF pricing are excluded from normal price ranking until the input is completed.
+- **OCVS and Hybrid:** VCF licensing is modeled as an optional add-on. Enter a per-core/year price to include license run-rate in OCVS and Hybrid costs; otherwise infrastructure remains rankable and license coverage is noted separately.
 - **Review placement:** VMs left in Review remain visible as unresolved decisions and are conservatively modeled on OCVS until placement is confirmed.
 - **Exports:** Draft Excel remains available while review items are open. Customer-ready status is granted only when the selected recommendation meets its readiness requirements.
 
