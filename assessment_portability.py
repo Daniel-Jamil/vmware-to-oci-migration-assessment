@@ -28,6 +28,7 @@ _OCVS_PROFILE_VALUES = {
     "BM.DenseIO.E5.128",
     "BM.Standard2.52",
     "BM.Standard3.64",
+    "BM.Optimized3.36",
     "BM.Standard.E4.128",
     "BM.Standard.E5.192",
 }

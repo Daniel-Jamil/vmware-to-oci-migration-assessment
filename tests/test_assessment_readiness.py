@@ -1621,6 +1621,30 @@ class ReadinessTests(unittest.TestCase):
 
         self.assertFalse(summary["selected"]["pricing_available"])
 
+    def test_optimized3_ocvs_profile_uses_standard_storage_model(self) -> None:
+        summary = app_module.build_ocvs_price_summary(
+            vm_rows=[{"cpus": 60, "memory_gb": 800, "provisioned_gb": 1000}],
+            price_lookup={
+                "Compute - Optimized - X9 - OCPU": 0.04,
+                "Compute - Optimized - X9 - Memory": 0.002,
+            },
+            block_storage_unit_price=0.02,
+            block_perf_unit_price=0.001,
+            iaas_discount_pct=0.0,
+            selected_profile="BM.Optimized3.36",
+        )
+
+        selected = summary["selected"]
+
+        self.assertEqual("BM.Optimized3.36", selected["shape"])
+        self.assertEqual("Standard", selected["host_type"])
+        self.assertEqual(36, selected["ocpus_per_host"])
+        self.assertEqual(512, selected["memory_gb_per_host"])
+        self.assertEqual(0, selected["hosts_by_storage"])
+        self.assertEqual(10, selected["standard_storage_vpu"])
+        self.assertGreater(selected["storage_monthly_cost"], 0.0)
+        self.assertTrue(selected["pricing_available"])
+
     def test_native_stays_eligible_and_rankable_with_unsupported_vms(self) -> None:
         result = build_assessment_readiness(complete_context())
         native = result["scenarios"]["native"]

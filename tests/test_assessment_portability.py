@@ -538,6 +538,36 @@ class PortableAssessmentTests(unittest.TestCase):
             app_module.normalize_app_state(validated_state),
         )
 
+    def test_optimized3_ocvs_profile_roundtrips_in_portable_state(self) -> None:
+        package = valid_package()
+        package["assessment"]["app_state"].update(
+            step4_ocvs_profile="BM.Optimized3.36",
+            step4_hybrid_ocvs_profile="BM.Optimized3.36",
+        )
+        package["assessment"]["step4_snapshot"].update(
+            ocvs_profile="BM.Optimized3.36",
+            hybrid_ocvs_profile="BM.Optimized3.36",
+        )
+
+        validated = portability.validate_portable_package(package)
+
+        self.assertEqual(
+            "BM.Optimized3.36",
+            validated["assessment"]["app_state"]["step4_ocvs_profile"],
+        )
+        self.assertEqual(
+            "BM.Optimized3.36",
+            validated["assessment"]["app_state"]["step4_hybrid_ocvs_profile"],
+        )
+        self.assertEqual(
+            "BM.Optimized3.36",
+            validated["assessment"]["step4_snapshot"]["ocvs_profile"],
+        )
+        self.assertEqual(
+            "BM.Optimized3.36",
+            validated["assessment"]["step4_snapshot"]["hybrid_ocvs_profile"],
+        )
+
     def test_only_trusted_workbook_formula_wrapper_emits_formula_xml(self) -> None:
         workbook = app_module._build_xlsx_workbook_bytes(
             [
